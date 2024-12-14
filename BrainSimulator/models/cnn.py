@@ -6,44 +6,57 @@ class CNNLayer(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1):
         super(CNNLayer, self).__init__()
         
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
-        self.batchnorm1 = nn.BatchNorm2d(out_channels)
-        self.batchnorm2 = nn.BatchNorm2d(out_channels)
-        self.activation1 = nn.GELU()
-        self.activation2 = nn.GELU()
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, stride, padding)
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+        
+        # Add a projection shortcut if dimensions change
+        self.shortcut = nn.Identity()
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1),
+                nn.BatchNorm2d(out_channels)
+            )
+        
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.batchnorm1(x)
-        x = self.activation1(x)
-        res = x
-        x = self.conv2(x)
-        x = self.batchnorm2(x)
-        x = self.activation2(x)
-        x = x + res
+        residual = self.shortcut(x)
+        x = self.conv_block(x)
+        x = x + residual
         return x
 
 # Deconvolutional layer
 class DeCNNLayer(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1):
         super(DeCNNLayer, self).__init__()
-        self.deconv1 = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding)
-        self.batchnorm1 = nn.BatchNorm2d(out_channels)
-        self.batchnorm2 = nn.BatchNorm2d(out_channels)
-        self.activation1 = nn.GELU()
-        self.activation2 = nn.GELU()
-        self.deconv2 = nn.Conv2d(out_channels, out_channels, 3, 1, 1)
+        
+        self.deconv_block = nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+        
+        # # Add a projection shortcut if dimensions change
+        # self.shortcut = nn.Identity()
+        # if in_channels != out_channels:
+        #     self.shortcut = nn.Sequential(
+        #         nn.ConvTranspose2d(in_channels, out_channels, kernel_size=1, stride=stride),
+        #         nn.BatchNorm2d(out_channels)
+        #     )
+        
 
     def forward(self, x):
-        x = self.deconv1(x)
-        x = self.batchnorm1(x)
-        x = self.activation1(x)
-        res = x
-        x = self.deconv2(x)
-        x = self.batchnorm2(x)
-        x = self.activation2(x)
-        x = x + res
+        #residual = self.shortcut(x)
+        x = self.deconv_block(x)
+        #x = x + residual
         return x
 
 # Basically the nn.F.interpolate func in class form

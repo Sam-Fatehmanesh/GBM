@@ -11,6 +11,8 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from BrainSimulator.models.vae import VariationalAutoEncoder
 
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
 class BrainDataset(Dataset):
     def __init__(self, h5_files):
         self.h5_files = h5_files
@@ -47,7 +49,7 @@ class BrainDataset(Dataset):
             frame_idx = idx - self.file_frame_ranges[file_idx][0]
             frame = f['default'][frame_idx].astype(np.float32)
             # Normalize to [0, 1]
-            frame = (frame - frame.min()) / (frame.max() - frame.min())
+            # frame = (frame - frame.min()) / (frame.max() - frame.min())
             # Add channel dimension
             frame = frame[np.newaxis, :, :]
             return torch.from_numpy(frame)
@@ -78,19 +80,19 @@ def plot_losses(train_losses, recon_losses, kl_losses, exp_dir):
     
     # Only normalize if we have data
     if len(train_losses) > 0:
-        train_losses_norm = normalize_array(train_losses)
-        recon_losses_norm = normalize_array(recon_losses)
-        kl_losses_norm = normalize_array(kl_losses)
+        # train_losses_norm = normalize_array(train_losses)
+        # recon_losses_norm = normalize_array(recon_losses)
+        # kl_losses_norm = normalize_array(kl_losses)
         
         # Plot normalized loss components
         iterations = range(1, len(train_losses) + 1)
-        plt.plot(iterations, train_losses_norm, label='Total Loss', linewidth=2, alpha=0.7)
-        plt.plot(iterations, recon_losses_norm, label='Reconstruction Loss', linewidth=2, alpha=0.7)
-        plt.plot(iterations, kl_losses_norm, label='KL Loss', linewidth=2, alpha=0.7)
+        plt.plot(iterations, train_losses, label='Total Loss', linewidth=2, alpha=0.7)
+        plt.plot(iterations, recon_losses, label='Reconstruction Loss', linewidth=2, alpha=0.7)
+        plt.plot(iterations, kl_losses, label='KL Loss', linewidth=2, alpha=0.7)
         
         plt.xlabel('Iteration')
-        plt.ylabel('Normalized Loss')
-        plt.title('VAE Training Losses (Normalized)')
+        plt.ylabel('Loss')
+        plt.title('VAE Training Losses')
         plt.legend()
         plt.grid(True)
         
@@ -107,6 +109,14 @@ def plot_losses(train_losses, recon_losses, kl_losses, exp_dir):
     # Save the plot
     plt.savefig(os.path.join(exp_dir, "plots", "training_loss.png"))
     plt.close()
+
+def normalize_frame(frame):
+    """Normalize frame to 0-255 range"""
+    frame_min = frame.min()
+    frame_max = frame.max()
+    if frame_max == frame_min:
+        return np.zeros_like(frame, dtype=np.uint8)
+    return ((frame - frame_min) / (frame_max - frame_min) * 255).astype(np.uint8)
 
 def create_comparison_video(model, test_dataset, output_path, fps=1, max_frames=None):
     """Create a video comparing original and reconstructed frames"""
@@ -136,8 +146,11 @@ def create_comparison_video(model, test_dataset, output_path, fps=1, max_frames=
             reconstruction, _, _ = model(frame)
             
             # Convert to numpy arrays and normalize to uint8
-            original = (frame[0, 0].cpu().numpy() * 255).astype(np.uint8)
-            reconstructed = (reconstruction[0, 0].cpu().numpy() * 255).astype(np.uint8)
+            original = normalize_frame(frame[0, 0].cpu().numpy())
+            reconstructed = normalize_frame(reconstruction[0, 0].cpu().numpy())
+
+            # original = (frame[0, 0].cpu().numpy() * 255).astype(np.uint8)
+            # reconstructed = (reconstruction[0, 0].cpu().numpy() * 255).astype(np.uint8)
             
             # Create side-by-side comparison
             comparison = np.hstack([original, reconstructed])
@@ -160,20 +173,19 @@ def train_vae(train_loader, model, optimizer, device, epoch, train_losses, recon
         
         recon_batch, latent_sample, latent_dist = model(data)
         
-        # Reconstruction loss (MSE)
-        recon_loss = F.mse_loss(recon_batch, data, reduction='mean')
-        
+        # Reconstruction loss (Binary Cross Entropy)
+        recon_loss = F.binary_cross_entropy(recon_batch, data, reduction='mean')
         # KL divergence loss
-        kl_loss = -0.5 * torch.mean(1 + torch.log(latent_dist + 1e-10) - latent_dist) / data.size(0)
+        kl_loss = -0.5 * torch.mean(1 + torch.log(latent_dist + 1e-10) - latent_dist)
         
         # Total loss with beta-VAE weighting
         # Reduce beta since KL loss is much larger than reconstruction loss
-        beta = 0.0#0001  # Reduced from 0.1 to better balance the losses
-        loss = recon_loss + beta * kl_loss
+        #beta = 0.0#0001  # Reduced from 0.1 to better balance the losses
+        loss = recon_loss #+ beta * kl_loss
         
         loss.backward()
         optimizer.step()
-        
+
         # Record losses
         train_losses.append(loss.item())
         recon_losses.append(recon_loss.item())
@@ -203,12 +215,12 @@ def main():
         'image_height': height,
         'image_width': width,
         'n_distributions': 512,  # Number of categorical distributions
-        'n_categories': 8,    # Number of categories per distribution
+        'n_categories': 4,    # Number of categories per distribution
     }
     
     training_params = {
         'batch_size': 32,
-        'epochs': 50,
+        'epochs': 3,
         'learning_rate': 1e-4,
         'train_split': 0.9,  # 90% for training
     }
@@ -248,7 +260,7 @@ def main():
         f.write(f"Latent space size: {model_params['n_distributions'] * model_params['n_categories']}\n")
     
     # Get and sort all h5 files
-    h5_files = sorted(glob(os.path.join("input", "volume*.h5")))
+    h5_files = sorted(glob(os.path.join("data", "volume*.h5")))
     n_files = len(h5_files)
     n_train = int(n_files * training_params['train_split'])
     
@@ -276,7 +288,8 @@ def main():
     
     for i in tqdm(range(n_test_frames)):
         frame = test_dataset[i].numpy()[0]
-        frame_uint8 = (frame * 255).astype(np.uint8)
+        #frame_uint8 = (frame * 255).astype(np.uint8)
+        frame_uint8 = normalize_frame(frame)
         # Create side-by-side comparison with the same frame
         comparison = np.hstack([frame_uint8, frame_uint8])
         comparison_rgb = cv2.cvtColor(comparison, cv2.COLOR_GRAY2BGR)
