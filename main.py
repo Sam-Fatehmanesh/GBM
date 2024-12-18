@@ -68,16 +68,6 @@ def plot_losses(train_losses, recon_losses, kl_losses, exp_dir):
     """Plot and save the training losses"""
     plt.figure(figsize=(12, 8))
     
-    # Normalize each loss array between 0 and 1
-    def normalize_array(arr):
-        if len(arr) == 0:
-            return arr
-        arr_min = min(arr)
-        arr_max = max(arr)
-        if arr_max == arr_min:
-            return [1.0] * len(arr)  # Changed from 0.5 to 1.0 for better visibility
-        return [(x - arr_min) / (arr_max - arr_min) for x in arr]
-    
     # Only normalize if we have data
     if len(train_losses) > 0:
         # train_losses_norm = normalize_array(train_losses)
@@ -98,7 +88,7 @@ def plot_losses(train_losses, recon_losses, kl_losses, exp_dir):
         
         # Set fixed axis limits for normalized values
         plt.xlim(1, len(train_losses))
-        plt.ylim(-0.1, 1.1)  # Slight padding around 0-1 range
+        # plt.ylim(-0.1, 1.1)  # Slight padding around 0-1 range
         
         # Add actual values in text box
         textstr = f'Current Values:\nTotal Loss: {train_losses[-1]:.4f}\nRecon Loss: {recon_losses[-1]:.4f}\nKL Loss: {kl_losses[-1]:.4f}'
@@ -175,13 +165,15 @@ def train_vae(train_loader, model, optimizer, device, epoch, train_losses, recon
         
         # Reconstruction loss (Binary Cross Entropy)
         recon_loss = F.binary_cross_entropy(recon_batch, data, reduction='mean')
+        # Reconstruction loss (MSE)z
+        # recon_loss = F.mse_loss(recon_batch, data, reduction='mean')
         # KL divergence loss
         kl_loss = -0.5 * torch.mean(1 + torch.log(latent_dist + 1e-10) - latent_dist)
         
         # Total loss with beta-VAE weighting
         # Reduce beta since KL loss is much larger than reconstruction loss
-        #beta = 0.0#0001  # Reduced from 0.1 to better balance the losses
-        loss = recon_loss #+ beta * kl_loss
+        beta = 0.00#1  # Reduced from 0.1 to better balance the losses
+        loss = recon_loss + beta * kl_loss
         
         loss.backward()
         optimizer.step()
@@ -215,13 +207,13 @@ def main():
         'image_height': height,
         'image_width': width,
         'n_distributions': 512,  # Number of categorical distributions
-        'n_categories': 4,    # Number of categories per distribution
+        'n_categories': 8,    # Number of categories per distribution
     }
     
     training_params = {
         'batch_size': 32,
-        'epochs': 3,
-        'learning_rate': 1e-4,
+        'epochs': 75,
+        'learning_rate': 1e-3,
         'train_split': 0.9,  # 90% for training
     }
     
@@ -304,7 +296,7 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=training_params['batch_size'], shuffle=True)
     
     # Move model to device after architecture is saved
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1") #torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     model = model.to(device)
     
