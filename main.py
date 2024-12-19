@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
+import pandas as pd
+from scipy.interpolate import interp1d
 from BrainSimulator.models.vae import VariationalAutoEncoder
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -64,39 +66,93 @@ def create_experiment_dir():
     os.makedirs(os.path.join(exp_dir, "plots"), exist_ok=True)
     return exp_dir
 
-def plot_losses(train_losses, recon_losses, kl_losses, exp_dir):
-    """Plot and save the training losses"""
+def evaluate_test_loss(model, test_loader, device):
+    """Evaluate model on test set and return average losses"""
+    model.eval()
+    total_recon_loss = 0
+    total_kl_loss = 0
+    total_loss = 0
+    n_batches = 0
+    
+    with torch.no_grad():
+        for data in test_loader:
+            data = data.to(device)
+            recon_batch, latent_sample, latent_dist = model(data)
+            
+            recon_loss = F.binary_cross_entropy(recon_batch, data, reduction='mean')
+            kl_loss = -0.5 * torch.mean(1 + torch.log(latent_dist + 1e-10) - latent_dist)
+            
+            beta = 0.00  # Same beta as training
+            loss = recon_loss + beta * kl_loss
+            
+            total_recon_loss += recon_loss.item()
+            total_kl_loss += kl_loss.item()
+            total_loss += loss.item()
+            n_batches += 1
+    
+    return {
+        'test_loss': total_loss / n_batches,
+        'test_recon_loss': total_recon_loss / n_batches,
+        'test_kl_loss': total_kl_loss / n_batches
+    }
+
+def save_losses_to_csv(losses_dict, filepath):
+    """Save losses to CSV file"""
+    df = pd.DataFrame(losses_dict)
+    df.to_csv(filepath, index=False)
+
+def plot_losses(train_losses, recon_losses, kl_losses, test_losses, exp_dir, train_loader):
+    """Plot and save the training and test losses"""
     plt.figure(figsize=(12, 8))
     
-    # Only normalize if we have data
     if len(train_losses) > 0:
-        # train_losses_norm = normalize_array(train_losses)
-        # recon_losses_norm = normalize_array(recon_losses)
-        # kl_losses_norm = normalize_array(kl_losses)
-        
-        # Plot normalized loss components
+        # Plot training losses
         iterations = range(1, len(train_losses) + 1)
-        plt.plot(iterations, train_losses, label='Total Loss', linewidth=2, alpha=0.7)
-        plt.plot(iterations, recon_losses, label='Reconstruction Loss', linewidth=2, alpha=0.7)
-        plt.plot(iterations, kl_losses, label='KL Loss', linewidth=2, alpha=0.7)
+        plt.plot(iterations, train_losses, label='Train Total Loss', linewidth=2, alpha=0.7)
+        plt.plot(iterations, recon_losses, label='Train Recon Loss', linewidth=2, alpha=0.7)
+        plt.plot(iterations, kl_losses, label='Train KL Loss', linewidth=2, alpha=0.7)
+        
+        # Plot test losses with linear interpolation
+        if len(test_losses) > 1:  # Need at least 2 points for interpolation
+            # Calculate iterations where test losses were recorded (end of each epoch)
+            steps_per_epoch = len(train_loader)
+            test_iterations = [(i + 1) * steps_per_epoch for i in range(len(test_losses))]
+            
+            # Create interpolation functions for each test loss type
+            f_total = interp1d(test_iterations, [x['test_loss'] for x in test_losses], kind='linear')
+            f_recon = interp1d(test_iterations, [x['test_recon_loss'] for x in test_losses], kind='linear')
+            f_kl = interp1d(test_iterations, [x['test_kl_loss'] for x in test_losses], kind='linear')
+            
+            # Generate points for smooth curve
+            x_smooth = np.linspace(test_iterations[0], test_iterations[-1], len(train_losses))
+            
+            plt.plot(x_smooth, f_total(x_smooth), '--', label='Test Total Loss', linewidth=2, alpha=0.7)
+            plt.plot(x_smooth, f_recon(x_smooth), '--', label='Test Recon Loss', linewidth=2, alpha=0.7)
+            plt.plot(x_smooth, f_kl(x_smooth), '--', label='Test KL Loss', linewidth=2, alpha=0.7)
         
         plt.xlabel('Iteration')
         plt.ylabel('Loss')
-        plt.title('VAE Training Losses')
+        plt.title('VAE Training and Test Losses')
         plt.legend()
         plt.grid(True)
         
-        # Set fixed axis limits for normalized values
         plt.xlim(1, len(train_losses))
-        # plt.ylim(-0.1, 1.1)  # Slight padding around 0-1 range
         
-        # Add actual values in text box
-        textstr = f'Current Values:\nTotal Loss: {train_losses[-1]:.4f}\nRecon Loss: {recon_losses[-1]:.4f}\nKL Loss: {kl_losses[-1]:.4f}'
+        # Add current values in text box
+        textstr = (f'Current Training Values:\n'
+                  f'Total Loss: {train_losses[-1]:.4f}\n'
+                  f'Recon Loss: {recon_losses[-1]:.4f}\n'
+                  f'KL Loss: {kl_losses[-1]:.4f}')
+        if test_losses:
+            textstr += (f'\n\nLatest Test Values:\n'
+                       f'Total Loss: {test_losses[-1]["test_loss"]:.4f}\n'
+                       f'Recon Loss: {test_losses[-1]["test_recon_loss"]:.4f}\n'
+                       f'KL Loss: {test_losses[-1]["test_kl_loss"]:.4f}')
+        
         props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
         plt.text(0.02, 0.98, textstr, transform=plt.gca().transAxes, fontsize=9,
                 verticalalignment='top', bbox=props)
     
-    # Save the plot
     plt.savefig(os.path.join(exp_dir, "plots", "training_loss.png"))
     plt.close()
 
@@ -154,7 +210,7 @@ def create_comparison_video(model, test_dataset, output_path, fps=1, max_frames=
     out.release()
     print(f"Video saved as {output_path}")
 
-def train_vae(train_loader, model, optimizer, device, epoch, train_losses, recon_losses, kl_losses, exp_dir, test_dataset):
+def train_vae(train_loader, test_loader, model, optimizer, device, epoch, train_losses, recon_losses, kl_losses, test_losses, exp_dir, test_dataset):
     model.train()
     
     for batch_idx, data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}")):
@@ -163,35 +219,51 @@ def train_vae(train_loader, model, optimizer, device, epoch, train_losses, recon
         
         recon_batch, latent_sample, latent_dist = model(data)
         
-        # Reconstruction loss (Binary Cross Entropy)
         recon_loss = F.binary_cross_entropy(recon_batch, data, reduction='mean')
-        # Reconstruction loss (MSE)z
-        # recon_loss = F.mse_loss(recon_batch, data, reduction='mean')
-        # KL divergence loss
         kl_loss = -0.5 * torch.mean(1 + torch.log(latent_dist + 1e-10) - latent_dist)
         
-        # Total loss with beta-VAE weighting
-        # Reduce beta since KL loss is much larger than reconstruction loss
-        beta = 0.00#1  # Reduced from 0.1 to better balance the losses
+        beta = 0.00
         loss = recon_loss + beta * kl_loss
         
         loss.backward()
         optimizer.step()
 
-        # Record losses
         train_losses.append(loss.item())
         recon_losses.append(recon_loss.item())
         kl_losses.append(kl_loss.item())
         
-        # Plot every 100 batches
         if batch_idx % 100 == 0:
             print(f'Epoch {epoch} [{batch_idx}/{len(train_loader)}]:')
             print(f'  Total Loss: {loss.item():.4f}')
             print(f'  Reconstruction Loss: {recon_loss.item():.4f}')
             print(f'  KL Loss: {kl_loss.item():.4f}')
-            plot_losses(train_losses, recon_losses, kl_losses, exp_dir)
+            plot_losses(train_losses, recon_losses, kl_losses, test_losses, exp_dir, train_loader)
     
-    # Generate comparison video for this epoch using first 10% of test data
+    # Evaluate on test set at the end of each epoch
+    test_loss_dict = evaluate_test_loss(model, test_loader, device)
+    test_losses.append(test_loss_dict)
+    
+    # Save losses to CSV
+    train_loss_dict = {
+        'iteration': list(range(1, len(train_losses) + 1)),
+        'total_loss': train_losses,
+        'recon_loss': recon_losses,
+        'kl_loss': kl_losses
+    }
+    save_losses_to_csv(train_loss_dict, os.path.join(exp_dir, "train_losses.csv"))
+    
+    test_loss_dict_for_csv = {
+        'epoch': list(range(1, len(test_losses) + 1)),
+        'total_loss': [x['test_loss'] for x in test_losses],
+        'recon_loss': [x['test_recon_loss'] for x in test_losses],
+        'kl_loss': [x['test_kl_loss'] for x in test_losses]
+    }
+    save_losses_to_csv(test_loss_dict_for_csv, os.path.join(exp_dir, "test_losses.csv"))
+    
+    # Plot losses
+    plot_losses(train_losses, recon_losses, kl_losses, test_losses, exp_dir, train_loader)
+    
+    # Generate comparison video
     video_path = os.path.join(exp_dir, "videos", f"reconstruction_epoch_{epoch}.mp4")
     create_comparison_video(model, test_dataset, video_path, max_frames=len(test_dataset)//10)
 
@@ -264,6 +336,9 @@ def main():
     train_dataset = BrainDataset(train_files)
     test_dataset = BrainDataset(test_files)
     
+    train_loader = DataLoader(train_dataset, batch_size=training_params['batch_size'], shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=training_params['batch_size'], shuffle=False)
+    
     # Test video creation before training
     print("Testing video creation before training...")
     test_video_path = os.path.join(exp_dir, "videos", "test_video.mp4")
@@ -293,8 +368,6 @@ def main():
     if not os.path.exists(test_video_path) or os.path.getsize(test_video_path) == 0:
         raise Exception("Failed to create test video. Please check video writing capabilities.")
     
-    train_loader = DataLoader(train_dataset, batch_size=training_params['batch_size'], shuffle=True)
-    
     # Move model to device after architecture is saved
     device = torch.device("cuda:1") #torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -307,11 +380,13 @@ def main():
     train_losses = []
     recon_losses = []
     kl_losses = []
+    test_losses = []  # List to store test losses per epoch
     
     for epoch in range(1, training_params['epochs'] + 1):
-        train_vae(train_loader, model, optimizer, device, epoch, train_losses, recon_losses, kl_losses, exp_dir, test_dataset)
+        train_vae(train_loader, test_loader, model, optimizer, device, epoch, 
+                 train_losses, recon_losses, kl_losses, test_losses, exp_dir, test_dataset)
         
-        # Save checkpoint every 10 epochs
+        # Save checkpoint every 4 epochs
         if epoch % 4 == 0:
             checkpoint_path = os.path.join(exp_dir, "checkpoints", f"vae_epoch_{epoch}.pt")
             torch.save({
@@ -321,6 +396,7 @@ def main():
                 'train_losses': train_losses,
                 'recon_losses': recon_losses,
                 'kl_losses': kl_losses,
+                'test_losses': test_losses,
             }, checkpoint_path)
     
     # Save final model
