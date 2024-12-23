@@ -16,45 +16,58 @@ from BrainSimulator.models.vae import VariationalAutoEncoder
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 class BrainDataset(Dataset):
-    def __init__(self, h5_files):
+    def __init__(self, h5_files, frame_indices=None):
+        """
+        Args:
+            h5_files: List of h5 file paths
+            frame_indices: Optional list of (file_idx, frame_idx) tuples specifying which frames to use
+        """
         self.h5_files = h5_files
-        # Get total number of frames and dimensions
         self.frames_per_file = None
         self.total_frames = 0
         self.file_frame_ranges = []
         self.height = None
         self.width = None
+        self.frame_indices = frame_indices
         
         # Get dimensions from first file
-        with h5py.File(h5_files[0], 'r') as f:
+        with h5py.File(self.h5_files[0], 'r') as f:
             data = f['default']
             self.height, self.width = data.shape[1:]
+            if self.frames_per_file is None:
+                self.frames_per_file = data.shape[0]
         
-        for h5_file in h5_files:
-            with h5py.File(h5_file, 'r') as f:
-                if self.frames_per_file is None:
-                    self.frames_per_file = f['default'].shape[0]
-                self.file_frame_ranges.append((self.total_frames, self.total_frames + self.frames_per_file))
-                self.total_frames += self.frames_per_file
+        if frame_indices is None:
+            # Use all frames
+            for h5_file in self.h5_files:
+                with h5py.File(h5_file, 'r') as f:
+                    n_frames = f['default'].shape[0]
+                    self.file_frame_ranges.append((self.total_frames, self.total_frames + n_frames))
+                    self.total_frames += n_frames
+        else:
+            self.total_frames = len(frame_indices)
     
     def __len__(self):
         return self.total_frames
     
     def __getitem__(self, idx):
-        # Find which file contains this index
-        file_idx = 0
-        while file_idx < len(self.file_frame_ranges) and idx >= self.file_frame_ranges[file_idx][1]:
-            file_idx += 1
+        if self.frame_indices is not None:
+            # If using specific frame indices
+            file_idx, frame_idx = self.frame_indices[idx]
+            with h5py.File(self.h5_files[file_idx], 'r') as f:
+                frame = f['default'][frame_idx].astype(np.float32)
+        else:
+            # If using all frames sequentially
+            file_idx = 0
+            while file_idx < len(self.file_frame_ranges) and idx >= self.file_frame_ranges[file_idx][1]:
+                file_idx += 1
+            
+            with h5py.File(self.h5_files[file_idx], 'r') as f:
+                frame_idx = idx - self.file_frame_ranges[file_idx][0]
+                frame = f['default'][frame_idx].astype(np.float32)
         
-        # Get the frame from the appropriate file
-        with h5py.File(self.h5_files[file_idx], 'r') as f:
-            frame_idx = idx - self.file_frame_ranges[file_idx][0]
-            frame = f['default'][frame_idx].astype(np.float32)
-            # Normalize to [0, 1]
-            # frame = (frame - frame.min()) / (frame.max() - frame.min())
-            # Add channel dimension
-            frame = frame[np.newaxis, :, :]
-            return torch.from_numpy(frame)
+        frame = frame[np.newaxis, :, :]
+        return torch.from_numpy(frame)
 
 def create_experiment_dir():
     """Create and return path to new experiment directory with timestamp"""
@@ -267,141 +280,190 @@ def train_vae(train_loader, test_loader, model, optimizer, device, epoch, train_
     video_path = os.path.join(exp_dir, "videos", f"reconstruction_epoch_{epoch}.mp4")
     create_comparison_video(model, test_dataset, video_path, max_frames=len(test_dataset)//10)
 
+def cleanup():
+    """Clean up temporary directories"""
+    import shutil
+    if os.path.exists("data/temp_train"):
+        shutil.rmtree("data/temp_train")
+    if os.path.exists("data/temp_test"):
+        shutil.rmtree("data/temp_test")
+
 def main():
-    # Get data dimensions from first file
-    first_file = glob(os.path.join("input", "volume*.h5"))[0]
-    with h5py.File(first_file, 'r') as f:
-        data = f['default']
-        height, width = data.shape[1:]
-    
-    # Parameters
-    model_params = {
-        'image_height': height,
-        'image_width': width,
-        'n_distributions': 512,  # Number of categorical distributions
-        'n_categories': 8,    # Number of categories per distribution
-    }
-    
-    training_params = {
-        'batch_size': 32,
-        'epochs': 75,
-        'learning_rate': 1e-3,
-        'train_split': 0.9,  # 90% for training
-    }
-    
-    # Create experiment directory
-    exp_dir = create_experiment_dir()
-    print(f"Saving experiment results to: {exp_dir}")
-    
-    # Initialize model early to save architecture
-    model = VariationalAutoEncoder(
-        model_params['image_height'],
-        model_params['image_width'],
-        model_params['n_distributions'],
-        model_params['n_categories']
-    )
-    
-    # Save complete model architecture
-    with open(os.path.join(exp_dir, "model_architecture.txt"), "w") as f:
-        f.write("Complete Model Architecture:\n")
-        f.write("=" * 50 + "\n\n")
-        f.write(str(model))
-        f.write("\n\n" + "=" * 50 + "\n\n")
-        f.write("Model Parameters:\n")
-        for key, value in model_params.items():
-            f.write(f"{key}: {value}\n")
-        f.write("\nTraining Parameters:\n")
-        for key, value in training_params.items():
-            f.write(f"{key}: {value}\n")
+    try:
+        # Get all recording directories
+        data_dir = "data"
+        recording_dirs = [os.path.join(data_dir, d) for d in os.listdir(data_dir) 
+                         if d.endswith('_preprocessed') and os.path.isdir(os.path.join(data_dir, d))]
         
-        # Add some useful statistics
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        f.write(f"\nModel Statistics:\n")
-        f.write(f"Total parameters: {total_params:,}\n")
-        f.write(f"Trainable parameters: {trainable_params:,}\n")
-        f.write(f"Input shape: ({1}, {height}, {width})\n")
-        f.write(f"Latent space size: {model_params['n_distributions'] * model_params['n_categories']}\n")
-    
-    # Get and sort all h5 files
-    h5_files = sorted(glob(os.path.join("data", "volume*.h5")))
-    n_files = len(h5_files)
-    n_train = int(n_files * training_params['train_split'])
-    
-    # Split into train and test sets
-    train_files = h5_files[:n_train]
-    test_files = h5_files[n_train:]
-    
-    # Create datasets and dataloaders
-    train_dataset = BrainDataset(train_files)
-    test_dataset = BrainDataset(test_files)
-    
-    train_loader = DataLoader(train_dataset, batch_size=training_params['batch_size'], shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=training_params['batch_size'], shuffle=False)
-    
-    # Test video creation before training
-    print("Testing video creation before training...")
-    test_video_path = os.path.join(exp_dir, "videos", "test_video.mp4")
-    os.makedirs(os.path.dirname(test_video_path), exist_ok=True)
-    
-    # Create a simple test video with original frames only
-    first_frame = test_dataset[0].numpy()[0]
-    height, width = first_frame.shape
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(test_video_path, fourcc, 1, (width * 2, height))
-    
-    n_test_frames = min(10, len(test_dataset))  # Use 10 frames for test
-    print(f"Creating test video with {n_test_frames} frames...")
-    
-    for i in tqdm(range(n_test_frames)):
-        frame = test_dataset[i].numpy()[0]
-        #frame_uint8 = (frame * 255).astype(np.uint8)
-        frame_uint8 = normalize_frame(frame)
-        # Create side-by-side comparison with the same frame
-        comparison = np.hstack([frame_uint8, frame_uint8])
-        comparison_rgb = cv2.cvtColor(comparison, cv2.COLOR_GRAY2BGR)
-        out.write(comparison_rgb)
-    
-    out.release()
-    print(f"Test video saved as {test_video_path}")
-    
-    if not os.path.exists(test_video_path) or os.path.getsize(test_video_path) == 0:
-        raise Exception("Failed to create test video. Please check video writing capabilities.")
-    
-    # Move model to device after architecture is saved
-    device = torch.device("cuda:1") #torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    model = model.to(device)
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=training_params['learning_rate'])
-    
-    # Training loop
-    print("Starting training...")
-    train_losses = []
-    recon_losses = []
-    kl_losses = []
-    test_losses = []  # List to store test losses per epoch
-    
-    for epoch in range(1, training_params['epochs'] + 1):
-        train_vae(train_loader, test_loader, model, optimizer, device, epoch, 
-                 train_losses, recon_losses, kl_losses, test_losses, exp_dir, test_dataset)
+        if not recording_dirs:
+            raise ValueError("No preprocessed recording directories found in data/")
         
-        # Save checkpoint every 4 epochs
-        if epoch % 4 == 0:
-            checkpoint_path = os.path.join(exp_dir, "checkpoints", f"vae_epoch_{epoch}.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_losses': train_losses,
-                'recon_losses': recon_losses,
-                'kl_losses': kl_losses,
-                'test_losses': test_losses,
-            }, checkpoint_path)
-    
-    # Save final model
-    final_model_path = os.path.join(exp_dir, "checkpoints", "vae_final.pt")
-    torch.save(model.state_dict(), final_model_path)
+        print(f"Found {len(recording_dirs)} recording directories: {recording_dirs}")
+        
+        # Collect all h5 files from all recordings
+        all_h5_files = []
+        for recording_dir in recording_dirs:
+            recording_files = sorted(glob(os.path.join(recording_dir, "volume*.h5")))
+            all_h5_files.extend(recording_files)
+        
+        if not all_h5_files:
+            raise ValueError("No h5 files found in recording directories")
+        
+        # Get data dimensions and frames per file from first file
+        with h5py.File(all_h5_files[0], 'r') as f:
+            data = f['default']
+            height, width = data.shape[1:]
+            frames_per_file = data.shape[0]
+        
+        # Parameters
+        model_params = {
+            'image_height': height,
+            'image_width': width,
+            'n_distributions': 256,  # Number of categorical distributions
+            'n_categories': 8,    # Number of categories per distribution
+        }
+        
+        training_params = {
+            'batch_size': 32,
+            'epochs': 75,
+            'learning_rate': 1e-3,
+            'train_split': 0.9,  # 90% for training
+        }
+        
+        # Create experiment directory
+        exp_dir = create_experiment_dir()
+        print(f"Saving experiment results to: {exp_dir}")
+        
+        # Initialize model
+        model = VariationalAutoEncoder(
+            model_params['image_height'],
+            model_params['image_width'],
+            model_params['n_distributions'],
+            model_params['n_categories']
+        )
+        
+        # Save model architecture and parameters
+        with open(os.path.join(exp_dir, "model_architecture.txt"), "w") as f:
+            f.write("Complete Model Architecture:\n")
+            f.write("=" * 50 + "\n\n")
+            f.write(str(model))
+            f.write("\n\n" + "=" * 50 + "\n\n")
+            f.write("Model Parameters:\n")
+            for key, value in model_params.items():
+                f.write(f"{key}: {value}\n")
+            f.write("\nTraining Parameters:\n")
+            for key, value in training_params.items():
+                f.write(f"{key}: {value}\n")
+            f.write("\nRecording Directories:\n")
+            for dir_path in recording_dirs:
+                f.write(f"- {dir_path}\n")
+            
+            # Add statistics
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            f.write(f"\nModel Statistics:\n")
+            f.write(f"Total parameters: {total_params:,}\n")
+            f.write(f"Trainable parameters: {trainable_params:,}\n")
+            f.write(f"Input shape: ({1}, {height}, {width})\n")
+            f.write(f"Latent space size: {model_params['n_distributions'] * model_params['n_categories']}\n")
+        
+        # Calculate total number of frames
+        total_frames = len(all_h5_files) * frames_per_file
+        
+        # Create indices for all frames
+        all_indices = [(file_idx, frame_idx) 
+                      for file_idx in range(len(all_h5_files)) 
+                      for frame_idx in range(frames_per_file)]
+        
+        # Randomly shuffle indices
+        np.random.seed(42)  # For reproducibility
+        np.random.shuffle(all_indices)
+        
+        # Split indices into train and test
+        n_train = int(len(all_indices) * training_params['train_split'])
+        train_indices = all_indices[:n_train]
+        test_indices = all_indices[n_train:]
+        
+        # Create datasets using the split indices
+        train_dataset = BrainDataset(all_h5_files, train_indices)
+        test_dataset = BrainDataset(all_h5_files, test_indices)
+        
+        train_loader = DataLoader(train_dataset, batch_size=training_params['batch_size'], shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=training_params['batch_size'], shuffle=False)
+        
+        print(f"Total frames: {total_frames}")
+        print(f"Training set size: {len(train_dataset)} frames ({len(train_dataset) / frames_per_file:.1f} volumes)")
+        print(f"Test set size: {len(test_dataset)} frames ({len(test_dataset) / frames_per_file:.1f} volumes)")
+        
+        # Test video creation before training
+        print("Testing video creation before training...")
+        test_video_path = os.path.join(exp_dir, "videos", "test_video.mp4")
+        os.makedirs(os.path.dirname(test_video_path), exist_ok=True)
+        
+        # Create a simple test video with original frames only
+        first_frame = test_dataset[0].numpy()[0]
+        height, width = first_frame.shape
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(test_video_path, fourcc, 1, (width * 2, height))
+        
+        n_test_frames = min(10, len(test_dataset))  # Use 10 frames for test
+        print(f"Creating test video with {n_test_frames} frames...")
+        
+        for i in tqdm(range(n_test_frames)):
+            frame = test_dataset[i].numpy()[0]
+            #frame_uint8 = (frame * 255).astype(np.uint8)
+            frame_uint8 = normalize_frame(frame)
+            # Create side-by-side comparison with the same frame
+            comparison = np.hstack([frame_uint8, frame_uint8])
+            comparison_rgb = cv2.cvtColor(comparison, cv2.COLOR_GRAY2BGR)
+            out.write(comparison_rgb)
+        
+        out.release()
+        print(f"Test video saved as {test_video_path}")
+        
+        if not os.path.exists(test_video_path) or os.path.getsize(test_video_path) == 0:
+            raise Exception("Failed to create test video. Please check video writing capabilities.")
+        
+        # Move model to device after architecture is saved
+        device = torch.device("cuda:1") #torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+        model = model.to(device)
+        
+        optimizer = torch.optim.Adam(model.parameters(), lr=training_params['learning_rate'])
+        
+        # Training loop
+        print("Starting training...")
+        train_losses = []
+        recon_losses = []
+        kl_losses = []
+        test_losses = []  # List to store test losses per epoch
+        
+        for epoch in range(1, training_params['epochs'] + 1):
+            train_vae(train_loader, test_loader, model, optimizer, device, epoch, 
+                     train_losses, recon_losses, kl_losses, test_losses, exp_dir, test_dataset)
+            
+            # Save checkpoint every 4 epochs
+            if epoch % 4 == 0:
+                checkpoint_path = os.path.join(exp_dir, "checkpoints", f"vae_epoch_{epoch}.pt")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_losses': train_losses,
+                    'recon_losses': recon_losses,
+                    'kl_losses': kl_losses,
+                    'test_losses': test_losses,
+                }, checkpoint_path)
+        
+        # Save final model
+        final_model_path = os.path.join(exp_dir, "checkpoints", "vae_final.pt")
+        torch.save(model.state_dict(), final_model_path)
+        
+        # Clean up at the end
+        cleanup()
+    except Exception as e:
+        cleanup()  # Clean up even if there's an error
+        raise e
 
 if __name__ == "__main__":
     main()

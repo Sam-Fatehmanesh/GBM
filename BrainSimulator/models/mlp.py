@@ -15,7 +15,7 @@ class MLP(nn.Module):
             layer = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size),
                 RMSNorm(hidden_size),
-                nn.GELU()
+                nn.GELU(),
             )
             self.hidden_layers.append(layer)
 
@@ -28,7 +28,6 @@ class MLP(nn.Module):
         x = self.input_activation(x)
         residual = x
         
-
         # Hidden layers with residual connections
         for layer in self.hidden_layers:
             x = layer(x)

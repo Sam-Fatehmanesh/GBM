@@ -152,12 +152,23 @@ def process_volume(input_file, output_file, slice_means, slice_maxes, global_sta
         with h5py.File(output_file, 'w') as out_f:
             out_f.create_dataset('default', data=processed_data)
 
-def main():
-    # Create output directory
-    os.makedirs('data', exist_ok=True)
+def process_recording(input_dir, output_dir, recording_name):
+    """
+    Process all h5 files from a single recording.
+    
+    Args:
+        input_dir: Directory containing input h5 files
+        output_dir: Base directory for processed outputs
+        recording_name: Name of the recording (used for output subdirectory)
+    """
+    # Create output directory for this recording
+    recording_output_dir = os.path.join(output_dir, f"{recording_name}_preprocessed")
+    os.makedirs(recording_output_dir, exist_ok=True)
     
     # Get all input files
-    input_files = sorted(glob(os.path.join('input', '*.h5')))
+    input_files = sorted(glob(os.path.join(input_dir, '*.h5')))
+    if not input_files:
+        raise ValueError(f"No h5 files found in {input_dir}")
     
     # Calculate slice means using normalized frames
     slice_means = calculate_slice_means(input_files)
@@ -166,7 +177,7 @@ def main():
     slice_maxes = find_slice_max_values(input_files, slice_means)
     
     # Save the slice statistics for reference
-    with h5py.File(os.path.join('data', 'slice_statistics.h5'), 'w') as f:
+    with h5py.File(os.path.join(recording_output_dir, 'slice_statistics.h5'), 'w') as f:
         f.create_dataset('slice_means', data=slice_means)
         f.create_dataset('slice_maxes', data=slice_maxes)
     
@@ -177,7 +188,7 @@ def main():
     for input_file in tqdm(input_files, desc='Applying preprocessing'):
         # Create corresponding output filename
         filename = os.path.basename(input_file)
-        output_file = os.path.join('data', f'{filename}')
+        output_file = os.path.join(recording_output_dir, filename)
         
         # Process the volume
         process_volume(input_file, output_file, slice_means, slice_maxes, global_frame_idx)
@@ -185,6 +196,65 @@ def main():
         # Update global frame index
         with h5py.File(input_file, 'r') as f:
             global_frame_idx += f['default'].shape[0]
+
+def tif_to_h5(tif_path, output_dir):
+    """
+    Convert a tif file to h5 files.
+    
+    Args:
+        tif_path: Path to input tif file
+        output_dir: Directory to save h5 files
+    """
+    from skimage import io
+    
+    # Read the tif file
+    print(f"Reading tif file: {tif_path}")
+    data = io.imread(tif_path)
+    nfr_per_vol = 25
+    prev_frame = 0
+    total_num_frames = len(data)
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Converting to h5 files...")
+    for volume, next_frame in enumerate(
+        tqdm(np.arange(nfr_per_vol, total_num_frames + nfr_per_vol, nfr_per_vol))
+    ):
+        h5_path = os.path.join(output_dir, f"volume{1000 + volume}.h5")
+        with h5py.File(h5_path, "w") as h5_file:
+            h5_file.create_dataset(
+                "default", data=data[prev_frame:next_frame]
+            )
+        prev_frame = next_frame
+    print(f"Conversion complete. H5 files saved in {output_dir}")
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Process brain recording data')
+    parser.add_argument('--tif_file', type=str, help='Path to input tif file')
+    parser.add_argument('--input_dir', type=str, help='Directory containing input h5 files')
+    parser.add_argument('--output_dir', type=str, default='data', help='Base directory for outputs')
+    parser.add_argument('--recording_name', type=str, required=True, help='Name of the recording (e.g. recording_1)')
+    
+    args = parser.parse_args()
+    
+    if args.tif_file:
+        # If tif file provided, first convert to h5
+        temp_h5_dir = os.path.join(args.output_dir, 'temp_h5')
+        tif_to_h5(args.tif_file, temp_h5_dir)
+        input_dir = temp_h5_dir
+    else:
+        input_dir = args.input_dir
+        
+    if not input_dir:
+        raise ValueError("Either --tif_file or --input_dir must be provided")
+    
+    # Process the recording
+    process_recording(input_dir, args.output_dir, args.recording_name)
+    
+    # Clean up temporary directory if it was created
+    if args.tif_file and os.path.exists(temp_h5_dir):
+        import shutil
+        shutil.rmtree(temp_h5_dir)
 
 if __name__ == '__main__':
     main() 
