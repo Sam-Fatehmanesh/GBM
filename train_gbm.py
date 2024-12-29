@@ -122,7 +122,7 @@ def create_experiment_dir():
     os.makedirs(os.path.join(exp_dir, "plots"), exist_ok=True)
     return exp_dir
 
-def evaluate_test_loss(model, test_loader, device):
+def evaluate_test_loss(model, test_loader, device, model_params):
     """Evaluate model on test set and return average loss"""
     model.eval()
     total_loss = 0
@@ -266,7 +266,7 @@ def create_prediction_video(model, test_dataset, output_path, recording_dirs, fp
     print(f"Video saved as {output_path}")
 
 def train_gbm(train_loader, test_loader, model, optimizer, device, epoch, train_losses, 
-              test_losses, exp_dir, test_dataset, recording_dirs):
+              test_losses, exp_dir, test_dataset, recording_dirs, model_params):
     model.train()
     
     for batch_idx, sequences in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}")):
@@ -315,7 +315,7 @@ def train_gbm(train_loader, test_loader, model, optimizer, device, epoch, train_
             plot_losses(train_losses, test_losses, exp_dir, train_loader)
     
     # Evaluate on test set at the end of each epoch
-    test_loss = evaluate_test_loss(model, test_loader, device)
+    test_loss = evaluate_test_loss(model, test_loader, device, model_params)
     test_losses.append(test_loss)
     
     # Save losses to CSV
@@ -382,14 +382,14 @@ def main():
             'image_width': width,
             'n_distributions': 1024,  # Number of categorical distributions
             'n_categories': 8,    # Number of categories per distribution
-            'd_model': 1024 * 8,  # Must match VAE latent size
+            'd_model': 1024,  # Must match VAE latent size
             'num_layers': 8,      # Number of Mamba layers
         }
         
         training_params = {
             'batch_size': 4,
             'sequence_length': 32,
-            'epochs': 50,
+            'epochs': 3,
             'learning_rate': 1e-4,
             'train_split': 0.9,  # 90% for training
         }
@@ -418,6 +418,65 @@ def main():
             num_categories=model_params['n_categories']
         )
         model.pretrained_vae = vae  # Replace default VAE with our loaded one
+        
+        # Set device
+        device = torch.device("cuda:0")
+        print(f"Using device: {device}")
+        model = model.to(device)
+        vae = vae.to(device)
+        
+        # Calculate total number of frames
+        total_frames = len(all_h5_files) * frames_per_file
+        
+        # Create indices for all frames
+        all_indices = [(file_idx, frame_idx) 
+                      for file_idx in range(len(all_h5_files)) 
+                      for frame_idx in range(frames_per_file)]
+        
+        # Randomly shuffle indices
+        np.random.seed(42)  # For reproducibility
+        np.random.shuffle(all_indices)
+        
+        # Split indices into train and test
+        n_train = int(len(all_indices) * training_params['train_split'])
+        train_indices = all_indices[:n_train]
+        test_indices = all_indices[n_train:]
+        
+        # Create datasets using the split indices
+        train_dataset = BrainSequenceDataset(
+            all_h5_files, 
+            sequence_length=training_params['sequence_length'],
+            frame_indices=train_indices
+        )
+        test_dataset = BrainSequenceDataset(
+            all_h5_files, 
+            sequence_length=training_params['sequence_length'],
+            frame_indices=test_indices
+        )
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=training_params['batch_size'],
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
+        )
+        
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=training_params['batch_size'],
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
+        )
+        
+        print(f"Total frames: {total_frames}")
+        print(f"Training set size: {len(train_dataset)} sequences")
+        print(f"Test set size: {len(test_dataset)} sequences")
         
         # Save model architecture and parameters
         with open(os.path.join(exp_dir, "model_architecture.txt"), "w") as f:
@@ -486,64 +545,6 @@ def main():
             f.write(f"Frames per volume: {frames_per_file}\n")
             f.write(f"Number of volumes: {len(all_h5_files)}\n")
         
-        # Calculate total number of frames
-        total_frames = len(all_h5_files) * frames_per_file
-        
-        # Create indices for all frames
-        all_indices = [(file_idx, frame_idx) 
-                      for file_idx in range(len(all_h5_files)) 
-                      for frame_idx in range(frames_per_file)]
-        
-        # Randomly shuffle indices
-        np.random.seed(42)  # For reproducibility
-        np.random.shuffle(all_indices)
-        
-        # Split indices into train and test
-        n_train = int(len(all_indices) * training_params['train_split'])
-        train_indices = all_indices[:n_train]
-        test_indices = all_indices[n_train:]
-        
-        # Create datasets using the split indices
-        train_dataset = BrainSequenceDataset(
-            all_h5_files, 
-            sequence_length=training_params['sequence_length'],
-            frame_indices=train_indices
-        )
-        test_dataset = BrainSequenceDataset(
-            all_h5_files, 
-            sequence_length=training_params['sequence_length'],
-            frame_indices=test_indices
-        )
-        
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=training_params['batch_size'],
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=True
-        )
-        
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=training_params['batch_size'],
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=True
-        )
-        
-        print(f"Total frames: {total_frames}")
-        print(f"Training set size: {len(train_dataset)} sequences")
-        print(f"Test set size: {len(test_dataset)} sequences")
-        
-        # Move model to device
-        device = torch.device("cuda:0")
-        print(f"Using device: {device}")
-        model = model.to(device)
-        
         # Freeze VAE parameters
         for param in model.pretrained_vae.parameters():
             param.requires_grad = False
@@ -560,7 +561,8 @@ def main():
         
         for epoch in range(1, training_params['epochs'] + 1):
             train_gbm(train_loader, test_loader, model, optimizer, device, epoch, 
-                     train_losses, test_losses, exp_dir, test_dataset, recording_dirs)
+                     train_losses, test_losses, exp_dir, test_dataset, recording_dirs,
+                     model_params)
             
             # Save checkpoint every 5 epochs
             if epoch % 5 == 0:
