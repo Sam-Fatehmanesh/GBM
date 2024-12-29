@@ -16,11 +16,12 @@ from BrainSimulator.models.vae import VariationalAutoEncoder
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 class BrainDataset(Dataset):
-    def __init__(self, h5_files, frame_indices=None):
+    def __init__(self, h5_files, frame_indices=None, cache_size=4):
         """
         Args:
             h5_files: List of h5 file paths
             frame_indices: Optional list of (file_idx, frame_idx) tuples specifying which frames to use
+            cache_size: Number of h5 files to keep in memory (default: 4)
         """
         self.h5_files = h5_files
         self.frames_per_file = None
@@ -29,6 +30,11 @@ class BrainDataset(Dataset):
         self.height = None
         self.width = None
         self.frame_indices = frame_indices
+        
+        # Cache for h5 files
+        self.cache_size = cache_size
+        self.file_cache = {}
+        self.cache_order = []
         
         # Get dimensions from first file
         with h5py.File(self.h5_files[0], 'r') as f:
@@ -46,6 +52,37 @@ class BrainDataset(Dataset):
                     self.total_frames += n_frames
         else:
             self.total_frames = len(frame_indices)
+            
+        # Precompute file indices for faster lookup
+        if frame_indices is None:
+            self.file_lookup = np.zeros(self.total_frames, dtype=np.int32)
+            self.frame_lookup = np.zeros(self.total_frames, dtype=np.int32)
+            for idx in range(self.total_frames):
+                file_idx = 0
+                while file_idx < len(self.file_frame_ranges) and idx >= self.file_frame_ranges[file_idx][1]:
+                    file_idx += 1
+                self.file_lookup[idx] = file_idx
+                self.frame_lookup[idx] = idx - self.file_frame_ranges[file_idx][0]
+    
+    def _get_cached_file(self, file_idx):
+        """Get file from cache or load it if not present"""
+        if file_idx in self.file_cache:
+            # Move to end of cache order (most recently used)
+            self.cache_order.remove(file_idx)
+            self.cache_order.append(file_idx)
+            return self.file_cache[file_idx]
+        
+        # Load file into cache
+        data = h5py.File(self.h5_files[file_idx], 'r')['default'][:]
+        
+        # If cache is full, remove least recently used file
+        if len(self.file_cache) >= self.cache_size:
+            lru_idx = self.cache_order.pop(0)
+            del self.file_cache[lru_idx]
+        
+        self.file_cache[file_idx] = data
+        self.cache_order.append(file_idx)
+        return data
     
     def __len__(self):
         return self.total_frames
@@ -54,18 +91,14 @@ class BrainDataset(Dataset):
         if self.frame_indices is not None:
             # If using specific frame indices
             file_idx, frame_idx = self.frame_indices[idx]
-            with h5py.File(self.h5_files[file_idx], 'r') as f:
-                frame = f['default'][frame_idx].astype(np.float32)
         else:
             # If using all frames sequentially
-            file_idx = 0
-            while file_idx < len(self.file_frame_ranges) and idx >= self.file_frame_ranges[file_idx][1]:
-                file_idx += 1
-            
-            with h5py.File(self.h5_files[file_idx], 'r') as f:
-                frame_idx = idx - self.file_frame_ranges[file_idx][0]
-                frame = f['default'][frame_idx].astype(np.float32)
+            file_idx = self.file_lookup[idx]
+            frame_idx = self.frame_lookup[idx]
         
+        # Get frame from cache
+        data = self._get_cached_file(file_idx)
+        frame = data[frame_idx].astype(np.float32)
         frame = frame[np.newaxis, :, :]
         return torch.from_numpy(frame)
 
@@ -177,8 +210,18 @@ def normalize_frame(frame):
         return np.zeros_like(frame, dtype=np.uint8)
     return ((frame - frame_min) / (frame_max - frame_min) * 255).astype(np.uint8)
 
-def create_comparison_video(model, test_dataset, output_path, fps=1, max_frames=None):
-    """Create a video comparing original and reconstructed frames"""
+def create_comparison_video(model, test_dataset, output_path, recording_dirs, fps=1, max_frames=None, recording_idx=0):
+    """Create a video comparing original and reconstructed frames
+    
+    Args:
+        model: The VAE model
+        test_dataset: The test dataset
+        output_path: Where to save the video
+        recording_dirs: List of recording directories
+        fps: Frames per second
+        max_frames: Maximum number of frames to process
+        recording_idx: Which recording to use (index into recording_dirs)
+    """
     device = next(model.parameters()).device
     
     # Get dimensions from first frame
@@ -189,27 +232,44 @@ def create_comparison_video(model, test_dataset, output_path, fps=1, max_frames=
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width * 2, height))
     
+    # Find consecutive frames from the specified recording
+    recording_files = sorted(glob(os.path.join(recording_dirs[recording_idx], "volume*.h5")))
+    frames_per_volume = None
+    
+    # Get frames per volume from first file
+    with h5py.File(recording_files[0], 'r') as f:
+        frames_per_volume = f['default'].shape[0]
+    
+    # Create indices for consecutive frames from this recording
+    start_file_idx = sum(len(glob(os.path.join(d, "volume*.h5"))) 
+                        for d in recording_dirs[:recording_idx])
+    consecutive_indices = [(start_file_idx + file_idx, frame_idx)
+                         for file_idx in range(len(recording_files))
+                         for frame_idx in range(frames_per_volume)]
+    
     # Determine how many frames to process
-    total_frames = len(test_dataset)
+    total_frames = len(consecutive_indices)
     if max_frames is not None:
         total_frames = min(total_frames, max_frames)
     
     model.eval()
-    print(f"Creating comparison video with first {total_frames} frames...")
+    print(f"Creating comparison video with {total_frames} consecutive frames from recording {recording_idx + 1}...")
     with torch.no_grad():
         for i in tqdm(range(total_frames)):
-            # Get original frame
-            frame = test_dataset[i].unsqueeze(0).to(device)
+            # Get original frame using consecutive indices
+            file_idx, frame_idx = consecutive_indices[i]
+            with h5py.File(test_dataset.h5_files[file_idx], 'r') as f:
+                frame = f['default'][frame_idx].astype(np.float32)
+            
+            # Prepare frame for model
+            frame_tensor = torch.from_numpy(frame[np.newaxis, np.newaxis, :, :]).to(device)
             
             # Get reconstruction
-            reconstruction, _, _ = model(frame)
+            reconstruction, _, _ = model(frame_tensor)
             
             # Convert to numpy arrays and normalize to uint8
-            original = normalize_frame(frame[0, 0].cpu().numpy())
+            original = normalize_frame(frame)
             reconstructed = normalize_frame(reconstruction[0, 0].cpu().numpy())
-
-            # original = (frame[0, 0].cpu().numpy() * 255).astype(np.uint8)
-            # reconstructed = (reconstruction[0, 0].cpu().numpy() * 255).astype(np.uint8)
             
             # Create side-by-side comparison
             comparison = np.hstack([original, reconstructed])
@@ -223,7 +283,8 @@ def create_comparison_video(model, test_dataset, output_path, fps=1, max_frames=
     out.release()
     print(f"Video saved as {output_path}")
 
-def train_vae(train_loader, test_loader, model, optimizer, device, epoch, train_losses, recon_losses, kl_losses, test_losses, exp_dir, test_dataset):
+def train_vae(train_loader, test_loader, model, optimizer, device, epoch, train_losses, 
+              recon_losses, kl_losses, test_losses, exp_dir, test_dataset, recording_dirs):
     model.train()
     
     for batch_idx, data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}")):
@@ -276,9 +337,12 @@ def train_vae(train_loader, test_loader, model, optimizer, device, epoch, train_
     # Plot losses
     plot_losses(train_losses, recon_losses, kl_losses, test_losses, exp_dir, train_loader)
     
-    # Generate comparison video
-    video_path = os.path.join(exp_dir, "videos", f"reconstruction_epoch_{epoch}.mp4")
-    create_comparison_video(model, test_dataset, video_path, max_frames=len(test_dataset)//10)
+    # Generate comparison video for each recording
+    for recording_idx in range(len(recording_dirs)):
+        video_path = os.path.join(exp_dir, "videos", f"reconstruction_recording_{recording_idx + 1}_epoch_{epoch}.mp4")
+        create_comparison_video(model, test_dataset, video_path, recording_dirs,
+                              max_frames=min(100, len(test_dataset)//len(recording_dirs)),
+                              recording_idx=recording_idx)
 
 def cleanup():
     """Clean up temporary directories"""
@@ -319,13 +383,13 @@ def main():
         model_params = {
             'image_height': height,
             'image_width': width,
-            'n_distributions': 256,  # Number of categorical distributions
+            'n_distributions': 1024,  # Number of categorical distributions
             'n_categories': 8,    # Number of categories per distribution
         }
         
         training_params = {
             'batch_size': 32,
-            'epochs': 75,
+            'epochs': 5,
             'learning_rate': 1e-3,
             'train_split': 0.9,  # 90% for training
         }
@@ -388,8 +452,25 @@ def main():
         train_dataset = BrainDataset(all_h5_files, train_indices)
         test_dataset = BrainDataset(all_h5_files, test_indices)
         
-        train_loader = DataLoader(train_dataset, batch_size=training_params['batch_size'], shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=training_params['batch_size'], shuffle=False)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=training_params['batch_size'],
+            shuffle=True,
+            num_workers=4,  # Adjust based on CPU cores
+            pin_memory=True,  # Speeds up transfer to GPU
+            prefetch_factor=2,  # Number of batches loaded in advance by each worker
+            persistent_workers=True  # Keep workers alive between epochs
+        )
+        
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=training_params['batch_size'],
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
+        )
         
         print(f"Total frames: {total_frames}")
         print(f"Training set size: {len(train_dataset)} frames ({len(train_dataset) / frames_per_file:.1f} volumes)")
@@ -425,7 +506,7 @@ def main():
             raise Exception("Failed to create test video. Please check video writing capabilities.")
         
         # Move model to device after architecture is saved
-        device = torch.device("cuda:1") #torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda:0") #torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
         model = model.to(device)
         
@@ -440,7 +521,8 @@ def main():
         
         for epoch in range(1, training_params['epochs'] + 1):
             train_vae(train_loader, test_loader, model, optimizer, device, epoch, 
-                     train_losses, recon_losses, kl_losses, test_losses, exp_dir, test_dataset)
+                     train_losses, recon_losses, kl_losses, test_losses, exp_dir, 
+                     test_dataset, recording_dirs)
             
             # Save checkpoint every 4 epochs
             if epoch % 4 == 0:
@@ -465,5 +547,4 @@ def main():
         cleanup()  # Clean up even if there's an error
         raise e
 
-if __name__ == "__main__":
-    main()
+main()

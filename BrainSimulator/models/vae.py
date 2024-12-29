@@ -16,7 +16,7 @@ class VariationalAutoEncoder(nn.Module):
         self.n_categories = n_categories  # Number of categories per distribution
         self.latent_size = n_distributions * n_categories  # Total size of latent space
         
-        self.scalings = [4, 4, 8]#, 4]  # Down/Upsampling factors
+        self.scalings = [4, 4, 4]#, 4]  # Down/Upsampling factors
 
         # Calculate padded dimensions to make them divisible by total scaling
         total_scaling = int(np.prod(self.scalings))
@@ -31,12 +31,14 @@ class VariationalAutoEncoder(nn.Module):
         self.pad_left = int(self.pad_width // 2)
         self.pad_right = int(self.pad_width - self.pad_left)
 
-        self.latent_channels_size = self.n_distributions
+        
 
         # Calculate sizes after CNN layers
         self.post_cnn_height = int(self.padded_height // total_scaling)
         self.post_cnn_width = int(self.padded_width // total_scaling)
-        self.post_cnn_encoder_size = int(self.post_cnn_height * self.post_cnn_width * self.latent_channels_size)
+        self.post_cnn_encoder_size = int(self.post_cnn_height * self.post_cnn_width * self.n_distributions)
+
+        self.latent_channels_size = self.post_cnn_encoder_size // int(self.post_cnn_height * self.post_cnn_width)
         
         self.encoder = nn.Sequential(
             CNNLayer(1, 32, 7),
@@ -52,7 +54,7 @@ class VariationalAutoEncoder(nn.Module):
             # nn.MaxPool2d(self.scalings[3], stride=self.scalings[3]),
 
             nn.Flatten(),
-            MLP(3, self.post_cnn_encoder_size, self.latent_size, self.n_distributions * self.n_categories)
+            MLP(3, self.post_cnn_encoder_size, self.latent_size, self.latent_size)
         )
 
         self.softmax_act = nn.Softmax(dim=1)
