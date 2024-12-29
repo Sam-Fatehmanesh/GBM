@@ -12,10 +12,10 @@ class StackedMamba(nn.Module):
         self.num_layers = num_layers
         self.layers = nn.ModuleList([Mamba(d_model=d_model) for _ in range(num_layers)])
         self.norms = nn.ModuleList([RMSNorm(d_model) for _ in range(num_layers)])
-
+    
     def forward(self, x):
         for layer, norm in zip(self.layers, self.norms):
             # Residual connection
             x = layer(norm(x)) + x
-            
+    
         return x

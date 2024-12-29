@@ -22,7 +22,8 @@ class BrainSequenceDataset(Dataset):
         Args:
             h5_files: List of h5 file paths
             sequence_length: Number of consecutive frames in each sequence
-            frame_indices: Optional list of (file_idx, frame_idx) tuples specifying which frames to use
+            frame_indices: List of (file_idx, frame_idx) tuples specifying which frames to use
+                         These should be pre-arranged into consecutive sequences
             cache_size: Number of h5 files to keep in memory (default: 4)
         """
         self.h5_files = h5_files
@@ -47,25 +48,12 @@ class BrainSequenceDataset(Dataset):
                 self.frames_per_file = data.shape[0]
         
         if frame_indices is None:
-            # Use all frames
-            for h5_file in self.h5_files:
-                with h5py.File(h5_file, 'r') as f:
-                    n_frames = f['default'].shape[0]
-                    self.file_frame_ranges.append((self.total_frames, self.total_frames + n_frames))
-                    self.total_frames += n_frames
-        else:
-            self.total_frames = len(frame_indices)
+            raise ValueError("frame_indices must be provided and pre-arranged into consecutive sequences")
             
-        # Precompute file indices for faster lookup
-        if frame_indices is None:
-            self.file_lookup = np.zeros(self.total_frames, dtype=np.int32)
-            self.frame_lookup = np.zeros(self.total_frames, dtype=np.int32)
-            for idx in range(self.total_frames):
-                file_idx = 0
-                while file_idx < len(self.file_frame_ranges) and idx >= self.file_frame_ranges[file_idx][1]:
-                    file_idx += 1
-                self.file_lookup[idx] = file_idx
-                self.frame_lookup[idx] = idx - self.file_frame_ranges[file_idx][0]
+        self.total_frames = len(frame_indices)
+        # Since indices are already arranged in sequences, just count how many complete sequences we have
+        self.num_sequences = self.total_frames // self.sequence_length
+        print(f"Dataset initialized with {self.total_frames} frames, {self.num_sequences} sequences")
     
     def _get_cached_file(self, file_idx):
         """Get file from cache or load it if not present"""
@@ -88,19 +76,16 @@ class BrainSequenceDataset(Dataset):
         return data
     
     def __len__(self):
-        return max(0, self.total_frames - self.sequence_length)
+        return self.num_sequences
     
     def __getitem__(self, idx):
+        # Get sequence of consecutive frames
+        start_idx = idx * self.sequence_length
         frames = []
+        
         for i in range(self.sequence_length):
-            frame_idx = idx + i
-            if self.frame_indices is not None:
-                # If using specific frame indices
-                file_idx, frame_idx = self.frame_indices[frame_idx]
-            else:
-                # If using all frames sequentially
-                file_idx = self.file_lookup[frame_idx]
-                frame_idx = self.frame_lookup[frame_idx]
+            # Get frame from pre-arranged consecutive indices
+            file_idx, frame_idx = self.frame_indices[start_idx + i]
             
             # Get frame from cache
             data = self._get_cached_file(file_idx)
@@ -151,17 +136,14 @@ def evaluate_test_loss(model, test_loader, device, model_params):
             target_dists = latent_dists[:, 1:]  # Target is all but first
             
             # Reshape for cross entropy loss
-            batch_size, seq_len = predicted_dists.shape[:2]
-            predicted_dists = predicted_dists.reshape(-1, model.num_distributions, model_params['n_categories'])
-            target_dists = target_dists.reshape(-1, model.num_distributions, model_params['n_categories'])
+            # Move all dims except categories into batch dim
+            # predicted: [batch, seq_len, n_dist, n_cat] -> [batch*seq_len*n_dist, n_cat]
+            # target: [batch, seq_len, n_dist, n_cat] -> [batch*seq_len*n_dist]
+            predicted_dists = predicted_dists.reshape(-1, model_params['n_categories'])
+            target_dists = target_dists.reshape(-1, model_params['n_categories'])
             
-            # Compute cross entropy loss between predicted and target distributions
-            # Treat each distribution independently
-            loss = F.cross_entropy(
-                predicted_dists.transpose(1, 2),  # [batch*seq_len, n_categories, n_distributions]
-                target_dists.transpose(1, 2),     # [batch*seq_len, n_categories, n_distributions]
-                reduction='mean'
-            )
+            # Compute cross entropy loss
+            loss = F.cross_entropy(predicted_dists, target_dists, reduction='mean')
             
             total_loss += loss.item()
             n_batches += 1
@@ -292,17 +274,14 @@ def train_gbm(train_loader, test_loader, model, optimizer, device, epoch, train_
         target_dists = latent_dists[:, 1:]  # Target is all but first
         
         # Reshape for cross entropy loss
-        batch_size, seq_len = predicted_dists.shape[:2]
-        predicted_dists = predicted_dists.reshape(-1, model.num_distributions, model_params['n_categories'])
-        target_dists = target_dists.reshape(-1, model.num_distributions, model_params['n_categories'])
+        # Move all dims except categories into batch dim
+        # predicted: [batch, seq_len, n_dist, n_cat] -> [batch*seq_len*n_dist, n_cat]
+        # target: [batch, seq_len, n_dist, n_cat] -> [batch*seq_len*n_dist]
+        predicted_dists = predicted_dists.reshape(-1, model_params['n_categories'])
+        target_dists = target_dists.reshape(-1, model_params['n_categories'])
         
-        # Compute cross entropy loss between predicted and target distributions
-        # Treat each distribution independently
-        loss = F.cross_entropy(
-            predicted_dists.transpose(1, 2),  # [batch*seq_len, n_categories, n_distributions]
-            target_dists.transpose(1, 2),     # [batch*seq_len, n_categories, n_distributions]
-            reduction='mean'
-        )
+        # Compute cross entropy loss
+        loss = F.cross_entropy(predicted_dists, target_dists, reduction='mean')
         
         loss.backward()
         optimizer.step()
@@ -383,14 +362,14 @@ def main():
             'n_distributions': 1024,  # Number of categorical distributions
             'n_categories': 8,    # Number of categories per distribution
             'd_model': 1024,  # Must match VAE latent size
-            'num_layers': 8,      # Number of Mamba layers
+            'num_layers': 32,      # Number of Mamba layers
         }
         
         training_params = {
-            'batch_size': 4,
+            'batch_size': 128,
             'sequence_length': 32,
-            'epochs': 3,
-            'learning_rate': 1e-4,
+            'epochs': 4,
+            'learning_rate': 1e-5,
             'train_split': 0.9,  # 90% for training
         }
         
@@ -428,19 +407,76 @@ def main():
         # Calculate total number of frames
         total_frames = len(all_h5_files) * frames_per_file
         
-        # Create indices for all frames
-        all_indices = [(file_idx, frame_idx) 
-                      for file_idx in range(len(all_h5_files)) 
-                      for frame_idx in range(frames_per_file)]
+        # Create indices for sequences of consecutive frames
+        sequence_indices = []
+        print(f"\nCreating sequences:")
+        print(f"Frames per file: {frames_per_file}")
+        print(f"Sequence length: {training_params['sequence_length']}")
+        print(f"Number of files: {len(all_h5_files)}")
         
-        # Randomly shuffle indices
+        # Group files by recording
+        recording_files = {}
+        for recording_dir in recording_dirs:
+            recording_name = os.path.basename(recording_dir)
+            recording_files[recording_name] = sorted(glob(os.path.join(recording_dir, "volume*.h5")))
+        
+        # Create sequences for each recording
+        for recording_name, files in recording_files.items():
+            print(f"\nProcessing recording: {recording_name}")
+            total_frames_in_recording = len(files) * frames_per_file
+            
+            # Get the starting file index in all_h5_files for this recording
+            start_file_idx = all_h5_files.index(files[0])
+            
+            # Create sequences that can span across files
+            for start_frame_global in range(total_frames_in_recording - training_params['sequence_length'] + 1):
+                # Calculate which file and frame this sequence starts at
+                start_file_offset = start_frame_global // frames_per_file
+                start_frame_local = start_frame_global % frames_per_file
+                
+                # Create sequence
+                sequence = []
+                for i in range(training_params['sequence_length']):
+                    # Calculate global frame index
+                    frame_global = start_frame_global + i
+                    # Calculate which file and local frame index
+                    file_offset = frame_global // frames_per_file
+                    frame_local = frame_global % frames_per_file
+                    
+                    # Add to sequence if we haven't run out of files
+                    if file_offset < len(files):
+                        file_idx = start_file_idx + file_offset
+                        sequence.append((file_idx, frame_local))
+                
+                # Only add sequence if we got all frames
+                if len(sequence) == training_params['sequence_length']:
+                    sequence_indices.append(sequence)
+            
+            print(f"Created {len(sequence_indices)} sequences so far")
+        
+        print(f"\nTotal sequences created: {len(sequence_indices)}")
+        
+        # Randomly shuffle the sequences (but keep frames within sequences consecutive)
         np.random.seed(42)  # For reproducibility
-        np.random.shuffle(all_indices)
+        np.random.shuffle(sequence_indices)
         
-        # Split indices into train and test
-        n_train = int(len(all_indices) * training_params['train_split'])
-        train_indices = all_indices[:n_train]
-        test_indices = all_indices[n_train:]
+        # Split sequences into train and test
+        n_train = int(len(sequence_indices) * training_params['train_split'])
+        train_sequences = sequence_indices[:n_train]
+        test_sequences = sequence_indices[n_train:]
+        
+        # Flatten sequences for dataset creation while maintaining their order
+        train_indices = []
+        for seq in train_sequences:
+            train_indices.extend(seq)  # Keep sequences consecutive
+            
+        test_indices = []
+        for seq in test_sequences:
+            test_indices.extend(seq)  # Keep sequences consecutive
+        
+        print(f"\nDataset creation:")
+        print(f"Train indices length: {len(train_indices)}")
+        print(f"Test indices length: {len(test_indices)}")
         
         # Create datasets using the split indices
         train_dataset = BrainSequenceDataset(
@@ -475,6 +511,9 @@ def main():
         )
         
         print(f"Total frames: {total_frames}")
+        print(f"Number of sequences created: {len(sequence_indices)}")
+        print(f"Training sequences: {len(train_sequences)} ({len(train_indices)} frames)")
+        print(f"Test sequences: {len(test_sequences)} ({len(test_indices)} frames)")
         print(f"Training set size: {len(train_dataset)} sequences")
         print(f"Test set size: {len(test_dataset)} sequences")
         

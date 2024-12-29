@@ -12,6 +12,10 @@ class GBM(nn.Module):
 
         # We'll set the VAE later when loading pretrained
         self.pretrained_vae = None
+        
+        # Save parameters
+        self.num_distributions = num_distributions
+        self.num_categories = num_categories
 
         self.mamba_core = nn.Sequential(
             nn.Linear(num_categories * num_distributions, d_model),
@@ -20,7 +24,6 @@ class GBM(nn.Module):
         )
 
         self.head_softmax = nn.Softmax(dim=-1)
-        self.num_distributions = num_distributions
 
     def load_pretrained_vae(self, path):
         """Load a pretrained VAE from a checkpoint file"""
@@ -95,11 +98,19 @@ class GBM(nn.Module):
         """
         if self.pretrained_vae is None:
             raise ValueError("VAE not initialized")
+        
+        batch_size, seq_len, _, height, width = x.shape
             
         # Encode sequence to latent space
         latent_sequence = self.encode_images(x)
         # Predict next latent states
         predicted_latents = self.forward(latent_sequence)
+        # Perform argmax to go from distribution to integer encoding
+        predicted_latents = torch.argmax(predicted_latents.view(batch_size, seq_len, self.num_distributions, -1), dim=-1)
+        # Convert to one-hot encodinglaser
+        predicted_latents = F.one_hot(predicted_latents, num_classes=self.num_categories)
+        # Reshape to (batch, seq_len, 1, height, width)
+        predicted_latents = predicted_latents.view(batch_size, seq_len, -1)
         # Decode predicted latents back to images
         predicted_frames = self.decode_images(predicted_latents)
         return predicted_frames
