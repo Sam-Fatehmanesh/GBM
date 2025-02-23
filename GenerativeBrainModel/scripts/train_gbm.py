@@ -19,26 +19,27 @@ from GenerativeBrainModel.datasets.sequential_spike_dataset import SequentialSpi
 from GenerativeBrainModel.custom_functions.visualization import create_comparison_video, update_loss_plot
 
 def get_max_z_planes(spike_files):
-    """Get the maximum number of z-planes across all subjects."""
-    max_z = 0
-    for f in spike_files:
-        with h5py.File(f, 'r') as h5f:
-            cell_positions = h5f['cell_positions'][:]
-            num_z = len(np.unique(np.round(cell_positions[:, 2], decimals=3)))
-            max_z = max(max_z, num_z)
-    return max_z
-
-def collate_sequences(batch):
-    """Custom collate function for batching sequences.
+    """Get the maximum number of z-planes across all subjects.
     
     Args:
-        batch: List of sequences from dataset
+        spike_files: List of paths to processed spike data H5 files
+    
     Returns:
-        Batched sequences tensor
+        max_z_planes: Maximum number of z-planes found across all subjects
     """
-    # All sequences should be the same size
-    sequences = torch.stack(batch, dim=0)
-    return sequences
+    max_z_planes = 0
+    
+    for h5_file in spike_files:
+        with h5py.File(h5_file, 'r') as f:
+            cell_positions = f['cell_positions'][:]
+            # Get unique z values (rounded to handle floating point precision)
+            z_values = np.unique(np.round(cell_positions[:, 2], decimals=3))
+            max_z_planes = max(max_z_planes, len(z_values))
+    
+    if max_z_planes == 0:
+        raise ValueError("No z-planes found in any of the spike files!")
+    
+    return max_z_planes
 
 def create_experiment_dir():
     """Create a timestamped experiment directory with all necessary subdirectories"""
@@ -146,16 +147,105 @@ def create_prediction_video(model, test_dataset, output_path, max_seqs=10, fps=2
     except Exception as e:
         print(f"Error creating prediction video: {str(e)}")
 
+def create_data_check_video(model, test_dataset, output_path, max_seqs=5, fps=2):
+    """Create video showing raw sequences from dataset to verify data generation."""
+    try:
+        device = next(model.parameters()).device
+        model.eval()
+        
+        # Set up video parameters
+        width = 256
+        height = 128
+        scale = 2
+        scaled_width = width * scale
+        scaled_height = height * scale
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Use H264 codec for MP4
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, 
+                            (scaled_width * 3, scaled_height), 
+                            isColor=True)
+        
+        if not out.isOpened():
+            print(f"Failed to create video writer. Trying alternative codec...")
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            out = cv2.VideoWriter(output_path, fourcc, fps, 
+                                (scaled_width * 3, scaled_height), 
+                                isColor=True)
+            
+            if not out.isOpened():
+                print(f"Failed to create video writer with both codecs. Skipping video creation.")
+                return
+        
+        with torch.no_grad():
+            for i in range(min(max_seqs, len(test_dataset))):
+                # Get sequence
+                sequence = test_dataset[i].to(device)
+                sequence = sequence.unsqueeze(0)  # Add batch dimension
+                
+                # Get predictions
+                pred_sequence = model(sequence)
+                
+                # For each frame in sequence (except last)
+                for t in range(sequence.size(1) - 1):
+                    # Get current frame, prediction, and target
+                    current = sequence[0, t].cpu().numpy()
+                    predicted = pred_sequence[0, t].cpu().numpy()
+                    target = sequence[0, t + 1].cpu().numpy()
+                    
+                    # Convert to uint8 images
+                    curr_img = (current * 255).astype(np.uint8)
+                    pred_img = (predicted * 255).astype(np.uint8)
+                    targ_img = (target * 255).astype(np.uint8)
+                    
+                    # Scale up images
+                    curr_img = cv2.resize(curr_img, (scaled_width, scaled_height), 
+                                       interpolation=cv2.INTER_NEAREST)
+                    pred_img = cv2.resize(pred_img, (scaled_width, scaled_height), 
+                                       interpolation=cv2.INTER_NEAREST)
+                    targ_img = cv2.resize(targ_img, (scaled_width, scaled_height), 
+                                       interpolation=cv2.INTER_NEAREST)
+                    
+                    # Convert to RGB
+                    curr_rgb = cv2.cvtColor(curr_img, cv2.COLOR_GRAY2BGR)
+                    pred_rgb = cv2.cvtColor(pred_img, cv2.COLOR_GRAY2BGR)
+                    targ_rgb = cv2.cvtColor(targ_img, cv2.COLOR_GRAY2BGR)
+                    
+                    # Add text labels
+                    cv2.putText(curr_rgb, 'Current', (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(pred_rgb, 'Predicted Next', (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(targ_rgb, 'Actual Next', (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    
+                    # Add frame number
+                    cv2.putText(curr_rgb, f'Seq {i}, Frame {t}', (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    
+                    # Combine horizontally
+                    combined = np.hstack([curr_rgb, pred_rgb, targ_rgb])
+                    out.write(combined)
+        
+        out.release()
+        print(f"\nData check video saved as: {output_path}")
+        
+    except Exception as e:
+        print(f"Error creating data check video: {str(e)}")
+
 def main():
     try:
         # Parameters
         params = {
             'batch_size': 32,
-            'num_epochs': 1,
+            'num_epochs': 4,
             'learning_rate': 1e-4,
             'mamba_layers': 1,
             'mamba_dim': 1024,
-            'timesteps_per_sequence': 10,  # Number of actual timepoints in each sequence
+            'timesteps_per_sequence': 10,
             'train_ratio': 0.95
         }
         
@@ -205,15 +295,14 @@ def main():
         tqdm.write(f"Training sequences: {len(train_dataset)}")
         tqdm.write(f"Test sequences: {len(test_dataset)}")
         
-        # Create dataloaders with custom collate function
+        # Create dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=params['batch_size'],
             shuffle=True,
             num_workers=4,
             pin_memory=True,
-            persistent_workers=True,
-            collate_fn=collate_sequences
+            persistent_workers=True
         )
         
         test_loader = DataLoader(
@@ -222,8 +311,7 @@ def main():
             shuffle=False,
             num_workers=4,
             pin_memory=True,
-            persistent_workers=True,
-            collate_fn=collate_sequences
+            persistent_workers=True
         )
         
         tqdm.write(f"Number of batches in train_loader: {len(train_loader)}")
@@ -256,6 +344,13 @@ def main():
         device = "cuda:0"#torch.device("cuda" if torch.cuda.is_available() else "cpu")
         tqdm.write(f"Using device: {device}")
         model = model.to(device)
+        
+        # Create data check video with untrained model predictions
+        tqdm.write("\nCreating data check video to verify dataset generation and see untrained predictions...")
+        video_path = os.path.join(exp_dir, 'videos', 'data_check_untrained.mp4')
+        create_data_check_video(model, test_dataset, video_path)
+        tqdm.write("Please verify the data check video before proceeding with training.")
+        tqdm.write("Press Enter to continue or Ctrl+C to abort...")
         
         # Create optimizer
         optimizer = Adam(model.parameters(), lr=params['learning_rate'])
@@ -294,7 +389,7 @@ def main():
                 progress_bar.set_postfix({'raw_loss': raw_loss, 'avg_loss': current_avg_loss})
                 
                 # Save intermediate diagnostics
-                if batch_idx % 256 == 0:
+                if batch_idx % 32 == 0:
                     # Log current state
                     log_file = os.path.join(exp_dir, 'logs', 'training_log.txt')
                     with open(log_file, 'a') as f:
