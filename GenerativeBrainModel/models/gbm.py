@@ -2,8 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import numpy as np
-from BrainSimulator.models.mambacore import StackedMamba
-from BrainSimulator.models.vae import VariationalAutoEncoder
+from GenerativeBrainModel.models.mambacore import StackedMamba
+from GenerativeBrainModel.models.vae import VariationalAutoEncoder
 
 # Generative Brain Model
 class GBM(nn.Module):
