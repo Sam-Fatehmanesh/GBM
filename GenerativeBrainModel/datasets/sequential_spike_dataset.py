@@ -77,23 +77,23 @@ class SequentialSpikeDataset(Dataset):
         """
         t_start, z_start = self.valid_starts[idx]
         
-        # Get sequence of timepoints
-        sequence = []
-        for t in range(t_start, t_start + self.seq_len):
-            # Create empty grid
-            grid = np.zeros((256, 128), dtype=np.float32)
-            
+        # Pre-allocate the full sequence array
+        sequence = np.zeros((self.seq_len, 256, 128), dtype=np.float32)
+        
+        # Get mask for cells in this z-plane
+        z_mask = self.z_masks[z_start]
+        
+        # Get relevant cell indices for this z-plane
+        cell_x_z = self.cell_x[z_mask]
+        cell_y_z = self.cell_y[z_mask]
+        
+        # Fill sequence array
+        for t_idx, t in enumerate(range(t_start, t_start + self.seq_len)):
             # Get spikes for this timepoint
-            spikes_t = self.spikes[t]
-            
-            # Get mask for cells in this z-plane
-            z_mask = self.z_masks[z_start]
-            
-            # Consider a cell active if it has any non-zero spike value
-            active_mask = (np.abs(spikes_t) > 1e-6) & z_mask
+            spikes_t = self.spikes[t][z_mask]  # Only get spikes for cells in this z-plane
             
             # Set active cells to 1 in the grid
-            grid[self.cell_x[active_mask], self.cell_y[active_mask]] = 1.0
-            sequence.append(grid)
+            active_cells = np.abs(spikes_t) > 1e-6
+            sequence[t_idx, cell_x_z[active_cells], cell_y_z[active_cells]] = 1.0
             
-        return torch.FloatTensor(sequence) 
+        return torch.from_numpy(sequence) 
