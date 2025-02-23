@@ -12,10 +12,33 @@ import pandas as pd
 from datetime import datetime
 import matplotlib.pyplot as plt
 import cv2
+import h5py
 
 from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.datasets.sequential_spike_dataset import SequentialSpikeDataset
 from GenerativeBrainModel.custom_functions.visualization import create_comparison_video, update_loss_plot
+
+def get_max_z_planes(spike_files):
+    """Get the maximum number of z-planes across all subjects."""
+    max_z = 0
+    for f in spike_files:
+        with h5py.File(f, 'r') as h5f:
+            cell_positions = h5f['cell_positions'][:]
+            num_z = len(np.unique(np.round(cell_positions[:, 2], decimals=3)))
+            max_z = max(max_z, num_z)
+    return max_z
+
+def collate_sequences(batch):
+    """Custom collate function for batching sequences.
+    
+    Args:
+        batch: List of sequences from dataset
+    Returns:
+        Batched sequences tensor
+    """
+    # All sequences should be the same size
+    sequences = torch.stack(batch, dim=0)
+    return sequences
 
 def create_experiment_dir():
     """Create a timestamped experiment directory with all necessary subdirectories"""
@@ -128,11 +151,11 @@ def main():
         # Parameters
         params = {
             'batch_size': 32,
-            'num_epochs': 100,
+            'num_epochs': 1,
             'learning_rate': 1e-4,
-            'mamba_layers': 4,
+            'mamba_layers': 1,
             'mamba_dim': 1024,
-            'seq_len': 30,
+            'timesteps_per_sequence': 10,  # Number of actual timepoints in each sequence
             'train_ratio': 0.95
         }
         
@@ -149,6 +172,13 @@ def main():
         
         if not spike_files:
             raise ValueError("No processed spike data files found!")
+        
+        # Get maximum number of z-planes across all subjects
+        max_z_planes = get_max_z_planes(spike_files)
+        params['seq_len'] = params['timesteps_per_sequence'] * max_z_planes
+        
+        tqdm.write(f"Maximum z-planes across subjects: {max_z_planes}")
+        tqdm.write(f"Total sequence length: {params['seq_len']} ({params['timesteps_per_sequence']} timepoints × {max_z_planes} z-planes)")
         
         # Create train and test datasets
         train_datasets = [
@@ -175,14 +205,15 @@ def main():
         tqdm.write(f"Training sequences: {len(train_dataset)}")
         tqdm.write(f"Test sequences: {len(test_dataset)}")
         
-        # Create dataloaders
+        # Create dataloaders with custom collate function
         train_loader = DataLoader(
             train_dataset,
             batch_size=params['batch_size'],
             shuffle=True,
             num_workers=4,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=True,
+            collate_fn=collate_sequences
         )
         
         test_loader = DataLoader(
@@ -191,7 +222,8 @@ def main():
             shuffle=False,
             num_workers=4,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=True,
+            collate_fn=collate_sequences
         )
         
         tqdm.write(f"Number of batches in train_loader: {len(train_loader)}")
