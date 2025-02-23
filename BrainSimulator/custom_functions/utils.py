@@ -109,7 +109,48 @@ class RMSNorm(nn.Module):
 def symlogMSE(x, y):
     return F.mse_loss(symlog(x), symlog(y))
 
-def twohot_symexp_loss(predicted_logits, true_values, num_bins=41):
+def logits_to_value(predicted_logits, num_bins=41, min_exp=1, max_exp=11):
+    """Convert logits to actual values using exponential binning.
+    
+    Args:
+        predicted_logits: Logits from the network (B, num_bins)
+        num_bins: Number of bins to use
+        min_exp: Minimum exponent for 2^x binning (default: 1, for 2^1 = 2)
+        max_exp: Maximum exponent for 2^x binning (default: 11, for 2^11 = 2048)
+    
+    Returns:
+        Predicted values computed as weighted sum of bin values
+    """
+    # Ensure input is 2D
+    if predicted_logits.dim() == 1:
+        predicted_logits = predicted_logits.unsqueeze(0)
+
+    # Create exponentially spaced bins using powers of 2
+    exponents = torch.linspace(min_exp, max_exp, num_bins).to(predicted_logits.device)
+    bins = 2.0 ** exponents
+    
+    # Compute softmax probabilities
+    softmax_probs = F.softmax(predicted_logits, dim=1)
+    
+    # Compute expected prediction (weighted sum)
+    predicted_values = torch.sum(softmax_probs * bins, dim=1)
+    
+    return predicted_values
+
+def twohot_exp_loss(predicted_logits, true_values, num_bins=41, min_exp=1, max_exp=11):
+    """Compute two-hot encoded loss for exponentially spaced bins.
+    
+    Args:
+        predicted_logits: Predicted distribution logits (B, num_bins)
+        true_values: True values to encode (B,)
+        num_bins: Number of bins to use
+        min_exp: Minimum exponent for 2^x binning (default: 1, for 2^1 = 2)
+        max_exp: Maximum exponent for 2^x binning (default: 11, for 2^11 = 2048)
+    
+    Returns:
+        loss: Cross entropy loss between predicted and two-hot distribution
+        predicted_values: The predicted values from the logits
+    """
     # Ensure inputs are 2D
     if predicted_logits.dim() == 1:
         predicted_logits = predicted_logits.unsqueeze(0)
@@ -121,18 +162,21 @@ def twohot_symexp_loss(predicted_logits, true_values, num_bins=41):
     batch_size = true_values.shape[0]
 
     # Create exponentially spaced bins
-    bins = symexp(torch.linspace(-20, 20, num_bins)).to(true_values.device)
+    exponents = torch.linspace(min_exp, max_exp, num_bins).to(true_values.device)
+    bins = 2.0 ** exponents
     
-    # Compute twohot encoding for true values
-    true_symlog = symlog(true_values)
-    k = torch.sum(bins < true_symlog, dim=1).long()
+    # Find closest bins for true values
+    # Convert to log2 space for easier comparison
+    log2_true = torch.log2(true_values)
+    k = torch.sum(exponents < log2_true, dim=1).long()
     k = torch.clamp(k, 0, num_bins - 2)
     
+    # Get bin values
     lower_bin = bins[k]
     upper_bin = bins[k + 1]
     
     # Compute weights for twohot encoding
-    weight_upper = (true_symlog.squeeze() - lower_bin) / (upper_bin - lower_bin)
+    weight_upper = (true_values.squeeze() - lower_bin) / (upper_bin - lower_bin)
     weight_lower = 1 - weight_upper
     
     # Create twohot encoding
@@ -140,49 +184,13 @@ def twohot_symexp_loss(predicted_logits, true_values, num_bins=41):
     twohot.scatter_(1, k.unsqueeze(1), weight_lower.unsqueeze(1))
     twohot.scatter_(1, (k + 1).unsqueeze(1), weight_upper.unsqueeze(1))
     
-    # # Add uniform mixture
-    # epsilon = 0.01
-    # twohot = (1 - epsilon) * twohot + epsilon / num_bins
-    
     # Compute cross-entropy loss
     loss = F.cross_entropy(predicted_logits, twohot, reduction='mean')
     
-    # Compute predicted values
-    softmax_probs = F.softmax(predicted_logits, dim=1)
-    
-    # Separate positive and negative bins
-    pos_mask = bins >= 0
-    neg_mask = bins < 0
-    
-    # Compute expected prediction
-    pos_pred = torch.sum(softmax_probs[:, pos_mask] * bins[pos_mask], dim=1)
-    neg_pred = torch.sum(softmax_probs[:, neg_mask] * bins[neg_mask], dim=1)
-    predicted_values = pos_pred + neg_pred
+    # Get predicted values
+    predicted_values = logits_to_value(predicted_logits, num_bins, min_exp, max_exp)
     
     return loss, predicted_values
-
-
-def logits_to_reward(predicted_logits, num_bins=41):
-    # Ensure input is 2D
-    if predicted_logits.dim() == 1:
-        predicted_logits = predicted_logits.unsqueeze(0)
-
-    # Create exponentially spaced bins
-    bins = symexp(torch.linspace(-20, 20, num_bins)).to(predicted_logits.device)
-    
-    # Compute softmax probabilities
-    softmax_probs = F.softmax(predicted_logits, dim=1)
-    
-    # Separate positive and negative bins
-    pos_mask = bins >= 0
-    neg_mask = bins < 0
-    
-    # Compute expected prediction
-    pos_pred = torch.sum(softmax_probs[:, pos_mask] * bins[pos_mask], dim=1)
-    neg_pred = torch.sum(softmax_probs[:, neg_mask] * bins[neg_mask], dim=1)
-    predicted_rewards = pos_pred + neg_pred
-    
-    return predicted_rewards
 
 
 def plot_and_save(data, title, ylabel, filename, xlabel='Epoch'):
