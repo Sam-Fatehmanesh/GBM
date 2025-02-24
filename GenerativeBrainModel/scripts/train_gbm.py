@@ -62,7 +62,7 @@ def save_losses_to_csv(losses_dict, filepath):
     df = pd.DataFrame(losses_dict)
     df.to_csv(filepath, index=False)
 
-def create_prediction_video(model, test_dataset, output_path, max_seqs=10, fps=2):
+def create_prediction_video(model, test_dataset, output_path, max_seqs=3, fps=10, max_frames=600):
     """Create video showing model predictions vs actual next frames"""
     try:
         device = next(model.parameters()).device
@@ -96,6 +96,7 @@ def create_prediction_video(model, test_dataset, output_path, max_seqs=10, fps=2
                 return
         
         with torch.no_grad():
+            total_frames = 0
             for i in range(min(max_seqs, len(test_dataset))):
                 # Get sequence
                 sequence = test_dataset[i].to(device)
@@ -106,91 +107,9 @@ def create_prediction_video(model, test_dataset, output_path, max_seqs=10, fps=2
                 
                 # For each frame in sequence (except last)
                 for t in range(sequence.size(1) - 1):
-                    # Get current frame, prediction, and target
-                    current = sequence[0, t].cpu().numpy()
-                    predicted = pred_sequence[0, t].cpu().numpy()
-                    target = sequence[0, t + 1].cpu().numpy()
+                    if total_frames >= max_frames:
+                        break
                     
-                    # Convert to uint8 images
-                    curr_img = (current * 255).astype(np.uint8)
-                    pred_img = (predicted * 255).astype(np.uint8)
-                    targ_img = (target * 255).astype(np.uint8)
-                    
-                    # Scale up images
-                    curr_img = cv2.resize(curr_img, (scaled_width, scaled_height), 
-                                       interpolation=cv2.INTER_NEAREST)
-                    pred_img = cv2.resize(pred_img, (scaled_width, scaled_height), 
-                                       interpolation=cv2.INTER_NEAREST)
-                    targ_img = cv2.resize(targ_img, (scaled_width, scaled_height), 
-                                       interpolation=cv2.INTER_NEAREST)
-                    
-                    # Convert to RGB
-                    curr_rgb = cv2.cvtColor(curr_img, cv2.COLOR_GRAY2BGR)
-                    pred_rgb = cv2.cvtColor(pred_img, cv2.COLOR_GRAY2BGR)
-                    targ_rgb = cv2.cvtColor(targ_img, cv2.COLOR_GRAY2BGR)
-                    
-                    # Add text labels
-                    cv2.putText(curr_rgb, 'Current', (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(pred_rgb, 'Predicted Next', (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(targ_rgb, 'Actual Next', (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    
-                    # Combine horizontally
-                    combined = np.hstack([curr_rgb, pred_rgb, targ_rgb])
-                    out.write(combined)
-        
-        out.release()
-        print(f"\nPrediction video saved as: {output_path}")
-        
-    except Exception as e:
-        print(f"Error creating prediction video: {str(e)}")
-
-def create_data_check_video(model, test_dataset, output_path, max_seqs=5, fps=2):
-    """Create video showing raw sequences from dataset to verify data generation."""
-    try:
-        device = next(model.parameters()).device
-        model.eval()
-        
-        # Set up video parameters
-        width = 256
-        height = 128
-        scale = 2
-        scaled_width = width * scale
-        scaled_height = height * scale
-        
-        # Ensure output directory exists
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        # Use H264 codec for MP4
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, 
-                            (scaled_width * 3, scaled_height), 
-                            isColor=True)
-        
-        if not out.isOpened():
-            print(f"Failed to create video writer. Trying alternative codec...")
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            out = cv2.VideoWriter(output_path, fourcc, fps, 
-                                (scaled_width * 3, scaled_height), 
-                                isColor=True)
-            
-            if not out.isOpened():
-                print(f"Failed to create video writer with both codecs. Skipping video creation.")
-                return
-        
-        with torch.no_grad():
-            for i in range(min(max_seqs, len(test_dataset))):
-                # Get sequence
-                sequence = test_dataset[i].to(device)
-                sequence = sequence.unsqueeze(0)  # Add batch dimension
-                
-                # Get predictions
-                pred_sequence = model(sequence)
-                
-                # For each frame in sequence (except last)
-                for t in range(sequence.size(1) - 1):
                     # Get current frame, prediction, and target
                     current = sequence[0, t].cpu().numpy()
                     predicted = pred_sequence[0, t].cpu().numpy()
@@ -229,6 +148,107 @@ def create_data_check_video(model, test_dataset, output_path, max_seqs=5, fps=2)
                     # Combine horizontally
                     combined = np.hstack([curr_rgb, pred_rgb, targ_rgb])
                     out.write(combined)
+                    total_frames += 1
+                
+                if total_frames >= max_frames:
+                    break
+        
+        out.release()
+        print(f"\nPrediction video saved as: {output_path}")
+        
+    except Exception as e:
+        print(f"Error creating prediction video: {str(e)}")
+
+def create_data_check_video(model, test_dataset, output_path, max_seqs=2, fps=10, max_frames=600):
+    """Create video showing raw sequences from dataset to verify data generation."""
+    try:
+        device = next(model.parameters()).device
+        model.eval()
+        
+        # Set up video parameters
+        width = 256
+        height = 128
+        scale = 2
+        scaled_width = width * scale
+        scaled_height = height * scale
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Use H264 codec for MP4
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, 
+                            (scaled_width * 3, scaled_height), 
+                            isColor=True)
+        
+        if not out.isOpened():
+            print(f"Failed to create video writer. Trying alternative codec...")
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            out = cv2.VideoWriter(output_path, fourcc, fps, 
+                                (scaled_width * 3, scaled_height), 
+                                isColor=True)
+            
+            if not out.isOpened():
+                print(f"Failed to create video writer with both codecs. Skipping video creation.")
+                return
+        
+        with torch.no_grad():
+            total_frames = 0
+            for i in range(min(max_seqs, len(test_dataset))):
+                # Get sequence
+                sequence = test_dataset[i].to(device)
+                sequence = sequence.unsqueeze(0)  # Add batch dimension
+                
+                # Get predictions
+                pred_sequence = model(sequence)
+                
+                # For each frame in sequence (except last)
+                for t in range(sequence.size(1) - 1):
+                    if total_frames >= max_frames:
+                        break
+                    
+                    # Get current frame, prediction, and target
+                    current = sequence[0, t].cpu().numpy()
+                    predicted = pred_sequence[0, t].cpu().numpy()
+                    target = sequence[0, t + 1].cpu().numpy()
+                    
+                    # Convert to uint8 images
+                    curr_img = (current * 255).astype(np.uint8)
+                    pred_img = (predicted * 255).astype(np.uint8)
+                    targ_img = (target * 255).astype(np.uint8)
+                    
+                    # Scale up images
+                    curr_img = cv2.resize(curr_img, (scaled_width, scaled_height), 
+                                       interpolation=cv2.INTER_NEAREST)
+                    pred_img = cv2.resize(pred_img, (scaled_width, scaled_height), 
+                                       interpolation=cv2.INTER_NEAREST)
+                    targ_img = cv2.resize(targ_img, (scaled_width, scaled_height), 
+                                       interpolation=cv2.INTER_NEAREST)
+                    
+                    # Convert to RGB
+                    curr_rgb = cv2.cvtColor(curr_img, cv2.COLOR_GRAY2BGR)
+                    pred_rgb = cv2.cvtColor(pred_img, cv2.COLOR_GRAY2BGR)
+                    targ_rgb = cv2.cvtColor(targ_img, cv2.COLOR_GRAY2BGR)
+                    
+                    # Add text labels
+                    cv2.putText(curr_rgb, 'Current', (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(pred_rgb, 'Predicted Next', (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(targ_rgb, 'Actual Next', (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    
+                    # Add frame number
+                    cv2.putText(curr_rgb, f'Seq {i}, Frame {t}', (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    
+                    # Combine horizontally
+                    combined = np.hstack([curr_rgb, pred_rgb, targ_rgb])
+                    out.write(combined)
+                    total_frames += 1
+                
+                if total_frames >= max_frames:
+                    break
         
         out.release()
         print(f"\nData check video saved as: {output_path}")
@@ -474,7 +494,7 @@ def main():
         
         # Create final prediction video
         video_path = os.path.join(exp_dir, 'videos', 'final_predictions.mp4')
-        create_prediction_video(model, test_dataset, video_path, max_seqs=20)
+        create_prediction_video(model, test_dataset, video_path, max_seqs=5)
         
     except Exception as e:
         tqdm.write(f"Error during training: {str(e)}")
