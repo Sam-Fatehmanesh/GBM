@@ -2,8 +2,10 @@ name: brainsim
 channels:
   - pytorch
   - nvidia
-  - conda-forge
   - defaults
+  - conda-forge
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
 dependencies:
   - _libgcc_mutex=0.1=conda_forge
   - _openmp_mutex=4.5=2_gnu
@@ -282,17 +284,21 @@ dependencies:
   - zstd=1.5.6=ha6fb4c9_0
   - pip:
       - absl-py==2.1.0
+      - astunparse==1.6.3
+      - attrs==25.1.0
       - black==24.4.2
       - box2d-py==2.3.5
       - causal-conv1d==1.4.0
       - chex==0.1.87
       - click==8.1.7
       - configmypy==0.2.0
+      - dm-tree==0.1.9
       - docker-pycreds==0.4.0
       - einops==0.8.0
       - etils==1.10.0
       - flax==0.10.0
       - fsspec==2024.6.1
+      - gast==0.6.0
       - gitdb==4.0.11
       - gitpython==3.1.43
       - gymnasium==1.0.0
@@ -313,6 +319,10 @@ dependencies:
       - neuraloperator==0.3.0
       - nfnets-pytorch==0.1.3
       - ninja==1.11.1.1
+      - nvidia-dali-cuda110==1.47.0
+      - nvidia-nvimgcodec-cu11==0.4.1.21
+      - nvidia-nvjpeg2k-cu11==0.8.1.40
+      - nvidia-nvtiff-cu11==0.4.0.62
       - opencv-python==4.10.0.84
       - opt-einsum==3.3.0
       - optax==0.2.3
@@ -344,5 +354,8 @@ dependencies:
       - torch-harmonics==0.6.5
       - transformers==4.42.4
       - wandb==0.17.5
+      - wrapt==1.17.2
       - zipp==3.20.2
-prefix: /home/user1/anaconda3/envs/neurocontrol
+prefix: /home/user/miniconda3/envs/brainsim
+# Note: NVIDIA DALI for PyTorch was installed via pip using install_dali_deps.sh
+# If recreating this environment, run install_dali_deps.sh after conda env create

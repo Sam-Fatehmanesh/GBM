@@ -3,6 +3,10 @@ import os
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 import torch
+import torch.multiprocessing as mp
+# Set sharing strategy to file_system to avoid shared memory issues
+mp.set_sharing_strategy('file_system')
+
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.optim import Adam
@@ -260,7 +264,7 @@ def main():
     try:
         # Parameters
         params = {
-            'batch_size': 32,
+            'batch_size': 128,  # Use full batch size of 128
             'num_epochs': 4,
             'learning_rate': 1e-4,
             'mamba_layers': 1,
@@ -315,23 +319,27 @@ def main():
         tqdm.write(f"Training sequences: {len(train_dataset)}")
         tqdm.write(f"Test sequences: {len(test_dataset)}")
         
-        # Create dataloaders
+        # Create dataloaders with optimized settings for memory-mapped datasets
         train_loader = DataLoader(
             train_dataset,
             batch_size=params['batch_size'],
             shuffle=True,
-            num_workers=4,
+            num_workers=18, 
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=True,
+            multiprocessing_context='spawn',  # More stable process creation
+            prefetch_factor=2  # Limit prefetching to reduce memory pressure
         )
         
         test_loader = DataLoader(
             test_dataset,
             batch_size=params['batch_size'],
             shuffle=False,
-            num_workers=4,
+            num_workers=4,  # Reduced from 4 to 2 to prevent resource contention
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=True,
+            multiprocessing_context='spawn',  # More stable process creation
+            prefetch_factor=2  # Limit prefetching to reduce memory pressure
         )
         
         tqdm.write(f"Number of batches in train_loader: {len(train_loader)}")
@@ -361,7 +369,7 @@ def main():
             f.write(f"Trainable parameters: {trainable_params:,}\n")
         
         # Move to GPU if available
-        device = "cuda:0"#torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         tqdm.write(f"Using device: {device}")
         model = model.to(device)
         
