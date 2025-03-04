@@ -8,6 +8,7 @@ class SimpleAutoencoder(nn.Module):
         
         self.encoder = nn.Linear(input_size, hidden_size)
         self.decoder = nn.Linear(hidden_size, input_size)
+        #self.batch_norm = nn.BatchNorm1d(hidden_size)
         
     def forward(self, x):
         # Flatten input
@@ -16,6 +17,9 @@ class SimpleAutoencoder(nn.Module):
         
         # Encode
         encoded = self.encoder(x)
+
+        # Apply batch normalization
+        #encoded = self.batch_norm(encoded)
         
         # Decode
         decoded = torch.sigmoid(self.decoder(encoded))

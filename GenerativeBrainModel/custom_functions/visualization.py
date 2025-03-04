@@ -4,15 +4,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-def create_comparison_video(actual, predicted, output_path, num_frames=8, fps=5):
+def create_comparison_video(actual, predicted, output_path, num_frames=8, fps=1):
     """Create video comparing actual brain activity with model predictions.
     
     Args:
         actual: numpy array of shape (batch_size, seq_len, 256, 128) with actual data
         predicted: numpy array of shape (batch_size, seq_len-1, 256, 128) with predictions
         output_path: Path to save the video
-        num_frames: Maximum number of frames to include in the video
-        fps: Frames per second for the video
+        num_frames: Maximum number of frames to include per sequence
+        fps: Frames per second for the video (default: 1)
     """
     try:
         # Set up video parameters
@@ -43,7 +43,9 @@ def create_comparison_video(actual, predicted, output_path, num_frames=8, fps=5)
                 return
         
         # Process each sequence in the batch
-        batch_size = min(actual.shape[0], 2)  # Limit to at most 2 sequences
+        batch_size = min(actual.shape[0], 100)  # Limit to at most 100 sequences
+        total_frames = 0
+        max_total_frames = 1000  # Safety limit to prevent extremely large videos
         
         for batch_idx in range(batch_size):
             # Get current sequence
@@ -54,6 +56,11 @@ def create_comparison_video(actual, predicted, output_path, num_frames=8, fps=5)
             seq_len = min(current_seq.shape[0]-1, predicted_seq.shape[0], num_frames)
             
             for t in range(seq_len):
+                # Safety check for max frames
+                if total_frames >= max_total_frames:
+                    print(f"Reached maximum frame limit ({max_total_frames}). Truncating video.")
+                    break
+                    
                 # Get current frame, prediction, and ground truth next frame
                 current = current_seq[t]
                 next_frame = current_seq[t+1]  # Ground truth
@@ -93,17 +100,22 @@ def create_comparison_video(actual, predicted, output_path, num_frames=8, fps=5)
                 cv2.putText(next_rgb, 'Actual Next', (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 
-                # Add frame number
-                cv2.putText(curr_rgb, f'Seq {batch_idx}, Frame {t}', (10, 60),
+                # Add frame number and sequence info
+                cv2.putText(curr_rgb, f'Seq {batch_idx+1}/{batch_size}, Frame {t+1}/{seq_len}', (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 
                 # Combine horizontally
                 combined = np.hstack([curr_rgb, pred_rgb, next_rgb])
                 out.write(combined)
+                total_frames += 1
+            
+            # Safety check for max frames
+            if total_frames >= max_total_frames:
+                break
         
         out.release()
         # Simplify the output message
-        print(f"Video saved: {os.path.basename(output_path)}")
+        print(f"Video saved: {os.path.basename(output_path)} ({total_frames} frames, {batch_size} sequences)")
         
     except Exception as e:
         print(f"Error creating video: {str(e)}")

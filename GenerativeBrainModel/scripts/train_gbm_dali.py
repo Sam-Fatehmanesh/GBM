@@ -135,31 +135,32 @@ def create_prediction_video(model, data_loader, output_path, num_frames=8):
         predictions = model.get_predictions(batch)
     
     # Convert predictions to numpy for visualization
-    # We'll choose 2 random sequences from the batch for visualization
-    rand_indices = torch.randint(0, batch.size(0), (2,))
+    # We'll choose multiple sequences from the batch for visualization (up to 100)
+    num_sequences = min(100, batch.size(0))
+    rand_indices = torch.randperm(batch.size(0))[:num_sequences]
     
-    # Create comparison visualization
+    # Create comparison visualization with 1fps
     create_comparison_video(
         actual=batch_viz[rand_indices].cpu().numpy(),
         predicted=predictions[rand_indices].cpu().numpy(),
         output_path=output_path,
         num_frames=num_frames,
-        fps=5
+        fps=1  # Set to 1fps as requested
     )
 
 def main():
     try:
         # Parameters
         params = {
-            'batch_size': 64,  # Reduced from 128 to 64 to save memory
+            'batch_size': 64, 
             'num_epochs': 4,
             'learning_rate': 1e-4,
             'mamba_layers': 1,
             'mamba_dim': 1024,
             'timesteps_per_sequence': 10,
             'train_ratio': 0.95,
-            'dali_num_threads': 2,  # Reduced from 4 to 2
-            'gpu_prefetch': 1,      # Reduced from 2 to 1
+            'dali_num_threads': 2, 
+            'gpu_prefetch': 1,      
             'use_float16': True,    # Enable float16 for memory efficiency
         }
         
@@ -220,8 +221,18 @@ def main():
         
         print_memory_stats("After test loader:")
         
+        # Log batch size and number of batches relationship
+        tqdm.write(f"Batch size: {params['batch_size']}")
+        tqdm.write(f"Total training sequences: {train_loader.total_length}")
         tqdm.write(f"Number of batches in train_loader: {len(train_loader)}")
         tqdm.write(f"Number of batches in test_loader: {len(test_loader)}")
+        
+        # Verify the relationship is correct
+        expected_train_batches = (train_loader.total_length + params['batch_size'] - 1) // params['batch_size']
+        if expected_train_batches != len(train_loader):
+            tqdm.write(f"WARNING: Expected {expected_train_batches} training batches but got {len(train_loader)}")
+        else:
+            tqdm.write(f"Batch calculation is correct: {len(train_loader)} batches for {train_loader.total_length} sequences with batch size {params['batch_size']}")
         
         # Create model
         model = GBM(
@@ -253,8 +264,10 @@ def main():
         
         print_memory_stats("After model creation:")
         
-        # Skip data check video to save memory during diagnostics
-        # create_data_check_video(model, test_loader, video_path)
+        # Create initial comparison video before training starts
+        tqdm.write("Creating initial comparison video with untrained model...")
+        video_path = os.path.join(exp_dir, 'videos', 'predictions_initial.mp4')
+        create_prediction_video(model, test_loader, video_path, num_frames=20)
         
         # Create optimizer
         optimizer = Adam(model.parameters(), lr=params['learning_rate'])
@@ -278,6 +291,9 @@ def main():
         
         # Enable automatic mixed precision for memory efficiency
         scaler = torch.cuda.amp.GradScaler(enabled=params['use_float16'])
+        
+        # Calculate quarter epoch size for video generation
+        quarter_epoch_size = len(train_loader) // 4
         
         for epoch in range(params['num_epochs']):
             if MEMORY_DIAGNOSTICS:
@@ -313,7 +329,7 @@ def main():
                     with torch.cuda.amp.autocast(enabled=params['use_float16']):
                         # Get logits from model (no sigmoid)
                         predictions = model(batch)
-                        # Binary cross entropy with logits loss
+                        # Binary focal loss with logits (replacing BCE loss)
                         loss = model.compute_loss(predictions, batch[:, 1:])
                     
                     # Scale loss and backpropagate with mixed precision
@@ -333,6 +349,37 @@ def main():
                     
                     # Update tqdm display
                     train_loop.set_postfix(loss=loss.item())
+                    
+                    # Update loss graph and CSV every 128 batches
+                    if (len(raw_batch_losses) % 128 == 0):
+                        # Update plots and save losses
+                        current_avg_loss = epoch_loss / batch_count
+                        temp_train_losses = train_losses + [current_avg_loss]
+                        temp_test_losses = test_losses + [test_losses[-1] if test_losses else 0]
+                        
+                        update_loss_plot(temp_train_losses, temp_test_losses, raw_batch_losses,
+                                      os.path.join(exp_dir, 'plots', 'loss_plot.png'))
+                        
+                        # Save raw batch losses
+                        save_losses_to_csv(
+                            {'batch': list(range(1, len(raw_batch_losses) + 1)),
+                             'raw_loss': raw_batch_losses},
+                            os.path.join(exp_dir, 'logs', 'raw_batch_losses.csv')
+                        )
+                        
+                        tqdm.write(f"Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_loader)}: Current Loss = {loss.item():.6f}, Avg Loss = {current_avg_loss:.6f}")
+                    
+                    # Generate comparison video every quarter epoch
+                    if (batch_idx + 1) % quarter_epoch_size == 0:
+                        quarter = (batch_idx + 1) // quarter_epoch_size
+                        tqdm.write(f"Generating quarter epoch comparison video ({quarter}/4)...")
+                        
+                        # Clean up memory before video creation
+                        torch.cuda.empty_cache()
+                        
+                        # Create prediction video
+                        video_path = os.path.join(exp_dir, 'videos', f'predictions_epoch_{epoch+1:03d}_quarter_{quarter}.mp4')
+                        create_prediction_video(model, test_loader, video_path, num_frames=20)
                     
                     # Clean up memory
                     if batch_idx % 50 == 0:
@@ -397,21 +444,24 @@ def main():
                 print_memory_stats(f"Before video creation, epoch {epoch+1}:")
             
             # Create prediction video after each epoch
-            video_path = os.path.join(exp_dir, 'videos', f'predictions_epoch_{epoch+1:03d}.mp4')
-            create_prediction_video(model, test_loader, video_path)
+            video_path = os.path.join(exp_dir, 'videos', f'predictions_epoch_{epoch+1:03d}_final.mp4')
+            create_prediction_video(model, test_loader, video_path, num_frames=20)
             
             # Save best model
             if avg_test_loss < best_test_loss:
                 best_test_loss = avg_test_loss
                 torch.save({
-                    'epoch': epoch,
+                    'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'train_losses': train_losses,
                     'test_losses': test_losses,
                     'raw_batch_losses': raw_batch_losses,
                     'params': params,
-                    'best_test_loss': best_test_loss
+                    'best_test_loss': best_test_loss,
+                    'loss_type': 'binary_focal_loss',  # Updated loss type
+                    'alpha': 0.25,  # Focal loss alpha parameter
+                    'gamma': 2.0,   # Focal loss gamma parameter
                 }, os.path.join(exp_dir, 'checkpoints', 'best_model.pt'))
             
             # Update plots and save losses
@@ -453,12 +503,15 @@ def main():
             'raw_batch_losses': raw_batch_losses,
             'params': params,
             'final_train_loss': avg_train_loss,
-            'final_test_loss': avg_test_loss
+            'final_test_loss': avg_test_loss,
+            'loss_type': 'binary_focal_loss',  # Updated loss type
+            'alpha': 0.5,  # Focal loss alpha parameter
+            'gamma': 2.0,   # Focal loss gamma parameter
         }, os.path.join(exp_dir, 'checkpoints', 'final_model.pt'))
         
         # Create final prediction video
         video_path = os.path.join(exp_dir, 'videos', 'final_predictions.mp4')
-        create_prediction_video(model, test_loader, video_path, max_seqs=5)
+        create_prediction_video(model, test_loader, video_path, num_frames=30)
         
     except Exception as e:
         tqdm.write(f"Error during training: {str(e)}")

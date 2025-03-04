@@ -230,18 +230,18 @@ class DALIBrainDataLoader:
     def __init__(self, h5_files, batch_size=128, seq_len=330, split='train', 
                  train_ratio=0.95, device_id=0, num_threads=2, gpu_prefetch=1,
                  seed=42, shuffle=True):
-        # Reduce batch size to avoid memory issues
+        # Store the original requested batch size
         self.original_batch_size = batch_size
-        # Start with a smaller batch size
-        self.batch_size = min(64, batch_size)
+        # Use the requested batch size directly instead of capping at 64
+        self.batch_size = batch_size
         
         if MEMORY_DIAGNOSTICS:
-            print(f"MEMORY OPTIMIZATION: Using reduced batch size of {self.batch_size} (requested: {batch_size})")
+            print(f"Using batch size of {self.batch_size}")
         
         self.device_id = device_id
         
         # Calculate pipeline batch size - use smaller batches per pipeline to reduce memory pressure
-        # Divide the total batch size by the number of files, with a minimum of 8 (reduced from 16)
+        # Divide the total batch size by the number of files, with a minimum of 8
         self.pipeline_batch_size = max(8, self.batch_size // len(h5_files))
         
         if MEMORY_DIAGNOSTICS:
@@ -290,14 +290,16 @@ class DALIBrainDataLoader:
         
         # Calculate total length
         self.total_length = sum(len(h5_loader) for h5_loader in self.h5_loaders)
-        # Calculate steps per epoch based on pipeline batch sizes
-        total_pipeline_batch_size = self.pipeline_batch_size * len(self.pipelines)
-        self.steps_per_epoch = self.total_length // total_pipeline_batch_size
+        
+        # FIX: Calculate steps per epoch based on actual batch size, not pipeline batch size
+        # This ensures that changing batch_size properly affects the number of batches
+        self.steps_per_epoch = (self.total_length + self.batch_size - 1) // self.batch_size  # Ceiling division
         
         # Print basic information always
         print(f"Created DALI data loader with {len(self.pipelines)} pipelines")
         print(f"Total sequences: {self.total_length}")
         print(f"Steps per epoch: {self.steps_per_epoch}")
+        print(f"Batch size: {self.batch_size}")  # Add this line to show the actual batch size
         
         # Initialize iterator state
         self.current_iterator = 0
@@ -332,11 +334,11 @@ class DALIBrainDataLoader:
             else:
                 self.accumulated_batch = None
                 self.accumulated_count = 0
-                
+            
             if MEMORY_DIAGNOSTICS:
-                print(f"Returning accumulated batch: {result.shape}, dtype={result.dtype}")
-                print_memory_stats("After returning accumulated batch:")
-                
+                print_memory_stats("After batch fetch:")
+                print(f"Batch fetch took {time.time() - start_time:.2f}s")
+            
             return result
         
         # Otherwise, accumulate more data

@@ -5,6 +5,37 @@ import numpy as np
 from GenerativeBrainModel.models.mambacore import StackedMamba
 from GenerativeBrainModel.models.simple_autoencoder import SimpleAutoencoder
 
+def binary_focal_loss(pred, target, alpha=0.25, gamma=2.0, reduction='mean', eps=1e-8):
+    """
+    Compute binary focal loss for a batch of predictions.
+    
+    Args:
+      pred (torch.Tensor): raw logits
+      target (torch.Tensor): binary labels (0 or 1) of the same shape as pred.
+      alpha (float): balancing factor.
+      gamma (float): focusing parameter.
+      reduction (str): reduction method ('mean', 'sum', or 'none').
+      eps (float): small value for numerical stability.
+    
+    Returns:
+      torch.Tensor: focal loss value.
+    """
+    # Apply sigmoid to get probabilities
+    p = torch.sigmoid(pred)
+    
+    # Compute p_t depending on the true label
+    p_t = p * target + (1 - p) * (1 - target)
+    
+    # Compute the loss
+    loss = -alpha * (1 - p_t)**gamma * torch.log(p_t + eps)
+    
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss
+
 class GBM(nn.Module):
     def __init__(self, mamba_layers=1, mamba_dim=1024, pretrained_ae_path="trained_simpleAE/checkpoints/best_model.pt"):
         """Generative Brain Model combining pretrained autoencoder with Mamba for sequential prediction.
@@ -95,7 +126,7 @@ class GBM(nn.Module):
             return predictions[:, :-1]  # (batch_size, seq_len-1, 256, 128)
     
     def compute_loss(self, pred, target):
-        """Compute binary cross entropy loss between predictions and targets.
+        """Compute focal loss between predictions and targets to address class imbalance.
         
         Args:
             pred: Tensor of shape (batch_size, seq_len-1, 256, 128) containing predicted logits
@@ -104,11 +135,11 @@ class GBM(nn.Module):
         Returns:
             loss: Scalar loss value
         """
-        # Ensure target is float32 for BCE loss
+        # Ensure target is float32 for loss calculation
         if target.dtype != torch.float32:
             target = target.float()
         
-        # Ensure pred is float32 for BCE loss if it's not already
+        # Ensure pred is float32 for loss calculation if it's not already
         if pred.dtype != torch.float32:
             pred = pred.float()
         
@@ -127,10 +158,12 @@ class GBM(nn.Module):
                 start_idx = i * chunk_size
                 end_idx = min((i + 1) * chunk_size, pred_flat.shape[0])
                 
-                # Use binary_cross_entropy_with_logits which is safe with autocast
-                chunk_loss = F.binary_cross_entropy_with_logits(
+                # Use binary focal loss instead of BCE
+                chunk_loss = binary_focal_loss(
                     pred_flat[start_idx:end_idx], 
                     target_flat[start_idx:end_idx],
+                    alpha=0.25,  # Balance parameter
+                    gamma=2.0,   # Focusing parameter
                     reduction='sum'
                 )
                 total_loss += chunk_loss
@@ -139,7 +172,12 @@ class GBM(nn.Module):
             return total_loss / (pred_flat.shape[0] * self.flat_size)
         else:
             # For smaller batches, compute all at once
-            return F.binary_cross_entropy_with_logits(pred_flat, target_flat)
+            return binary_focal_loss(
+                pred_flat, 
+                target_flat,
+                alpha=0.25,  # Balance parameter
+                gamma=2.0    # Focusing parameter
+            )
             
     def get_predictions(self, x):
         """Forward pass returning the sigmoid of logits for actual probabilities.

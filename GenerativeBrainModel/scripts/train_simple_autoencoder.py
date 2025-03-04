@@ -41,11 +41,11 @@ def main():
     try:
         # Parameters
         params = {
-            'batch_size': 64,
+            'batch_size': 64*4*4,
             'num_epochs': 1,
             'learning_rate': 1e-3,
             'hidden_size': 1024,
-            'train_samples': 64*100000,  # Number of training samples to generate
+            'train_samples': 4*64*100000,  # Number of training samples to generate
         }
         
         # Create experiment directory
