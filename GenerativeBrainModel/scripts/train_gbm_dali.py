@@ -152,10 +152,10 @@ def main():
     try:
         # Parameters
         params = {
-            'batch_size': 64, 
+            'batch_size': 128, 
             'num_epochs': 4,
             'learning_rate': 1e-4,
-            'mamba_layers': 1,
+            'mamba_layers': 8,
             'mamba_dim': 1024,
             'timesteps_per_sequence': 10,
             'train_ratio': 0.95,
@@ -221,18 +221,10 @@ def main():
         
         print_memory_stats("After test loader:")
         
-        # Log batch size and number of batches relationship
-        tqdm.write(f"Batch size: {params['batch_size']}")
-        tqdm.write(f"Total training sequences: {train_loader.total_length}")
         tqdm.write(f"Number of batches in train_loader: {len(train_loader)}")
+        tqdm.write(f"Effective Batch Size: {train_loader.total_length//train_loader.steps_per_epoch}")
         tqdm.write(f"Number of batches in test_loader: {len(test_loader)}")
-        
-        # Verify the relationship is correct
-        expected_train_batches = (train_loader.total_length + params['batch_size'] - 1) // params['batch_size']
-        if expected_train_batches != len(train_loader):
-            tqdm.write(f"WARNING: Expected {expected_train_batches} training batches but got {len(train_loader)}")
-        else:
-            tqdm.write(f"Batch calculation is correct: {len(train_loader)} batches for {train_loader.total_length} sequences with batch size {params['batch_size']}")
+        tqdm.write(f"Effective Batch Size: {test_loader.total_length//test_loader.steps_per_epoch}")
         
         # Create model
         model = GBM(
