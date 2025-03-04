@@ -155,7 +155,7 @@ def main():
             'batch_size': 128, 
             'num_epochs': 4,
             'learning_rate': 1e-4,
-            'mamba_layers': 8,
+            'mamba_layers': 1,
             'mamba_dim': 1024,
             'timesteps_per_sequence': 10,
             'train_ratio': 0.95,

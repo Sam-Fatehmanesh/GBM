@@ -53,8 +53,8 @@ class GBM(nn.Module):
         self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
         
         # Freeze autoencoder parameters
-        for param in self.autoencoder.parameters():
-            param.requires_grad = False
+        # for param in self.autoencoder.parameters():
+        #     param.requires_grad = False
             
         # Create Mamba sequence model
         self.mamba = StackedMamba(d_model=mamba_dim, num_layers=mamba_layers)
