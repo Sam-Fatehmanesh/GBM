@@ -24,6 +24,19 @@ def print_memory_stats(prefix=""):
 class H5Loader:
     """Helper class to load data from HDF5 files for DALI's ExternalSource."""
     def __init__(self, h5_file_path, seq_len=330, split='train', train_ratio=0.95):
+        """Initialize H5Loader for efficient loading of spike data.
+        
+        This loader ensures that:
+        1. Sequences can start at any z-plane for the first timepoint
+        2. Each new timepoint in a sequence always starts at z=0 (most dorsal z-plane)
+        3. Z-planes are processed in anatomical order for each timepoint
+        
+        Args:
+            h5_file_path: Path to the processed spike data h5 file
+            seq_len: Length of sequences to return
+            split: 'train' or 'test'
+            train_ratio: Ratio of data to use for training
+        """
         self.h5_file_path = h5_file_path
         self.seq_len = seq_len
         
@@ -69,6 +82,7 @@ class H5Loader:
         # Create all possible sequence starting points
         valid_starts = []
         for t in range(self.num_timepoints - seq_len + 1):
+            # Allow sequences to start at any z-index
             valid_starts.extend([(t, z) for z in range(self.num_z)])
         
         # Split into train/test
@@ -95,7 +109,20 @@ class H5Loader:
         return len(self.valid_starts)
     
     def __call__(self, sample_info):
-        """Generate dense format sequences directly on CPU."""
+        """Generate dense format sequences directly on CPU.
+        
+        This method generates sequences where:
+        - The first sequence can start at any z-plane
+        - Z-planes are processed in anatomical order (0, 1, 2, ...) for each timepoint
+        - Each new timepoint after the first always starts at z=0
+        - No wrapping occurs within a timepoint
+        
+        Args:
+            sample_info: Sample information containing index
+            
+        Returns:
+            batch: Numpy array of shape (batch_size, seq_len, 256, 128) with binary spike data
+        """
         start_time = time.time()
         
         # Extract indices from SampleInfo objects
@@ -148,23 +175,18 @@ class H5Loader:
                 # Fill the sequence with frames
                 seq_idx = 0
                 t = t_start
+                current_z = z_start  # Start at the specified z-index
                 
                 while seq_idx < self.seq_len:
-                    # For each z-plane starting from z_start
-                    for z_idx in range(self.num_z):
-                        # Calculate actual z-plane index with wrapping
-                        actual_z = (z_start + z_idx) % self.num_z
-                        
-                        # Skip if we've reached the required sequence length
-                        if seq_idx >= self.seq_len:
-                            break
-                        
+                    # Process the remaining z-planes in the current timepoint
+                    while current_z < self.num_z and seq_idx < self.seq_len:
                         # Get pre-computed cell indices for this z-plane
-                        cell_indices = self.z_cell_indices[actual_z]['indices']
+                        cell_indices = self.z_cell_indices[current_z]['indices']
                         
                         # Skip if no cells in this z-plane
                         if len(cell_indices) == 0:
                             seq_idx += 1
+                            current_z += 1
                             continue
                         
                         # Get spikes for this timepoint and z-plane directly from HDF5 file
@@ -174,14 +196,15 @@ class H5Loader:
                         active_cells = np.abs(spikes_t) > 1e-6
                         
                         if np.any(active_cells):  # Only process if there are active cells
-                            active_x = self.z_cell_indices[actual_z]['x'][active_cells]
-                            active_y = self.z_cell_indices[actual_z]['y'][active_cells]
+                            active_x = self.z_cell_indices[current_z]['x'][active_cells]
+                            active_y = self.z_cell_indices[current_z]['y'][active_cells]
                             
                             # Set active cells to 1 in the dense representation
                             for i in range(len(active_x)):
                                 batch[batch_idx, seq_idx, active_x[i], active_y[i]] = 1
                         
                         seq_idx += 1
+                        current_z += 1
                     
                     # Move to next timepoint
                     t += 1
@@ -189,6 +212,9 @@ class H5Loader:
                     # Break if we've reached the end of available timepoints
                     if t >= self.num_timepoints:
                         break
+                    
+                    # For all subsequent timepoints, always start at z=0
+                    current_z = 0
         
         if MEMORY_DIAGNOSTICS:
             batch_size_mb = batch.nbytes / 1e6
