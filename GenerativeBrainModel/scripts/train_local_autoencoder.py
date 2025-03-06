@@ -13,7 +13,7 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 
 from GenerativeBrainModel.datasets.spike_datasets import GridSpikeDataset, SyntheticSpikeDataset
-from GenerativeBrainModel.custom_functions.visualization import create_comparison_video, update_loss_plot
+from GenerativeBrainModel.custom_functions.visualization import update_loss_plot, create_autoencoder_comparison_video
 from GenerativeBrainModel.models.local_autoencoder import LocallyConnectedAutoencoder
 
 def create_experiment_dir():
@@ -41,11 +41,11 @@ def main():
     try:
         # Parameters
         params = {
-            'batch_size': 64*4*4,
+            'batch_size': 64,
             'num_epochs': 1,
             'learning_rate': 1e-3,
             'hidden_size': 1024,
-            'train_samples': 4*64*100000,  # Number of training samples to generate
+            'train_samples': 6400000,#4*64*100000,  # Number of training samples to generate
         }
         
         # Create experiment directory
@@ -99,6 +99,11 @@ def main():
             input_size=256*128,
             hidden_size=params['hidden_size']
         )
+
+        # Load model from checkpoint
+        # checkpoint_path = "experiments/20250304_210840/checkpoints/best_model.pt"
+        # checkpoint = torch.load(checkpoint_path)
+        # model.load_state_dict(checkpoint['model_state_dict'])
         
         # Save model architecture and parameters
         with open(os.path.join(exp_dir, "model_architecture.txt"), "w") as f:
@@ -195,7 +200,7 @@ def main():
             
             # Create comparison video after each epoch
             video_path = os.path.join(exp_dir, 'videos', f'reconstruction_epoch_{epoch+1:03d}.mp4')
-            create_comparison_video(model, test_dataset, video_path)
+            create_autoencoder_comparison_video(model, test_dataset, video_path)
             
             # Save best model
             if avg_test_loss < best_test_loss:
@@ -266,7 +271,7 @@ def main():
         
         # Create final comparison video
         video_path = os.path.join(exp_dir, 'videos', 'final_reconstruction.mp4')
-        create_comparison_video(model, test_dataset, video_path, max_frames=200)  # More frames for final video
+        create_autoencoder_comparison_video(model, test_dataset, video_path)
         
     except Exception as e:
         tqdm.write(f"Error during training: {str(e)}")

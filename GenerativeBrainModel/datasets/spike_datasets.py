@@ -99,7 +99,7 @@ class SyntheticSpikeDataset(Dataset):
         self.grid_size = grid_size
         
         # Distribution parameters from empirical analysis
-        self.mean_spikes = 73.42
+        self.mean_spikes = 200.0
         self.std_spikes = 98.25
         self.min_spikes = 0
         self.max_spikes = 2000  # Using 99th percentile instead of max to avoid outliers

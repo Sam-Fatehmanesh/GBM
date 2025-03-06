@@ -146,4 +146,72 @@ def update_loss_plot(train_losses, test_losses, raw_batch_losses, output_path):
     
     plt.tight_layout()
     plt.savefig(output_path)
-    plt.close() 
+    plt.close()
+
+def create_autoencoder_comparison_video(model, dataset, output_path, num_frames=100, fps=10):
+    """
+    Create a video comparing original and reconstructed samples from an autoencoder model.
+    
+    Args:
+        model: The autoencoder model to use for reconstruction
+        dataset: The dataset to sample from
+        output_path: Path to save the output video
+        num_frames: Number of frames to include in the video
+        fps: Frames per second for the video
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+        from matplotlib.animation import FFMpegWriter
+        import numpy as np
+        import torch
+        from tqdm import tqdm
+        
+        # Set up the figure
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+        
+        # Set up the writer
+        writer = FFMpegWriter(fps=fps)
+        
+        # Move model to evaluation mode
+        model.eval()
+        
+        # Get device
+        device = next(model.parameters()).device
+        
+        # Create the video
+        with writer.saving(fig, output_path, dpi=100):
+            for i in tqdm(range(min(num_frames, len(dataset))), desc="Creating video"):
+                # Get a sample
+                sample = dataset[i].unsqueeze(0).to(device)
+                
+                # Get reconstruction
+                with torch.no_grad():
+                    reconstruction = model(sample).cpu().squeeze(0)
+                
+                # Convert to numpy for plotting
+                original = sample.cpu().squeeze(0).numpy().reshape(256, 128)
+                reconstructed = reconstruction.numpy().reshape(256, 128)
+                
+                # Clear axes
+                ax1.clear()
+                ax2.clear()
+                
+                # Plot original and reconstruction
+                ax1.imshow(original, cmap='gray')
+                ax1.set_title('Original')
+                ax1.axis('off')
+                
+                ax2.imshow(reconstructed, cmap='gray')
+                ax2.set_title('Reconstructed')
+                ax2.axis('off')
+                
+                # Add to video
+                writer.grab_frame()
+                
+        plt.close()
+        
+    except Exception as e:
+        print(f"Error creating video: {str(e)}")
+        import traceback
+        traceback.print_exc() 
