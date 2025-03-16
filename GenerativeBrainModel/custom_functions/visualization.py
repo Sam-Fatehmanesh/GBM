@@ -4,14 +4,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-def create_comparison_video(actual, predicted, output_path, num_frames=8, fps=1):
+def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=1):
     """Create video comparing actual brain activity with model predictions.
     
     Args:
         actual: numpy array of shape (batch_size, seq_len, 256, 128) with actual data
         predicted: numpy array of shape (batch_size, seq_len-1, 256, 128) with predictions
         output_path: Path to save the video
-        num_frames: Maximum number of frames to include per sequence
+        num_frames: Maximum sequence length to use (default: 330 for full sequences)
         fps: Frames per second for the video (default: 1)
     """
     try:
@@ -52,15 +52,20 @@ def create_comparison_video(actual, predicted, output_path, num_frames=8, fps=1)
             current_seq = actual[batch_idx]
             predicted_seq = predicted[batch_idx]
             
-            # Process frames
+            # Use full sequence length, limited by available frames
             seq_len = min(current_seq.shape[0]-1, predicted_seq.shape[0], num_frames)
             
+            # Check if adding this sequence would exceed the max frames limit
+            frames_left = max_total_frames - total_frames
+            if frames_left <= 0:
+                # We've reached the maximum, stop adding sequences
+                break
+                
+            # If this sequence would exceed the limit, truncate it
+            if seq_len > frames_left:
+                seq_len = frames_left
+            
             for t in range(seq_len):
-                # Safety check for max frames
-                if total_frames >= max_total_frames:
-                    print(f"Reached maximum frame limit ({max_total_frames}). Truncating video.")
-                    break
-                    
                 # Get current frame, prediction, and ground truth next frame
                 current = current_seq[t]
                 next_frame = current_seq[t+1]  # Ground truth
@@ -109,8 +114,9 @@ def create_comparison_video(actual, predicted, output_path, num_frames=8, fps=1)
                 out.write(combined)
                 total_frames += 1
             
-            # Safety check for max frames
+            # Check if we've reached the maximum frames
             if total_frames >= max_total_frames:
+                print(f"Reached maximum frame limit ({max_total_frames}). Truncating video.")
                 break
         
         out.release()
