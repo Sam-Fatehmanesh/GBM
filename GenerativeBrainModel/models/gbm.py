@@ -140,48 +140,49 @@ class GBM(nn.Module):
             loss: Scalar loss value
         """
         # Ensure target is float32 for loss calculation
-        if target.dtype != torch.float32:
-            target = target.float()
+        # if target.dtype != torch.float32:
+        #     target = target.float()
         
-        # Ensure pred is float32 for loss calculation if it's not already
-        if pred.dtype != torch.float32:
-            pred = pred.float()
+        # # Ensure pred is float32 for loss calculation if it's not already
+        # if pred.dtype != torch.float32:
+        #     pred = pred.float()
         
-        # Flatten predictions and targets for more efficient loss computation
-        batch_size, seq_len = pred.shape[:2]
-        pred_flat = pred.reshape(-1, self.flat_size)
-        target_flat = target.reshape(-1, self.flat_size)
+        # # Flatten predictions and targets for more efficient loss computation
+        # batch_size, seq_len = pred.shape[:2]
+        # pred_flat = pred.reshape(-1, self.flat_size)
+        # target_flat = target.reshape(-1, self.flat_size)
         
-        # For efficient memory usage, compute loss in chunks for very large batches
-        if pred_flat.shape[0] > 32:  # Process in chunks for large batches
-            total_loss = 0.0
-            chunk_size = 32
-            num_chunks = (pred_flat.shape[0] + chunk_size - 1) // chunk_size  # Ceiling division
+        # # For efficient memory usage, compute loss in chunks for very large batches
+        # if pred_flat.shape[0] > 32:  # Process in chunks for large batches
+        #     total_loss = 0.0
+        #     chunk_size = 32
+        #     num_chunks = (pred_flat.shape[0] + chunk_size - 1) // chunk_size  # Ceiling division
             
-            for i in range(num_chunks):
-                start_idx = i * chunk_size
-                end_idx = min((i + 1) * chunk_size, pred_flat.shape[0])
+        #     for i in range(num_chunks):
+        #         start_idx = i * chunk_size
+        #         end_idx = min((i + 1) * chunk_size, pred_flat.shape[0])
                 
-                # Use binary focal loss instead of BCE
-                chunk_loss = binary_focal_loss(
-                    pred_flat[start_idx:end_idx], 
-                    target_flat[start_idx:end_idx],
-                    alpha=0.25,  # Balance parameter
-                    gamma=2.0,   # Focusing parameter
-                    reduction='sum'
-                )
-                total_loss += chunk_loss
+        #         # Use binary focal loss instead of BCE
+        #         chunk_loss = binary_focal_loss(
+        #             pred_flat[start_idx:end_idx], 
+        #             target_flat[start_idx:end_idx],
+        #             alpha=0.25,  # Balance parameter
+        #             gamma=2.0,   # Focusing parameter
+        #             reduction='sum'
+        #         )
+        #         total_loss += chunk_loss
                 
-            # Average over all samples
-            return total_loss / (pred_flat.shape[0] * self.flat_size)
-        else:
-            # For smaller batches, compute all at once
-            return binary_focal_loss(
-                pred_flat, 
-                target_flat,
-                alpha=0.25,  # Balance parameter
-                gamma=2.0    # Focusing parameter
-            )
+        #     # Average over all samples
+        #     return total_loss / (pred_flat.shape[0] * self.flat_size)
+        # else:
+        #     # For smaller batches, compute all at once
+        #     return binary_focal_loss(
+        #         pred_flat, 
+        #         target_flat,
+        #         alpha=0.25,  # Balance parameter
+        #         gamma=2.0    # Focusing parameter
+        #     )
+        return F.binary_cross_entropy_with_logits(pred, target, reduction='mean')
             
     def get_predictions(self, x):
         """Forward pass returning the sigmoid of logits for actual probabilities.
