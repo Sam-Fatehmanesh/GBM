@@ -112,7 +112,7 @@ def save_losses_to_csv(losses_dict, filepath):
     df = pd.DataFrame(losses_dict)
     df.to_csv(filepath, index=False)
 
-def create_prediction_video(model, data_loader, output_path, num_frames=8):
+def create_prediction_video(model, data_loader, output_path, num_frames=330):
     """Create a video of model predictions vs actual brain activity."""
     # Get a single batch
     data_loader.reset()
@@ -259,7 +259,7 @@ def main():
         # Create initial comparison video before training starts
         tqdm.write("Creating initial comparison video with untrained model...")
         video_path = os.path.join(exp_dir, 'videos', 'predictions_initial.mp4')
-        create_prediction_video(model, test_loader, video_path, num_frames=20)
+        create_prediction_video(model, test_loader, video_path, num_frames=330)
         
         # Create optimizer
         optimizer = Adam(model.parameters(), lr=params['learning_rate'])
@@ -371,7 +371,7 @@ def main():
                         
                         # Create prediction video
                         video_path = os.path.join(exp_dir, 'videos', f'predictions_epoch_{epoch+1:03d}_quarter_{quarter}.mp4')
-                        create_prediction_video(model, test_loader, video_path, num_frames=20)
+                        create_prediction_video(model, test_loader, video_path, num_frames=330)
                     
                     # Clean up memory
                     if batch_idx % 50 == 0:
@@ -437,7 +437,7 @@ def main():
             
             # Create prediction video after each epoch
             video_path = os.path.join(exp_dir, 'videos', f'predictions_epoch_{epoch+1:03d}_final.mp4')
-            create_prediction_video(model, test_loader, video_path, num_frames=20)
+            create_prediction_video(model, test_loader, video_path, num_frames=330)
             
             # Save best model
             if avg_test_loss < best_test_loss:
@@ -503,7 +503,7 @@ def main():
         
         # Create final prediction video
         video_path = os.path.join(exp_dir, 'videos', 'final_predictions.mp4')
-        create_prediction_video(model, test_loader, video_path, num_frames=30)
+        create_prediction_video(model, test_loader, video_path, num_frames=330)
         
     except Exception as e:
         tqdm.write(f"Error during training: {str(e)}")
