@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from GenerativeBrainModel.models.mambacore import StackedMamba
 from GenerativeBrainModel.models.simple_autoencoder import SimpleAutoencoder
+from GenerativeBrainModel.models.local_autoencoder import LocallyConnectedAutoencoder
 
 def binary_focal_loss(pred, target, alpha=0.25, gamma=2.0, reduction='mean', eps=1e-8):
     """
@@ -48,7 +49,7 @@ class GBM(nn.Module):
         super(GBM, self).__init__()
         
         # Load pretrained autoencoder
-        self.autoencoder = SimpleAutoencoder(input_size=256*128, hidden_size=mamba_dim)
+        self.autoencoder = SimpleAutoencoder(input_size=256*128, hidden_size=mamba_dim)#LocallyConnectedAutoencoder(hidden_size=mamba_dim)#(input_size=256*128, hidden_size=mamba_dim)
         checkpoint = torch.load(pretrained_ae_path, map_location='cpu')  # Load to CPU first for better memory management
         self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
         
@@ -102,6 +103,9 @@ class GBM(nn.Module):
         # Remember original data type for output consistency
         orig_dtype = x.dtype
         batch_size, seq_len = x.shape[:2]
+
+        # Remember original shape for output consistency
+        original_shape = x.shape
         
         # Flatten all grids more efficiently
         x_flat = x.reshape(batch_size, seq_len, -1)  # Use reshape instead of view for better compatibility
@@ -113,7 +117,7 @@ class GBM(nn.Module):
         mamba_out = self.mamba(latents)  # (batch_size, seq_len, latent_dim)
         
         # Decode predictions back to flattened grid logits (no sigmoid)
-        predictions_flat = self.decode(mamba_out)  # (batch_size, seq_len, 256*128)
+        predictions_flat = self.decode(mamba_out).reshape(batch_size, seq_len, *self.grid_size)  # (batch_size, seq_len, 256*128)
         
         # Reshape predictions back to grids more efficiently
         predictions = predictions_flat.reshape(batch_size, seq_len, *self.grid_size)

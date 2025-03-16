@@ -223,6 +223,69 @@ class H5Loader:
         
         return batch
 
+def augment_z0_frames(batch, loader):
+    """Apply z-index based augmentation to frames in the batch.
+    
+    This function adds marker patterns in the top-right corner of each frame:
+    - For z-index 0, adds a 2×2 marker
+    - For z-index 1, adds a 2×3 marker
+    - For z-index 2, adds a 2×4 marker
+    And so on, with the width increasing with the z-index
+    
+    Args:
+        batch: Numpy array of shape (batch_size, seq_len, height, width) or (seq_len, height, width)
+        loader: H5Loader instance that contains z-index tracking information
+        
+    Returns:
+        Augmented batch with marker patterns
+    """
+    # Handle different input shapes (DALI might send single samples with shape [seq_len, h, w])
+    input_was_3d = False
+    if len(batch.shape) == 3:
+        # Single sample case: [seq_len, height, width]
+        input_was_3d = True
+        seq_len, height, width = batch.shape
+        batch_size = 1
+        # Reshape to [1, seq_len, height, width] for consistent processing
+        batch = batch.reshape(1, seq_len, height, width)
+    else:
+        # Batch case: [batch_size, seq_len, height, width]
+        batch_size, seq_len, height, width = batch.shape
+    
+    # Clone the batch to avoid modifying the original
+    augmented_batch = batch.copy()
+    
+    # Loop through all samples in the batch
+    for b in range(batch_size):
+        # For each sample, track the current z-index
+        current_z = 0  # Start at z=0
+        
+        # Loop through all frames in the sequence
+        for f in range(seq_len):
+            # Calculate marker dimensions based on z-index
+            marker_height = 2  # Always 2 pixels high
+            marker_width = current_z + 2  # z-index + 2 pixels wide
+            
+            # Ensure marker fits within the frame
+            marker_width = min(marker_width, width)
+            
+            # Set the top-right corner pixels to 1
+            augmented_batch[b, f, 0:marker_height, width-marker_width:width] = 1
+            
+            # Print debug information if memory diagnostics is enabled
+            if MEMORY_DIAGNOSTICS:
+                print(f"Augmenting frame {f} with z-index {current_z}, marker size: {marker_height}×{marker_width}")
+            
+            # Update z-index for the next frame
+            current_z += 1
+            if current_z >= loader.num_z:
+                current_z = 0  # Wrap back to z=0
+    
+    # If input was a single sample (3D), return in original shape
+    if input_was_3d:
+        return augmented_batch[0]
+    
+    return augmented_batch
 
 @pipeline_def
 def create_brain_data_pipeline(h5_loader, device="gpu"):
@@ -241,6 +304,10 @@ def create_brain_data_pipeline(h5_loader, device="gpu"):
     
     # Make sure we're getting a single tensor, not a list
     sequences = sequences[0] if isinstance(sequences, list) else sequences
+    
+    # Apply augmentation before transferring to GPU
+    # Use Python function to augment frames based on z-index
+    sequences = fn.python_function(sequences, function=lambda x: augment_z0_frames(x, h5_loader))
     
     # Transfer to GPU and cast to float16/float32 for model processing
     if device == "gpu":

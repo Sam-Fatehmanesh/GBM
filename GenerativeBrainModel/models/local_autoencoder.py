@@ -102,11 +102,12 @@ class LocallyConnectedAutoencoder(nn.Module):
         if len(z.shape) == 3:  # [batch, seq, hidden]
             batch_size, seq_len = z.shape[0], z.shape[1]
             z = z.reshape(-1, z.shape[-1])
-            original_batch_size = batch_size
+            original_batch_size = batch_size * seq_len
         else:
             batch_size = z.shape[0]
             seq_len = None
             original_batch_size = batch_size
+
         
         # Split latent vector into patches: [batch, total_patches, hidden_per_patch]
         z_patches = z.reshape(batch_size, self.total_patches, self.hidden_per_patch)
@@ -146,3 +147,10 @@ class LocallyConnectedAutoencoder(nn.Module):
         
         # Ensure output has the same shape as input
         return decoded.reshape(original_shape)
+    
+    def encoder(self, x):
+        return self.encode(x)
+    
+    def decoder(self, z):
+        
+        return self.decode(z)
