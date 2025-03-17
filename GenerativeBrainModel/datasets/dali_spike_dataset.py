@@ -30,6 +30,7 @@ class H5Loader:
         1. Sequences can start at any z-plane for the first timepoint
         2. Each new timepoint in a sequence always starts at z=0 (most dorsal z-plane)
         3. Z-planes are processed in anatomical order for each timepoint
+        4. Training and test sets are completely separated by timepoint blocks
         
         Args:
             h5_file_path: Path to the processed spike data h5 file
@@ -79,9 +80,157 @@ class H5Loader:
                 'indices': np.where(z_mask)[0]  # Store the actual indices for faster lookup
             }
         
+        # Implement timepoint-based separation
+        # 1. Create blocks of timepoints
+        # Size of each block - make sure it's larger than sequence length to avoid boundary issues
+        block_size = max(self.seq_len, self.seq_len * 2)  # Double sequence length for safety
+        
+        # Check if we have enough timepoints for proper blocking
+        if self.num_timepoints < block_size * 2:  # Need at least 2 blocks
+            # Fall back to simple ratio splitting if data is too small
+            print(f"Warning: Not enough timepoints for blocking. Using simple ratio split.")
+            self._create_valid_starts_with_ratio_split(train_ratio, split)
+        else:
+            # Calculate number of complete blocks
+            num_blocks = self.num_timepoints // block_size
+            
+            # Create block indices
+            block_indices = np.arange(num_blocks)
+            
+            # Shuffle blocks
+            np.random.seed(42)  # Fixed seed for reproducibility
+            np.random.shuffle(block_indices)
+            
+            # Determine how many blocks to use for test set (approx. 1-train_ratio)
+            # Ensure at least one block for testing
+            num_test_blocks = max(1, int(num_blocks * (1 - train_ratio)))
+            
+            # Select test blocks
+            test_block_indices = block_indices[:num_test_blocks]
+            train_block_indices = block_indices[num_test_blocks:]
+            
+            # Create masks for timepoints
+            test_timepoints = []
+            train_timepoints = []
+            
+            # Assign timepoints to train/test based on blocks
+            for block_idx in range(num_blocks):
+                start_timepoint = block_idx * block_size
+                end_timepoint = min((block_idx + 1) * block_size, self.num_timepoints)
+                
+                if block_idx in test_block_indices:
+                    test_timepoints.extend(range(start_timepoint, end_timepoint))
+                else:
+                    train_timepoints.extend(range(start_timepoint, end_timepoint))
+            
+            # Handle any remaining timepoints (assign to training by default)
+            if num_blocks * block_size < self.num_timepoints:
+                remaining_timepoints = range(num_blocks * block_size, self.num_timepoints)
+                train_timepoints.extend(remaining_timepoints)
+            
+            # Sort timepoints for easier processing
+            test_timepoints.sort()
+            train_timepoints.sort()
+            
+            # Find valid starting points that ensure a complete sequence stays 
+            # within either training or test data
+            valid_starts = []
+            
+            if split == 'train':
+                # Process training timepoints, finding continuous regions
+                if len(train_timepoints) > 0:
+                    # Find continuous regions
+                    regions = []
+                    region_start = train_timepoints[0]
+                    current_region = [region_start]
+                    
+                    for i in range(1, len(train_timepoints)):
+                        # If continuous, add to current region
+                        if train_timepoints[i] == train_timepoints[i-1] + 1:
+                            current_region.append(train_timepoints[i])
+                        else:
+                            # Region ended, store it and start a new one
+                            regions.append(current_region)
+                            current_region = [train_timepoints[i]]
+                    
+                    # Add the last region
+                    if current_region:
+                        regions.append(current_region)
+                    
+                    # For each continuous region, find valid starting points
+                    for region in regions:
+                        # Only consider regions long enough for a complete sequence
+                        if len(region) >= self.seq_len:
+                            # Find valid starting points within this region
+                            # A valid starting point can be any timepoint that leaves room for a full sequence
+                            for t_idx, t in enumerate(region):
+                                # Check if there are enough remaining timepoints in this region for a full sequence
+                                if t_idx + self.seq_len <= len(region):
+                                    # This is a valid starting point
+                                    valid_starts.extend([(t, z) for z in range(self.num_z)])
+            else:
+                # Process test timepoints, finding continuous regions
+                if len(test_timepoints) > 0:
+                    # Find continuous regions
+                    regions = []
+                    region_start = test_timepoints[0]
+                    current_region = [region_start]
+                    
+                    for i in range(1, len(test_timepoints)):
+                        # If continuous, add to current region
+                        if test_timepoints[i] == test_timepoints[i-1] + 1:
+                            current_region.append(test_timepoints[i])
+                        else:
+                            # Region ended, store it and start a new one
+                            regions.append(current_region)
+                            current_region = [test_timepoints[i]]
+                    
+                    # Add the last region
+                    if current_region:
+                        regions.append(current_region)
+                    
+                    # For each continuous region, find valid starting points
+                    for region in regions:
+                        # Only consider regions long enough for a complete sequence
+                        if len(region) >= self.seq_len:
+                            # Find valid starting points within this region
+                            # A valid starting point can be any timepoint that leaves room for a full sequence
+                            for t_idx, t in enumerate(region):
+                                # Check if there are enough remaining timepoints in this region for a full sequence
+                                if t_idx + self.seq_len <= len(region):
+                                    # This is a valid starting point
+                                    valid_starts.extend([(t, z) for z in range(self.num_z)])
+            
+            # Shuffle valid starts (within their respective train/test sets)
+            np.random.shuffle(valid_starts)
+            self.valid_starts = valid_starts
+            
+            # Print detailed information about the split
+            print(f"\nTimepoint-based split for {os.path.basename(h5_file_path)}:")
+            print(f"Total timepoints: {self.num_timepoints}")
+            print(f"Block size: {block_size}")
+            print(f"Number of blocks: {num_blocks}")
+            print(f"Test blocks: {num_test_blocks} ({len(test_timepoints)} timepoints)")
+            print(f"Train blocks: {num_blocks - num_test_blocks} ({len(train_timepoints)} timepoints)")
+            print(f"Number of continuous regions: {len(regions)}")
+            print(f"Average region length: {sum(len(r) for r in regions) / len(regions) if regions else 0:.1f} timepoints")
+        
+        # Only print basic dataset info, not diagnostics
+        print(f"\nDALI-Based Dataset {os.path.basename(h5_file_path)}:")
+        print(f"Total z-planes: {self.num_z}")
+        print(f"Sequence length: {seq_len}")
+        print(f"Total sequences ({split}): {len(self.valid_starts)}")
+        
+        # Only print z-plane ordering in diagnostic mode
+        if MEMORY_DIAGNOSTICS:
+            print(f"Z-plane ordering: {self.z_values}")
+    
+    def _create_valid_starts_with_ratio_split(self, train_ratio, split):
+        """Legacy method for creating valid starts using simple ratio-based splitting.
+        Used as fallback when there are not enough timepoints for block-based splitting."""
         # Create all possible sequence starting points
         valid_starts = []
-        for t in range(self.num_timepoints - seq_len + 1):
+        for t in range(self.num_timepoints - self.seq_len + 1):
             # Allow sequences to start at any z-index
             valid_starts.extend([(t, z) for z in range(self.num_z)])
         
@@ -94,16 +243,8 @@ class H5Loader:
             self.valid_starts = valid_starts[:split_idx]
         else:
             self.valid_starts = valid_starts[split_idx:]
-            
-        # Only print basic dataset info, not diagnostics
-        print(f"\nDALI-Based Dataset {os.path.basename(h5_file_path)}:")
-        print(f"Total z-planes: {self.num_z}")
-        print(f"Sequence length: {seq_len}")
-        print(f"Total sequences ({split}): {len(self.valid_starts)}")
         
-        # Only print z-plane ordering in diagnostic mode
-        if MEMORY_DIAGNOSTICS:
-            print(f"Z-plane ordering: {self.z_values}")
+        print(f"Warning: Using legacy ratio-based split due to insufficient timepoints.")
     
     def __len__(self):
         return len(self.valid_starts)
