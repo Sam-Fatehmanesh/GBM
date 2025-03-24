@@ -62,7 +62,7 @@ torch.cuda.init()
 torch.cuda.empty_cache()
 torch.cuda.memory.empty_cache()
 
-# Enable tensor cores for better performance with fp16
+# Enable tensor cores for better performance
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 # Enable memory optimizations
@@ -153,15 +153,15 @@ def main():
         # Parameters
         params = {
             'batch_size': 128, 
-            'num_epochs': 4,
-            'learning_rate': 1e-4,
+            'num_epochs': 1,
+            'learning_rate': 1e-3,
             'mamba_layers': 1,
             'mamba_dim': 1024,
             'timesteps_per_sequence': 10,
             'train_ratio': 0.95,
             'dali_num_threads': 2, 
             'gpu_prefetch': 1,      
-            'use_float16': True,    # Enable float16 for memory efficiency
+            'use_float16': False,    # Disabled float16 for full precision training
         }
         
         # Print initial memory stats
@@ -277,12 +277,17 @@ def main():
         raw_batch_losses = []  # Track individual batch losses
         best_test_loss = float('inf')
         
+        # Add running average tracking for loss spike detection
+        running_avg_loss = None
+        running_avg_alpha = 0.95  # Exponential moving average factor
+        
         # Create CUDA streams for overlapping operations
         compute_stream = torch.cuda.Stream()
         copy_stream = torch.cuda.Stream()
         
-        # Enable automatic mixed precision for memory efficiency
-        scaler = torch.cuda.amp.GradScaler(enabled=params['use_float16'])
+        # Use GradScaler for gradient stability even in FP32 mode
+        # This can help normalize gradient magnitudes during training
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
         
         # Calculate quarter epoch size for video generation
         quarter_epoch_size = len(train_loader) // 4
@@ -294,6 +299,7 @@ def main():
             model.train()
             epoch_loss = 0.0
             batch_count = 0
+            skipped_batches = 0  # Track number of skipped batches
             
             # Reset DALI loader
             train_loader.reset()
@@ -317,15 +323,34 @@ def main():
                     # Process batch - model handles dtype conversion internally
                     optimizer.zero_grad()
                     
-                    # Use automatic mixed precision for forward pass
-                    with torch.cuda.amp.autocast(enabled=params['use_float16']):
-                        # Get logits from model (no sigmoid)
-                        predictions = model(batch)
-                        # Binary focal loss with logits (replacing BCE loss)
-                        loss = model.compute_loss(predictions, batch[:, 1:])
+                    # Get logits from model (no sigmoid)
+                    predictions = model(batch)
+                    # BCE loss
+                    loss = model.compute_loss(predictions, batch[:, 1:])
                     
-                    # Scale loss and backpropagate with mixed precision
+                    # Check if loss is abnormally high compared to running average
+                    current_loss = loss.item()
+                    
+                    # Initialize running average if not set
+                    if running_avg_loss is None:
+                        running_avg_loss = current_loss
+                    
+                    # Check if loss exceeds threshold (2x running average)
+                    if current_loss > running_avg_loss * 2.0 and running_avg_loss > 0:
+                        tqdm.write(f"Skipping batch {batch_idx+1} with abnormally high loss: {current_loss:.6f} (> {running_avg_loss:.6f} * 4)")
+                        skipped_batches += 1
+                        # Record the high loss for monitoring but don't update model
+                        raw_batch_losses.append(current_loss)
+                        # # Update running average with high value (with lower weight to reduce impact)
+                        # running_avg_loss = running_avg_loss * 0.99 + current_loss * 0.01
+                        continue
+                    
+                    # Update running average with normal weight
+                    running_avg_loss = running_avg_loss * running_avg_alpha + current_loss * (1 - running_avg_alpha)
+                    
+                    # Use scaler for gradient stability (even in FP32)
                     scaler.scale(loss).backward()
+                    
                     # Update weights with gradient clipping
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -340,7 +365,7 @@ def main():
                     raw_batch_losses.append(loss.item())
                     
                     # Update tqdm display
-                    train_loop.set_postfix(loss=loss.item())
+                    train_loop.set_postfix(loss=loss.item(), avg=running_avg_loss, skipped=skipped_batches)
                     
                     # Update loss graph and CSV every 128 batches
                     if (len(raw_batch_losses) % 128 == 0):
@@ -359,7 +384,7 @@ def main():
                             os.path.join(exp_dir, 'logs', 'raw_batch_losses.csv')
                         )
                         
-                        tqdm.write(f"Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_loader)}: Current Loss = {loss.item():.6f}, Avg Loss = {current_avg_loss:.6f}")
+                        tqdm.write(f"Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_loader)}: Current Loss = {loss.item():.6f}, Avg Loss = {current_avg_loss:.6f}, Running Avg = {running_avg_loss:.6f}, Skipped = {skipped_batches}")
                     
                     # Generate comparison video every quarter epoch
                     if (batch_idx + 1) % quarter_epoch_size == 0:
@@ -411,11 +436,10 @@ def main():
                             batch = batch.cuda(non_blocking=True)
                         
                         # Model handles different input types internally
-                        with torch.cuda.amp.autocast(enabled=params['use_float16']):
-                            # Get logits from model (no sigmoid)
-                            predictions = model(batch)
-                            # Loss function handles type conversion
-                            loss = model.compute_loss(predictions, batch[:, 1:])
+                        # Get logits from model (no sigmoid)
+                        predictions = model(batch)
+                        # Loss function handles type conversion
+                        loss = model.compute_loss(predictions, batch[:, 1:])
                         
                         test_loss += loss.item()
                         test_batch_count += 1
