@@ -154,7 +154,7 @@ def main():
         params = {
             'batch_size': 128, 
             'num_epochs': 1,
-            'learning_rate': 1e-3,
+            'learning_rate': 5e-4,
             'mamba_layers': 1,
             'mamba_dim': 1024,
             'timesteps_per_sequence': 10,
@@ -172,7 +172,7 @@ def main():
         tqdm.write(f"Saving experiment results to: {exp_dir}")
         
         # Create datasets from spike data
-        processed_dir = "processed_spikes"
+        processed_dir = "training_spike_data_2018"
         spike_files = []
         for file in os.listdir(processed_dir):
             if file.endswith("_processed.h5"):

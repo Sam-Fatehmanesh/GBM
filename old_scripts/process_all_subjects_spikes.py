@@ -4,7 +4,7 @@ import h5py
 import numpy as np
 from scipy.io import loadmat
 from tqdm import tqdm
-from BrainSimulator.models.oasis import OASIS
+from GenerativeBrainModel.models.oasis import OASIS
 
 def process_subject(subject_dir, output_dir):
     """Process calcium data for a single subject using OASIS.
