@@ -115,3 +115,56 @@ class OASIS:
             c, s = self.fit(y)
         
         return c, s 
+    
+    def convolve_spikes_to_trace(self, s, kernel=None):
+        """Convolve spike train with a calcium response kernel to generate a fluorescence trace.
+        
+        Parameters
+        ----------
+        s : array_like
+            Spike train, a vector of non-negative spike counts or amplitudes.
+        kernel : array_like, optional
+            Calcium response kernel. If None, the kernel is constructed using the AR parameters.
+            
+        Returns
+        -------
+        c : ndarray
+            Calcium trace obtained by convolving the spike train with the kernel.
+        
+        Notes
+        -----
+        For an AR(p) process, the calcium response kernel is constructed as:
+        h[t] = (A^t)[1,1] for t >= 0, where A is the transition matrix.
+        
+        This function is useful for forward simulation and for reconstructing calcium traces
+        from inferred spike trains.
+        """
+        if kernel is None:
+            # Construct kernel from AR parameters
+            if not hasattr(self, 'g'):
+                raise ValueError("AR parameters not defined. Either provide a kernel or set AR parameters.")
+            
+            if isinstance(self.g, (int, float)):  # AR(1) case
+                # For AR(1), kernel is just powers of gamma
+                kernel_length = int(10 / (1 - self.g))  # Reasonable length to capture decay
+                kernel = np.power(self.g, np.arange(kernel_length))
+            else:  # AR(p) case with p > 1
+                # For AR(p), need to use the transition matrix
+                p = len(self.g) if isinstance(self.g, (list, np.ndarray)) else 1
+                A = np.zeros((p, p))
+                A[0, :] = self.g
+                for i in range(1, p):
+                    A[i, i-1] = 1
+                
+                # Compute kernel as first element of matrix powers
+                kernel_length = int(10 / (1 - np.max(np.abs(self.g))))
+                kernel = np.zeros(kernel_length)
+                A_power = np.eye(p)
+                for t in range(kernel_length):
+                    kernel[t] = A_power[0, 0]
+                    A_power = A_power @ A
+        
+        # Perform convolution
+        c = np.convolve(s, kernel, mode='full')[:len(s)]
+        
+        return c
