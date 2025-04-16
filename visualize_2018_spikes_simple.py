@@ -11,7 +11,7 @@ import argparse
 # Import only the built-in OASIS implementation
 from GenerativeBrainModel.models.oasis import OASIS
 
-def process_and_visualize_subject(subject_dir, output_dir, num_neurons=10, g=0.95):
+def process_and_visualize_subject(subject_dir, output_dir, num_neurons=10, g=0.028):
     """Process and visualize calcium data for a single subject using the built-in OASIS method.
     
     Parameters
@@ -182,9 +182,9 @@ def main():
                        help='Directory to save processed data and visualizations')
     parser.add_argument('--num_neurons', type=int, default=10,
                        help='Number of neurons to visualize per subject')
-    parser.add_argument('--g', type=float, default=0.95,
+    parser.add_argument('--g', type=float, default=0.9,
                        help='Calcium decay factor (AR coefficient)')
-    parser.add_argument('--skip_subjects', type=str, default='subject_1,subject_10',
+    parser.add_argument('--skip_subjects', type=str, default='',
                        help='Comma-separated list of subjects to skip (already processed)')
     
     args = parser.parse_args()

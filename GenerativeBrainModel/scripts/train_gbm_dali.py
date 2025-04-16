@@ -38,6 +38,10 @@ try:
 except ImportError:
     has_profiler = False
 
+# Sets torch seed for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
 # Enable memory diagnostics
 MEMORY_DIAGNOSTICS = False
 
@@ -131,21 +135,25 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330):
     # Generate predictions
     model.eval()
     with torch.no_grad():
-        # Model already handles different input types
+        # Get probability predictions from the model
         predictions = model.get_predictions(batch)
+        
+        # Generate sampled binary predictions from the predicted probability distributions
+        sampled_predictions = model.sample_binary_predictions(predictions)
     
     # Convert predictions to numpy for visualization
     # We'll choose multiple sequences from the batch for visualization (up to 100)
     num_sequences = min(100, batch.size(0))
     rand_indices = torch.randperm(batch.size(0))[:num_sequences]
     
-    # Create comparison visualization with 1fps
+    # Create comparison visualization with 1fps, including the sampled predictions
     create_comparison_video(
         actual=batch_viz[rand_indices].cpu().numpy(),
         predicted=predictions[rand_indices].cpu().numpy(),
         output_path=output_path,
         num_frames=num_frames,
-        fps=1  # Set to 1fps as requested
+        fps=1,  # Set to 1fps as requested
+        sampled_predictions=sampled_predictions[rand_indices].cpu().numpy()
     )
 
 def main():
@@ -292,6 +300,11 @@ def main():
         # Calculate quarter epoch size for video generation
         quarter_epoch_size = len(train_loader) // 4
         
+        # Variables to store previous model and optimizer states
+        prev_model_state = None
+        prev_optimizer_state = None
+        prev_batch_loss = None
+        
         for epoch in range(params['num_epochs']):
             if MEMORY_DIAGNOSTICS:
                 print_memory_stats(f"Beginning of epoch {epoch+1}:")
@@ -300,6 +313,7 @@ def main():
             epoch_loss = 0.0
             batch_count = 0
             skipped_batches = 0  # Track number of skipped batches
+            reverted_batches = 0  # Track number of reverted batches
             
             # Reset DALI loader
             train_loader.reset()
@@ -337,13 +351,47 @@ def main():
                     
                     # Check if loss exceeds threshold (2x running average)
                     if current_loss > running_avg_loss * 2.0 and running_avg_loss > 0:
-                        tqdm.write(f"Skipping batch {batch_idx+1} with abnormally high loss: {current_loss:.6f} (> {running_avg_loss:.6f} * 4)")
+                        tqdm.write(f"Loss spike detected at batch {batch_idx+1}: {current_loss:.6f} (> {running_avg_loss:.6f} * 2)")
+                        
+                        # Check if we have previous states to revert to (not for the first two batches)
+                        if prev_model_state is not None and batch_idx > 0:
+                            # Revert model to its state before the previous batch
+                            tqdm.write(f"Reverting model to state before batch {batch_idx}")
+                            model.load_state_dict(prev_model_state)
+                            optimizer.load_state_dict(prev_optimizer_state)
+                            
+                            # Remove the previous batch's loss from our tracking
+                            if len(raw_batch_losses) > 0:
+                                # Remove the last batch loss as we're reverting its effect
+                                removed_loss = raw_batch_losses.pop()
+                                # Adjust the epoch loss to remove the effect of the last batch
+                                if batch_count > 0:
+                                    epoch_loss -= prev_batch_loss
+                                    batch_count -= 1
+                            
+                            # Track reverted batches
+                            reverted_batches += 1
+                        
+                        # Skip the current batch with the loss spike
                         skipped_batches += 1
+                        
+                        # Update running average with the spike value (with lower weight to reduce impact)
+                        running_avg_loss = running_avg_loss * 0.99 + current_loss * 0.01
+                        
                         # Record the high loss for monitoring but don't update model
                         raw_batch_losses.append(current_loss)
-                        # # Update running average with high value (with lower weight to reduce impact)
-                        # running_avg_loss = running_avg_loss * 0.99 + current_loss * 0.01
+                        
+                        # Update tqdm display with reversion info
+                        train_loop.set_postfix(loss=current_loss, avg=running_avg_loss, 
+                                              skipped=skipped_batches, reverted=reverted_batches)
+                        
                         continue
+                    
+                    # If we get here, the batch is good. Save the current model and optimizer states
+                    # before updating the model, so we can revert if needed next time
+                    prev_model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                    prev_optimizer_state = optimizer.state_dict()
+                    prev_batch_loss = current_loss
                     
                     # Update running average with normal weight
                     running_avg_loss = running_avg_loss * running_avg_alpha + current_loss * (1 - running_avg_alpha)
@@ -358,19 +406,20 @@ def main():
                     scaler.update()
                     
                     # Update metrics
-                    epoch_loss += loss.item()
+                    epoch_loss += current_loss
                     batch_count += 1
                     
                     # Record raw batch loss
-                    raw_batch_losses.append(loss.item())
+                    raw_batch_losses.append(current_loss)
                     
                     # Update tqdm display
-                    train_loop.set_postfix(loss=loss.item(), avg=running_avg_loss, skipped=skipped_batches)
+                    train_loop.set_postfix(loss=current_loss, avg=running_avg_loss, 
+                                          skipped=skipped_batches, reverted=reverted_batches)
                     
                     # Update loss graph and CSV every 128 batches
                     if (len(raw_batch_losses) % 128 == 0):
                         # Update plots and save losses
-                        current_avg_loss = epoch_loss / batch_count
+                        current_avg_loss = epoch_loss / batch_count if batch_count > 0 else 0
                         temp_train_losses = train_losses + [current_avg_loss]
                         temp_test_losses = test_losses + [test_losses[-1] if test_losses else 0]
                         
@@ -384,7 +433,9 @@ def main():
                             os.path.join(exp_dir, 'logs', 'raw_batch_losses.csv')
                         )
                         
-                        tqdm.write(f"Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_loader)}: Current Loss = {loss.item():.6f}, Avg Loss = {current_avg_loss:.6f}, Running Avg = {running_avg_loss:.6f}, Skipped = {skipped_batches}")
+                        tqdm.write(f"Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_loader)}: Current Loss = {current_loss:.6f}, "
+                                  f"Avg Loss = {current_avg_loss:.6f}, Running Avg = {running_avg_loss:.6f}, "
+                                  f"Skipped = {skipped_batches}, Reverted = {reverted_batches}")
                     
                     # Generate comparison video every quarter epoch
                     if (batch_idx + 1) % quarter_epoch_size == 0:
@@ -408,7 +459,7 @@ def main():
                     break
             
             # Append actual epoch average loss
-            avg_train_loss = epoch_loss / (batch_count)
+            avg_train_loss = epoch_loss / batch_count if batch_count > 0 else float('inf')
             train_losses.append(avg_train_loss)
             
             # Clean up memory before evaluation
