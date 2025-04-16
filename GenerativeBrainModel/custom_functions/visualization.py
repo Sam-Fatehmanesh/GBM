@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=1):
+def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=1, sampled_predictions=None):
     """Create video comparing actual brain activity with model predictions.
     
     Args:
@@ -13,6 +13,7 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
         output_path: Path to save the video
         num_frames: Maximum sequence length to use (default: 330 for full sequences)
         fps: Frames per second for the video (default: 1)
+        sampled_predictions: numpy array of shape (batch_size, seq_len-1, 256, 128) with sampled binary predictions
     """
     try:
         # Set up video parameters
@@ -25,17 +26,30 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
+        # Check if we have sampled predictions (4-panel mode) or just predictions (3-panel mode)
+        has_samples = sampled_predictions is not None
+        
+        # Set video dimensions based on layout (2x2 grid or 3 in a row)
+        if has_samples:
+            # 2x2 grid layout
+            video_width = scaled_width * 2
+            video_height = scaled_height * 2
+        else:
+            # Original 3 in a row layout
+            video_width = scaled_width * 3
+            video_height = scaled_height
+        
         # Use H264 codec for MP4
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, 
-                            (scaled_width * 3, scaled_height), 
+                            (video_width, video_height), 
                             isColor=True)
         
         if not out.isOpened():
             # Try an alternative codec silently
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(output_path, fourcc, fps, 
-                                (scaled_width * 3, scaled_height), 
+                                (video_width, video_height), 
                                 isColor=True)
             
             if not out.isOpened():
@@ -51,6 +65,10 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
             # Get current sequence
             current_seq = actual[batch_idx]
             predicted_seq = predicted[batch_idx]
+            
+            # If we have sampled predictions, get those too
+            if has_samples:
+                sampled_seq = sampled_predictions[batch_idx]
             
             # Use full sequence length, limited by available frames
             seq_len = min(current_seq.shape[0]-1, predicted_seq.shape[0], num_frames)
@@ -71,6 +89,10 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
                 next_frame = current_seq[t+1]  # Ground truth
                 prediction = predicted_seq[t]   # Model prediction
                 
+                # Get sampled prediction if available
+                if has_samples:
+                    sampled = sampled_seq[t]  # Sampled binary prediction
+                
                 # Ensure values are in float [0,1] range
                 if current.dtype == np.uint8:
                     current = current.astype(np.float32) / 255.0
@@ -78,11 +100,15 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
                     next_frame = next_frame.astype(np.float32) / 255.0
                 if prediction.dtype == np.uint8:
                     prediction = prediction.astype(np.float32) / 255.0
+                if has_samples and sampled.dtype == np.uint8:
+                    sampled = sampled.astype(np.float32) / 255.0
                 
                 # Convert to uint8 images
                 curr_img = (current * 255).astype(np.uint8)
                 pred_img = (prediction * 255).astype(np.uint8)
                 next_img = (next_frame * 255).astype(np.uint8)
+                if has_samples:
+                    sample_img = (sampled * 255).astype(np.uint8)
                 
                 # Scale up images
                 curr_img = cv2.resize(curr_img, (scaled_width, scaled_height), 
@@ -91,11 +117,16 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
                                     interpolation=cv2.INTER_NEAREST)
                 next_img = cv2.resize(next_img, (scaled_width, scaled_height), 
                                     interpolation=cv2.INTER_NEAREST)
+                if has_samples:
+                    sample_img = cv2.resize(sample_img, (scaled_width, scaled_height), 
+                                        interpolation=cv2.INTER_NEAREST)
                 
                 # Convert to RGB
                 curr_rgb = cv2.cvtColor(curr_img, cv2.COLOR_GRAY2BGR)
                 pred_rgb = cv2.cvtColor(pred_img, cv2.COLOR_GRAY2BGR)
                 next_rgb = cv2.cvtColor(next_img, cv2.COLOR_GRAY2BGR)
+                if has_samples:
+                    sample_rgb = cv2.cvtColor(sample_img, cv2.COLOR_GRAY2BGR)
                 
                 # Add text labels
                 cv2.putText(curr_rgb, 'Current', (10, 30),
@@ -104,13 +135,25 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 cv2.putText(next_rgb, 'Actual Next', (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                if has_samples:
+                    cv2.putText(sample_rgb, 'Sampled Prediction', (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 
                 # Add frame number and sequence info
                 cv2.putText(curr_rgb, f'Seq {batch_idx+1}/{batch_size}, Frame {t+1}/{seq_len}', (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 
-                # Combine horizontally
-                combined = np.hstack([curr_rgb, pred_rgb, next_rgb])
+                # Combine images based on layout
+                if has_samples:
+                    # Create 2x2 grid: current | predicted
+                    #                  actual  | sampled
+                    top_row = np.hstack([curr_rgb, pred_rgb])
+                    bottom_row = np.hstack([next_rgb, sample_rgb])
+                    combined = np.vstack([top_row, bottom_row])
+                else:
+                    # Original 3 in a row layout
+                    combined = np.hstack([curr_rgb, pred_rgb, next_rgb])
+                
                 out.write(combined)
                 total_frames += 1
             
