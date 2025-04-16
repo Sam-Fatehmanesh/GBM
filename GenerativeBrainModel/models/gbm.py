@@ -158,3 +158,36 @@ class GBM(nn.Module):
         # Apply sigmoid to get probabilities
         return torch.sigmoid(logits)
 
+    def sample_binary_predictions(self, x):
+        """Sample predictions from the model.
+        
+        Args:
+            x: Tensor of shape (batch_size, seq_len, 256, 128) containing sequence of z plane spike probabilities
+            num_samples: Number of samples to generate
+        
+        Returns:
+            samples: Tensor of shape (batch_size, num_samples, seq_len-1, 256, 128) containing
+                     generated samples
+        """
+        
+        return torch.bernoulli(x)
+
+    def generate_autoregressive_brain(self, init_x, num_steps=30):
+        """Generate a brain sequence from an initial grid sequence using autoregressive sampling.
+        
+        Args:
+            init_x: Tensor of shape (batch_size, seq_len, 256, 128) containing sequence of z plane spike probabilities
+            num_steps: Number of steps to generate
+        Returns:
+            samples: Tensor of shape (batch_size, seq_len, 256, 128) containing
+                     generated samples
+        """
+        x = init_x
+        for i in range(num_steps):
+            prediction = self.sample_binary_predictions(self.forward(x)[:, -1, :, :]).unsqueeze(1)
+            x = torch.cat((x, prediction), dim=1)
+        return x
+        
+        
+        
+            
