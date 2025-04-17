@@ -43,12 +43,10 @@ class FastGridLoader:
         """
         self.h5_file_path = h5_file_path
         self.seq_len = seq_len
+        self.split = split  # Store split for later checks
         
-        # Extract subject name and verify split
-        self.subject_name = os.path.basename(os.path.dirname(os.path.dirname(h5_file_path)))
-        file_split = os.path.basename(os.path.dirname(h5_file_path))
-        if file_split != split:
-            print(f"Warning: Requested split '{split}' doesn't match file path split '{file_split}'")
+        # Extract subject name
+        self.subject_name = os.path.basename(os.path.dirname(h5_file_path))
         
         # Open the file temporarily to get metadata
         with h5py.File(h5_file_path, 'r', libver='latest', swmr=True) as f:
@@ -60,6 +58,9 @@ class FastGridLoader:
             # Get mapping from index to original timepoint
             self.timepoint_indices = f['timepoint_indices'][:]
             
+            # Get train/test mask (1 = train, 0 = test)
+            self.is_train = f['is_train'][:]
+            
             # Calculate total sequences for random access
             self.total_possible_sequences = self.num_timepoints * self.num_z
             
@@ -69,8 +70,6 @@ class FastGridLoader:
                 # For each timepoint, we can start at any z-plane
                 for z in range(self.num_z):
                     # Check if there are enough frames left for a complete sequence
-                    # Need to check if starting from this timepoint and z-plane
-                    # we can get a full sequence of length seq_len
                     
                     # Calculate how many frames we have from this starting point
                     # First, how many z-planes are left in this timepoint
@@ -89,13 +88,46 @@ class FastGridLoader:
                     
                     # Check if we have enough timepoints available
                     if tp_idx + total_tps_needed <= self.num_timepoints:
+                        # Build the list of time-points this window uses
+                        tp_span = list(range(tp_idx, tp_idx + total_tps_needed))
+                        
+                        # Check 1: Verify all frames are from the correct split
+                        split_check = True
+                        if split == 'train':
+                            # For train split, all frames must have is_train == 1
+                            for t in tp_span:
+                                if self.is_train[t] != 1:
+                                    split_check = False
+                                    break
+                        else:  # split == 'test'
+                            # For test split, all frames must have is_train == 0
+                            for t in tp_span:
+                                if self.is_train[t] != 0:
+                                    split_check = False
+                                    break
+                        
+                        if not split_check:
+                            continue  # Skip this start point if it crosses a split boundary
+                        
+                        # Check 2: Verify timepoints are consecutive in the original timeline
+                        continuity_check = True
+                        for i in range(len(tp_span) - 1):
+                            # Original time indices should be consecutive
+                            if self.timepoint_indices[tp_span[i]] + 1 != self.timepoint_indices[tp_span[i+1]]:
+                                continuity_check = False
+                                break
+                        
+                        if not continuity_check:
+                            continue  # Skip this start point if it's not continuous in real time
+                        
+                        # If we passed both checks, this is a valid start point
                         self.valid_starts.append((tp_idx, z))
         
         # Shuffle valid starts
         np.random.seed(42)  # Fixed seed for reproducibility
         np.random.shuffle(self.valid_starts)
         
-        print(f"\nFast DALI Dataset ({os.path.basename(h5_file_path)}):")
+        print(f"\nFast DALI Dataset (using {os.path.basename(h5_file_path)}):")
         print(f"Subject: {self.subject_name}")
         print(f"Split: {split}")
         print(f"Total z-planes: {self.num_z}")
@@ -238,21 +270,19 @@ class FastDALIBrainDataLoader:
         self.batch_size = batch_size
         self.device_id = device_id
         
-        # Find all preaugmented grid files for the specified split
+        # Find all preaugmented grid files
         self.grid_files = []
         for subject_dir in os.listdir(preaugmented_dir):
             subject_path = os.path.join(preaugmented_dir, subject_dir)
             if os.path.isdir(subject_path):
-                split_path = os.path.join(subject_path, split)
-                if os.path.isdir(split_path):
-                    grid_file = os.path.join(split_path, 'preaugmented_grids.h5')
-                    if os.path.exists(grid_file):
-                        self.grid_files.append(grid_file)
+                grid_file = os.path.join(subject_path, 'preaugmented_grids.h5')
+                if os.path.exists(grid_file):
+                    self.grid_files.append(grid_file)
         
         if not self.grid_files:
-            raise ValueError(f"No preaugmented grid files found for split '{split}' in {preaugmented_dir}")
+            raise ValueError(f"No preaugmented grid files found in {preaugmented_dir}")
         
-        print(f"Found {len(self.grid_files)} preaugmented grid files for split '{split}'")
+        print(f"Found {len(self.grid_files)} preaugmented grid files")
         
         # Calculate pipeline batch size
         self.pipeline_batch_size = max(8, self.batch_size // len(self.grid_files))

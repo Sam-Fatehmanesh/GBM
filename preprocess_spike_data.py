@@ -79,9 +79,8 @@ def preprocess_file(h5_file_path, output_dir, split_ratio=0.95, splits=('train',
     
     print(f"Saving to {subject_dir}")
     
-    # Create output directories for each split
-    for split in splits:
-        os.makedirs(os.path.join(subject_dir, split), exist_ok=True)
+    # Create output directory
+    os.makedirs(subject_dir, exist_ok=True)
     
     # Open the file for reading
     with h5py.File(h5_file_path, 'r', libver='latest', swmr=True) as f:
@@ -127,7 +126,7 @@ def preprocess_file(h5_file_path, output_dir, split_ratio=0.95, splits=('train',
         np.random.seed(seed)
         
         # Create blocks of timepoints for more robust train/test split
-        block_size = 20  # Use fixed block size 
+        block_size = 330  # Use fixed block size 
         num_blocks = num_timepoints // block_size
         
         # Create block indices and shuffle
@@ -173,13 +172,19 @@ def preprocess_file(h5_file_path, output_dir, split_ratio=0.95, splits=('train',
             'test': test_timepoints
         }
         
+        # Create a binary mask for train vs test
+        # 1 = train, 0 = test
+        is_train = np.zeros(num_timepoints, dtype=np.uint8)
+        is_train[train_timepoints] = 1
+        
         # Save metadata about the dataset
         metadata = {
             'num_timepoints': num_timepoints,
             'num_z_planes': num_z,
             'z_values': z_values,
             'train_timepoints': train_timepoints,
-            'test_timepoints': test_timepoints
+            'test_timepoints': test_timepoints,
+            'is_train': is_train
         }
         
         # Save metadata to a separate file
@@ -189,74 +194,72 @@ def preprocess_file(h5_file_path, output_dir, split_ratio=0.95, splits=('train',
             meta_file.create_dataset('z_values', data=z_values)
             meta_file.create_dataset('train_timepoints', data=train_timepoints)
             meta_file.create_dataset('test_timepoints', data=test_timepoints)
+            meta_file.create_dataset('is_train', data=is_train)
         
         # Process each timepoint and z-plane
         spikes = f['spikes']
         
-        # Create a grid for each timepoint and z-plane, and apply augmentation
-        for split in splits:
-            timepoints = split_timepoints[split]
+        # Create a single HDF5 file with all timepoints in original order
+        all_timepoints = list(range(num_timepoints))
+        
+        # Create a combined output file
+        output_file_path = os.path.join(subject_dir, 'preaugmented_grids.h5')
+        with h5py.File(output_file_path, 'w') as out_f:
+            # Create a dataset to store all grids
+            # Shape: (num_timepoints, num_z, height, width)
+            out_f.create_dataset('grids', 
+                                shape=(num_timepoints, num_z, 256, 128), 
+                                dtype=np.uint8,
+                                chunks=(1, 1, 256, 128),  # Chunk by individual frames
+                                compression='gzip',
+                                compression_opts=1)  # Light compression for speed
             
-            # Skip if no timepoints for this split
-            if not timepoints:
-                continue
-                
-            # Create output file for this split
-            output_file_path = os.path.join(subject_dir, split, 'preaugmented_grids.h5')
-            with h5py.File(output_file_path, 'w') as out_f:
-                # Create a dataset to store all grids
-                # Shape: (num_timepoints, num_z, height, width)
-                out_f.create_dataset('grids', 
-                                    shape=(len(timepoints), num_z, 256, 128), 
-                                    dtype=np.uint8,
-                                    chunks=(1, 1, 256, 128),  # Chunk by individual frames
-                                    compression='gzip',
-                                    compression_opts=1)  # Light compression for speed
-                
-                # Create dataset to store timepoint mapping
-                out_f.create_dataset('timepoint_indices', data=timepoints)
-                
-                # Process each timepoint
-                for idx, t in enumerate(tqdm(timepoints, desc=f"Processing {split} timepoints")):
-                    # Process each z-plane
-                    for z_idx in range(num_z):
-                        # Get pre-computed cell indices for this z-plane
-                        cell_indices = z_cell_indices[z_idx]['indices']
-                        
-                        # Create empty grid for this timepoint and z-plane
-                        grid = np.zeros((256, 128), dtype=np.uint8)
-                        
-                        # Skip if no cells in this z-plane
-                        if len(cell_indices) == 0:
-                            # Still apply augmentation 
-                            grid = augment_z_frames(grid, z_idx)
-                            out_f['grids'][idx, z_idx] = grid
-                            continue
-                        
-                        # Get spikes for this timepoint and z-plane
-                        spikes_t = spikes[t][cell_indices]
-                        
-                        # Find active cells
-                        active_cells = np.abs(spikes_t) > 1e-6
-                        
-                        if np.any(active_cells):  # Only process if there are active cells
-                            active_x = z_cell_indices[z_idx]['x'][active_cells]
-                            active_y = z_cell_indices[z_idx]['y'][active_cells]
-                            
-                            # Set active cells to 1 in the grid
-                            for i in range(len(active_x)):
-                                grid[active_x[i], active_y[i]] = 1
-                        
-                        # Apply z-plane augmentation
+            # Create dataset to store timepoint mapping (original indices)
+            out_f.create_dataset('timepoint_indices', data=np.array(all_timepoints, dtype=np.int32))
+            
+            # Create dataset to store train/test mask
+            out_f.create_dataset('is_train', data=is_train)
+            
+            # Process each timepoint
+            for idx, t in enumerate(tqdm(all_timepoints, desc=f"Processing timepoints")):
+                # Process each z-plane
+                for z_idx in range(num_z):
+                    # Get pre-computed cell indices for this z-plane
+                    cell_indices = z_cell_indices[z_idx]['indices']
+                    
+                    # Create empty grid for this timepoint and z-plane
+                    grid = np.zeros((256, 128), dtype=np.uint8)
+                    
+                    # Skip if no cells in this z-plane
+                    if len(cell_indices) == 0:
+                        # Still apply augmentation 
                         grid = augment_z_frames(grid, z_idx)
-                        
-                        # Save to output file
                         out_f['grids'][idx, z_idx] = grid
-                
-                # Add split to metadata
-                out_f.attrs['split'] = split
-                out_f.attrs['num_timepoints'] = len(timepoints)
-                out_f.attrs['num_z_planes'] = num_z
+                        continue
+                    
+                    # Get spikes for this timepoint and z-plane
+                    spikes_t = spikes[t][cell_indices]
+                    
+                    # Find active cells
+                    active_cells = np.abs(spikes_t) > 1e-6
+                    
+                    if np.any(active_cells):  # Only process if there are active cells
+                        active_x = z_cell_indices[z_idx]['x'][active_cells]
+                        active_y = z_cell_indices[z_idx]['y'][active_cells]
+                        
+                        # Set active cells to 1 in the grid
+                        for i in range(len(active_x)):
+                            grid[active_x[i], active_y[i]] = 1
+                    
+                    # Apply z-plane augmentation
+                    grid = augment_z_frames(grid, z_idx)
+                    
+                    # Save to output file
+                    out_f['grids'][idx, z_idx] = grid
+            
+            # Add metadata to output file
+            out_f.attrs['num_timepoints'] = num_timepoints
+            out_f.attrs['num_z_planes'] = num_z
     
     print(f"Preprocessing completed in {time.time() - start_time:.2f} seconds")
     return subject_dir
@@ -336,7 +339,8 @@ def main():
                         'num_z_planes': f['num_z_planes'][()],
                         'z_values': f['z_values'][:],
                         'train_timepoints': f['train_timepoints'][:],
-                        'test_timepoints': f['test_timepoints'][:]
+                        'test_timepoints': f['test_timepoints'][:],
+                        'is_train': f['is_train'][:]
                     }
                     combined_metadata[subject_dir] = subject_data
     
