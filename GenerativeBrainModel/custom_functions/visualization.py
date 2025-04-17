@@ -128,16 +128,16 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
                 if has_samples:
                     sample_rgb = cv2.cvtColor(sample_img, cv2.COLOR_GRAY2BGR)
                 
-                # Add text labels
+                    # Add text labels
                 cv2.putText(curr_rgb, 'Current', (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(pred_rgb, 'Predicted Next', (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(pred_rgb, 'Predicted Spike Probabilities', (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 cv2.putText(next_rgb, 'Actual Next', (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 if has_samples:
-                    cv2.putText(sample_rgb, 'Sampled Prediction', (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(sample_rgb, 'Predicted Spike Samples', (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 
                 # Add frame number and sequence info
                 cv2.putText(curr_rgb, f'Seq {batch_idx+1}/{batch_size}, Frame {t+1}/{seq_len}', (10, 60),
