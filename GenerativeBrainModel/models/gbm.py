@@ -38,7 +38,7 @@ def binary_focal_loss(pred, target, alpha=0.25, gamma=2.0, reduction='mean', eps
         return loss
 
 class GBM(nn.Module):
-    def __init__(self, mamba_layers=1, mamba_dim=1024, pretrained_ae_path="trained_simpleAE/checkpoints/best_model.pt"):
+    def __init__(self, mamba_layers=1, mamba_dim=1024, mamba_state_multiplier=1, pretrained_ae_path="trained_simpleAE/checkpoints/best_model.pt"):
         """Generative Brain Model combining pretrained autoencoder with Mamba for sequential prediction.
         
         Args:
@@ -58,7 +58,7 @@ class GBM(nn.Module):
         #     param.requires_grad = False
             
         # Create Mamba sequence model
-        self.mamba = StackedMamba(d_model=mamba_dim, num_layers=mamba_layers)
+        self.mamba = StackedMamba(d_model=mamba_dim, num_layers=mamba_layers, state_multiplier=mamba_state_multiplier)
         
         # Save dimensions
         self.latent_dim = mamba_dim
