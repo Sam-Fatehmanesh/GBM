@@ -26,7 +26,9 @@ mp.set_start_method('spawn', force=True)
 
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, ConcatDataset
-from torch.optim import Adam
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+import math
 import numpy as np
 from tqdm import tqdm
 import pandas as pd
@@ -167,6 +169,38 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330):
         sampled_predictions=sampled_predictions[rand_indices].cpu().numpy()
     )
 
+def get_lr_scheduler(optimizer, warmup_steps, total_steps, min_lr=1e-5):
+    """Creates a learning rate scheduler with linear warmup and cosine decay to specified min_lr.
+    
+    Args:
+        optimizer: The optimizer to schedule
+        warmup_steps: Number of warmup steps
+        total_steps: Total number of training steps
+        min_lr: Minimum learning rate to decay to
+    
+    Returns:
+        LambdaLR scheduler
+    """
+    def lr_lambda(current_step):
+        # Get base lr
+        base_lr = optimizer.param_groups[0]['lr']
+        
+        # Convert min_lr to a fraction of base_lr for the lambda function
+        # Prevent division by zero by ensuring base_lr is not zero
+        min_lr_factor = min_lr / max(base_lr, 1e-8)
+        # Linear warmup
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        
+        # Cosine annealing after warmup with decay to min_lr
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+        # Scale between 1.0 and min_lr_factor instead of between 1.0 and 0.0
+        return min_lr_factor + (1.0 - min_lr_factor) * cosine_decay
+    
+    return LambdaLR(optimizer, lr_lambda)
+
 def main():
     try:
         # Parameters
@@ -174,8 +208,11 @@ def main():
             'preaugmented_dir': 'preaugmented_training_spike_data_2018',  # Directory with preaugmented data
             'batch_size': 128, 
             'num_epochs': 1,
-            'learning_rate': 5e-4,
-            'mamba_layers': 8,
+            'learning_rate': 6e-4,
+            'weight_decay': 0.1,         # Weight decay for AdamW
+            'warmup_ratio': 0.1,         # Warmup ratio (percentage of total steps)
+            'min_lr': 1e-5,              # Minimum learning rate for cosine decay
+            'mamba_layers': 12,
             'mamba_dim': 1024,
             'mamba_state_multiplier': 4,
             'timesteps_per_sequence': 10,
@@ -275,8 +312,19 @@ def main():
         video_path = os.path.join(exp_dir, 'videos', 'predictions_initial.mp4')
         create_prediction_video(model, test_loader, video_path, num_frames=330)
         
-        # Create optimizer
-        optimizer = Adam(model.parameters(), lr=params['learning_rate'])
+        # Create optimizer - AdamW with weight decay
+        optimizer = AdamW(model.parameters(), lr=params['learning_rate'], weight_decay=params['weight_decay'], betas=(0.9, 0.95))
+        
+        # Calculate total steps for scheduler
+        total_steps = len(train_loader) * params['num_epochs']
+        warmup_steps = int(total_steps * params['warmup_ratio'])
+        
+        # Create learning rate scheduler with linear warmup and cosine decay
+        lr_scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps, min_lr=params['min_lr'])
+        
+        tqdm.write(f"Using AdamW optimizer with weight decay: {params['weight_decay']}")
+        tqdm.write(f"Learning rate scheduler: Linear warmup for {warmup_steps} steps, then cosine decay to {params['min_lr']}")
+        tqdm.write(f"Total training steps: {total_steps}")
         
         # Set up DALI profiler if available
         if has_profiler:
@@ -415,9 +463,17 @@ def main():
                     
                     # Update weights with gradient clipping
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Using gradient clip value 1.0
                     scaler.step(optimizer)
                     scaler.update()
+                    
+                    # Update learning rate scheduler
+                    lr_scheduler.step()
+                    
+                    # Log current learning rate every 500 batches
+                    if batch_idx % 128 == 0:
+                        current_lr = lr_scheduler.get_last_lr()[0]
+                        tqdm.write(f"Current learning rate: {current_lr:.8f}")
                     
                     # Update metrics
                     epoch_loss += current_loss
@@ -535,6 +591,7 @@ def main():
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': lr_scheduler.state_dict(),
                     'train_losses': train_losses,
                     'test_losses': test_losses,
                     'raw_batch_losses': raw_batch_losses,
@@ -576,6 +633,7 @@ def main():
             'epoch': params['num_epochs'],
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': lr_scheduler.state_dict(),
             'train_losses': train_losses,
             'test_losses': test_losses,
             'raw_batch_losses': raw_batch_losses,
