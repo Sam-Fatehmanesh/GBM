@@ -182,7 +182,7 @@ def main():
                        help='Directory to save processed data and visualizations')
     parser.add_argument('--num_neurons', type=int, default=10,
                        help='Number of neurons to visualize per subject')
-    parser.add_argument('--g', type=float, default=0.9,
+    parser.add_argument('--g', type=float, default=0.99,
                        help='Calcium decay factor (AR coefficient)')
     parser.add_argument('--skip_subjects', type=str, default='',
                        help='Comma-separated list of subjects to skip (already processed)')

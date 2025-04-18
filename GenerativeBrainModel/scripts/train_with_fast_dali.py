@@ -174,9 +174,10 @@ def main():
             'preaugmented_dir': 'preaugmented_training_spike_data_2018',  # Directory with preaugmented data
             'batch_size': 128, 
             'num_epochs': 1,
-            'learning_rate': 5e-4,
-            'mamba_layers': 1,
+            'learning_rate': 10e-4,
+            'mamba_layers': 8,
             'mamba_dim': 1024,
+            'mamba_state_multiplier': 4,
             'timesteps_per_sequence': 10,
             'train_ratio': 0.95,
             'dali_num_threads': 2, 
@@ -241,7 +242,8 @@ def main():
         # Create model
         model = GBM(
             mamba_layers=params['mamba_layers'],
-            mamba_dim=params['mamba_dim']
+            mamba_dim=params['mamba_dim'],
+            mamba_state_multiplier=params['mamba_state_multiplier']
         )
         
         # Save model architecture and parameters
@@ -324,6 +326,12 @@ def main():
             
             # Training loop with tqdm for progress display
             train_loop = tqdm(range(len(train_loader)), desc=f"Epoch {epoch+1}/{params['num_epochs']}")
+
+            # Checkpoint batch index
+            checkpoint_batch_idx = 0
+
+            # Checkpoint per N batches
+            checkpoint_batch_every = 64
             
             for batch_idx in train_loop:
                 if MEMORY_DIAGNOSTICS:
@@ -358,8 +366,8 @@ def main():
                         
                         # Check if we have previous states to revert to (not for the first two batches)
                         if prev_model_state is not None and batch_idx > 0:
-                            # Revert model to its state before the previous batch
-                            tqdm.write(f"Reverting model to state before batch {batch_idx}")
+                            # Revert model to its state from the checkpoint batch
+                            tqdm.write(f"Reverting model to state from batch {checkpoint_batch_idx}")
                             model.load_state_dict(prev_model_state)
                             optimizer.load_state_dict(prev_optimizer_state)
                             
@@ -392,9 +400,12 @@ def main():
                     
                     # If we get here, the batch is good. Save the current model and optimizer states
                     # before updating the model, so we can revert if needed next time
-                    prev_model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                    prev_optimizer_state = optimizer.state_dict()
-                    prev_batch_loss = current_loss
+                    # Only save state every 32 batches to reduce memory overhead
+                    if batch_idx % checkpoint_batch_every == 0:
+                        prev_model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                        prev_optimizer_state = optimizer.state_dict()
+                        prev_batch_loss = current_loss
+                        checkpoint_batch_idx = batch_idx
                     
                     # Update running average with normal weight
                     running_avg_loss = running_avg_loss * running_avg_alpha + current_loss * (1 - running_avg_alpha)

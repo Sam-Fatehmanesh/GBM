@@ -165,10 +165,11 @@ def main():
             'learning_rate': 5e-4,
             'mamba_layers': 1,
             'mamba_dim': 1024,
+            'mamba_state_multiplier': 1,
             'timesteps_per_sequence': 10,
             'train_ratio': 0.95,
             'dali_num_threads': 2, 
-            'gpu_prefetch': 1,      
+            'gpu_prefetch': 1,
             'use_float16': False,    # Disabled float16 for full precision training
         }
         
@@ -237,7 +238,8 @@ def main():
         # Create model
         model = GBM(
             mamba_layers=params['mamba_layers'],
-            mamba_dim=params['mamba_dim']
+            mamba_dim=params['mamba_dim'],
+            mamba_state_multiplier=params['mamba_state_multiplier']
         )
         
         # Save model architecture and parameters

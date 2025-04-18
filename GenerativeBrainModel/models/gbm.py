@@ -50,8 +50,9 @@ class GBM(nn.Module):
         
         # Load pretrained autoencoder
         self.autoencoder = SimpleAutoencoder(input_size=256*128, hidden_size=mamba_dim)#LocallyConnectedAutoencoder(hidden_size=mamba_dim)#(input_size=256*128, hidden_size=mamba_dim)
-        checkpoint = torch.load(pretrained_ae_path, map_location='cpu')  # Load to CPU first for better memory management
-        self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
+        if mamba_dim == 1024:
+            checkpoint = torch.load(pretrained_ae_path, map_location='cpu')  # Load to CPU first for better memory management
+            self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
         
         # Freeze autoencoder parameters
         # for param in self.autoencoder.parameters():
