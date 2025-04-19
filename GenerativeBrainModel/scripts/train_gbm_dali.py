@@ -170,7 +170,6 @@ def main():
             'train_ratio': 0.95,
             'dali_num_threads': 2, 
             'gpu_prefetch': 1,
-            'max_overlap': 10,
             'use_float16': False,    # Disabled float16 for full precision training
         }
         
@@ -209,12 +208,12 @@ def main():
             num_threads=params['dali_num_threads'],
             gpu_prefetch=params['gpu_prefetch'],
             seed=42,
-            shuffle=True,
-            max_overlap=params['max_overlap']
+            shuffle=True
         )
         
         print_memory_stats("After train loader:")
         
+        # Use fewer files for test loader to save memory
         test_files = spike_files[:5] if len(spike_files) > 5 else spike_files
         test_loader = DALIBrainDataLoader(
             test_files,  # Use subset of files for testing
@@ -530,8 +529,6 @@ def main():
                     'params': params,
                     'best_test_loss': best_test_loss,
                     'loss_type': 'binary_focal_loss',  # Updated loss type
-                    'alpha': 0.25,  # Focal loss alpha parameter
-                    'gamma': 2.0,   # Focal loss gamma parameter
                 }, os.path.join(exp_dir, 'checkpoints', 'best_model.pt'))
             
             # Update plots and save losses

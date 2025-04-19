@@ -208,11 +208,11 @@ def main():
             'preaugmented_dir': 'preaugmented_training_spike_data_2018',  # Directory with preaugmented data
             'batch_size': 128, 
             'num_epochs': 1,
-            'learning_rate': 6e-4,
+            'learning_rate': 6e-3,
             'weight_decay': 0.1,         # Weight decay for AdamW
             'warmup_ratio': 0.1,         # Warmup ratio (percentage of total steps)
             'min_lr': 1e-5,              # Minimum learning rate for cosine decay
-            'mamba_layers': 4,
+            'mamba_layers': 8,
             'mamba_dim': 1024,
             'mamba_state_multiplier': 4,
             'timesteps_per_sequence': 10,
@@ -221,11 +221,11 @@ def main():
             'gpu_prefetch': 1,      
             'use_float16': False,    # Disabled float16 for full precision training
             'seed': seed,
-            'validation_per_epoch': 1,  # Number of validation evaluations per epoch
-            'max_train_sequence_overlap': 0,
-            'max_test_sequence_overlap': 0,
-            'generate_n_comparison_videos': 1,
+            'validation_per_epoch': 8,  # Number of validation evaluations per epoch
+            'timestep_stride': 1/3,       # Maximum allowed overlap between sequences, or None for no restriction
         }
+
+        assert params['timesteps_per_sequence'] >= params['timestep_stride'], "Timestep stride must be less than or equal to timesteps per sequence"
         
         # Print initial memory stats
         print_memory_stats("Initial:")
@@ -240,7 +240,16 @@ def main():
         
         # Get maximum number of z-planes from preaugmented data
         max_z_planes = get_max_z_planes(params['preaugmented_dir'])
-        params['seq_len'] = params['timesteps_per_sequence'] * max_z_planes
+        params['seq_len'] = int(params['timesteps_per_sequence'] * max_z_planes)    
+        params['seq_stride'] =  int(params['timestep_stride'] * max_z_planes)
+        
+        # Calculate stride based on max_overlap if specified
+        if 'max_overlap' in params and params['max_overlap'] is not None:
+            stride = params['seq_len'] - params['max_overlap']
+            tqdm.write(f"Using stride={stride} based on max_overlap={params['max_overlap']}")
+        else:
+            stride = None
+            tqdm.write("No stride specified, sequences can start at any valid point")
         
         tqdm.write(f"Maximum z-planes across subjects: {max_z_planes}")
         tqdm.write(f"Total sequence length: {params['seq_len']} ({params['timesteps_per_sequence']} timepoints × {max_z_planes} z-planes)")
@@ -254,9 +263,9 @@ def main():
             device_id=0,  # Assuming single GPU setup
             num_threads=params['dali_num_threads'],
             gpu_prefetch=params['gpu_prefetch'],
-            max_overlap=params['max_train_sequence_overlap'],
             seed=42,
-            shuffle=True
+            shuffle=True,
+            stride=params['seq_stride']  # Pass the max_overlap parameter
         )
         
         print_memory_stats("After train loader:")
@@ -270,9 +279,9 @@ def main():
             device_id=0,  # Assuming single GPU setup
             num_threads=params['dali_num_threads'],
             gpu_prefetch=params['gpu_prefetch'],
-            max_overlap=params['max_test_sequence_overlap'],
             seed=43,  # Different seed for test set
-            shuffle=False
+            shuffle=False,
+            stride=params['seq_stride']  # Pass the max_overlap parameter
         )
         
         print_memory_stats("After test loader:")
@@ -366,7 +375,7 @@ def main():
         scaler = torch.cuda.amp.GradScaler(enabled=True)
         
         # Calculate quarter epoch size for video generation
-        video_gen_batch_count = len(train_loader) // params['generate_n_comparison_videos']
+        quarter_epoch_size = len(train_loader) // 4
         
         # Calculate validation frequency in batches
         validation_interval = len(train_loader) // params['validation_per_epoch']
@@ -620,15 +629,17 @@ def main():
                                   f"Skipped = {skipped_batches}, Reverted = {reverted_batches}")
                     
                     # Generate comparison video every quarter epoch
-                    if (batch_idx + 1) % video_gen_batch_count == 0:
-                        video_count = (batch_idx + 1) // video_gen_batch_count
-                        tqdm.write(f"Generating comparison video ({video_count}/{params['generate_n_comparison_videos']})...")
+                    if (batch_idx + 1) % quarter_epoch_size == 0:
+                        quarter = (batch_idx + 1) // quarter_epoch_size
+                        tqdm.write(f"Generating quarter epoch comparison video ({quarter}/4)...")
+                        
                         # Clean up memory before video creation
                         torch.cuda.empty_cache()
                         
                         # Create prediction video
-                        video_path = os.path.join(exp_dir, 'videos', f"predictions_epoch_{epoch+1:03d}_comparison_{video_count}of{params['generate_n_comparison_videos']}.mp4")
+                        video_path = os.path.join(exp_dir, 'videos', f'predictions_epoch_{epoch+1:03d}_quarter_{quarter}.mp4')
                         create_prediction_video(model, test_loader, video_path, num_frames=330)
+                    
                     # Clean up memory
                     if batch_idx % 50 == 0:
                         # Forced garbage collection every 50 batches to control memory growth

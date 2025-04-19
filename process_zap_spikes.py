@@ -86,7 +86,7 @@ def process_trace_file(input_file, cell_positions, output_dir):
             g_values[i] = g[0]
             c, s, b, g, lam  = deconvolve(y, g=g, sn=sn, penalty=1)
 
-            threshold = 0.5 * sn
+            threshold = 0.333 * sn
             s[s >= threshold] = 1
             s[s < threshold] = 0
             # convert spike amplitues to binary, aka 1 if greater than 0, 0 otherwise
