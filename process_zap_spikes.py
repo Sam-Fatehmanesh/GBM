@@ -7,7 +7,10 @@ import pandas as pd
 import sys
 
 # Import from original OASIS library instead of custom class
+
+from oasis.functions import estimate_parameters
 from oasis.functions import deconvolve
+
 
 def process_trace_file(input_file, cell_positions, output_dir):
     """Process calcium trace data for a condition using OASIS.
@@ -73,20 +76,25 @@ def process_trace_file(input_file, cell_positions, output_dir):
         
         try:
             
-            # Set min of y to 0 by adding a constant
-            min_y = np.min(y)
-            y = y - min_y
-            # Use deconvolve function from original OASIS library with L1 penalty
-            c, s, b, g, lam = deconvolve(y, penalty=penalty)  # Use L1 penalty
+           
+            y = y.astype(np.float64)
             
-            # Store results
-            # Set back to original scale
-            c = c + min_y
+            #pdb.set_trace() 
+            est = estimate_parameters(y, p=1, fudge_factor=0.98)
+            g = est[0]
+            sn = est[1]
+            g_values[i] = g[0]
+            c, s, b, g, lam  = deconvolve(y, g=g, sn=sn, penalty=1)
+
+            threshold = 0.5 * sn
+            s[s >= threshold] = 1
+            s[s < threshold] = 0
+            # convert spike amplitues to binary, aka 1 if greater than 0, 0 otherwise
+            #s = np.where(s > 0, 1, 0)
+            
             calcium_denoised[:, i] = c
             spike_data[:, i] = s
-            g_values[i] = g
-            # Set back to original scale
-            b = b + min_y
+
             b_values[i] = b
             lam_values[i] = lam
             

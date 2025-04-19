@@ -170,6 +170,7 @@ def main():
             'train_ratio': 0.95,
             'dali_num_threads': 2, 
             'gpu_prefetch': 1,
+            'max_overlap': 10,
             'use_float16': False,    # Disabled float16 for full precision training
         }
         
@@ -208,12 +209,12 @@ def main():
             num_threads=params['dali_num_threads'],
             gpu_prefetch=params['gpu_prefetch'],
             seed=42,
-            shuffle=True
+            shuffle=True,
+            max_overlap=params['max_overlap']
         )
         
         print_memory_stats("After train loader:")
         
-        # Use fewer files for test loader to save memory
         test_files = spike_files[:5] if len(spike_files) > 5 else spike_files
         test_loader = DALIBrainDataLoader(
             test_files,  # Use subset of files for testing

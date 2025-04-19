@@ -33,17 +33,20 @@ def print_memory_stats(prefix=""):
 
 class FastGridLoader:
     """Helper class to load preaugmented grid data for DALI's ExternalSource."""
-    def __init__(self, h5_file_path, seq_len=330, split='train'):
+    def __init__(self, h5_file_path, seq_len=330, split='train', max_overlap=None):
         """Initialize FastGridLoader for efficient loading of preaugmented grid data.
         
         Args:
             h5_file_path: Path to the preaugmented grid data h5 file
             seq_len: Length of sequences to return
             split: 'train' or 'test' (should match the file path)
+            max_overlap: Maximum allowed overlap between any two sequences (default: seq_len-1)
+                         If None, no additional filtering is applied (only start points must be unique)
         """
         self.h5_file_path = h5_file_path
         self.seq_len = seq_len
         self.split = split  # Store split for later checks
+        self.max_overlap = seq_len-1 if max_overlap is None else max_overlap
         
         # Extract subject name
         self.subject_name = os.path.basename(os.path.dirname(h5_file_path))
@@ -123,6 +126,34 @@ class FastGridLoader:
                         # If we passed both checks, this is a valid start point
                         self.valid_starts.append((tp_idx, z))
         
+        # Apply filtering based on max_overlap if specified
+        if self.max_overlap < self.seq_len - 1:
+            # Calculate the minimum gap between start points to ensure max_overlap constraint
+            min_gap = self.seq_len - self.max_overlap
+            
+            # Convert to flat indices for easier filtering
+            flat_starts = []
+            for tp_idx, z in self.valid_starts:
+                flat_idx = tp_idx * self.num_z + z
+                flat_starts.append((flat_idx, (tp_idx, z)))
+            
+            # Sort by flat index
+            flat_starts.sort(key=lambda x: x[0])
+            
+            # Apply greedy filtering
+            filtered_starts = []
+            last_flat_idx = -min_gap  # Initialize to ensure first point is always included
+            
+            for flat_idx, (tp_idx, z) in flat_starts:
+                if flat_idx - last_flat_idx >= min_gap:
+                    filtered_starts.append((tp_idx, z))
+                    last_flat_idx = flat_idx
+            
+            # Replace valid_starts with filtered starts
+            self.valid_starts = filtered_starts
+            
+            print(f"Max overlap filter: Reduced valid start points from {len(flat_starts)} to {len(filtered_starts)} (overlap ≤ {self.max_overlap})")
+        
         # Shuffle valid starts
         np.random.seed(42)  # Fixed seed for reproducibility
         np.random.shuffle(self.valid_starts)
@@ -133,6 +164,7 @@ class FastGridLoader:
         print(f"Total z-planes: {self.num_z}")
         print(f"Total timepoints: {self.num_timepoints}")
         print(f"Sequence length: {seq_len}")
+        print(f"Maximum allowed overlap: {self.max_overlap}")
         print(f"Total valid sequences: {len(self.valid_starts)}")
     
     def __len__(self):
@@ -253,7 +285,8 @@ def create_fast_brain_data_pipeline(grid_loader, device="gpu"):
 class FastDALIBrainDataLoader:
     """Fast DALI-based data loader for preaugmented brain sequences."""
     def __init__(self, preaugmented_dir, batch_size=128, seq_len=330, split='train', 
-                 device_id=0, num_threads=2, gpu_prefetch=1, seed=42, shuffle=True):
+                 device_id=0, num_threads=2, gpu_prefetch=1, seed=42, shuffle=True,
+                 max_overlap=None):
         """Initialize the FastDALIBrainDataLoader.
         
         Args:
@@ -266,9 +299,12 @@ class FastDALIBrainDataLoader:
             gpu_prefetch: Number of batches to prefetch to GPU
             seed: Random seed for reproducibility
             shuffle: Whether to shuffle the data
+            max_overlap: Maximum allowed overlap between any two sequences
+                         (default: seq_len-1, which allows any sequence starts as long as they're different)
         """
         self.batch_size = batch_size
         self.device_id = device_id
+        self.max_overlap = max_overlap
         
         # Find all preaugmented grid files
         self.grid_files = []
@@ -291,7 +327,7 @@ class FastDALIBrainDataLoader:
             print(f"Using pipeline batch size of {self.pipeline_batch_size} (total batch size: {self.batch_size})")
         
         # Create grid loaders for each file
-        self.grid_loaders = [FastGridLoader(f, seq_len, split) for f in self.grid_files]
+        self.grid_loaders = [FastGridLoader(f, seq_len, split, max_overlap=max_overlap) for f in self.grid_files]
         
         # Create a pipeline for each file
         self.pipelines = []

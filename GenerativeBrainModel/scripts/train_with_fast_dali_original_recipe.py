@@ -212,7 +212,7 @@ def main():
             'weight_decay': 0.1,         # Weight decay for AdamW
             'warmup_ratio': 0.1,         # Warmup ratio (percentage of total steps)
             'min_lr': 1e-5,              # Minimum learning rate for cosine decay
-            'mamba_layers': 12,
+            'mamba_layers': 4,
             'mamba_dim': 1024,
             'mamba_state_multiplier': 4,
             'timesteps_per_sequence': 10,
@@ -221,6 +221,10 @@ def main():
             'gpu_prefetch': 1,      
             'use_float16': False,    # Disabled float16 for full precision training
             'seed': seed,
+            'validation_per_epoch': 1,  # Number of validation evaluations per epoch
+            'max_train_sequence_overlap': 0,
+            'max_test_sequence_overlap': 0,
+            'generate_n_comparison_videos': 1,
         }
         
         # Print initial memory stats
@@ -250,6 +254,7 @@ def main():
             device_id=0,  # Assuming single GPU setup
             num_threads=params['dali_num_threads'],
             gpu_prefetch=params['gpu_prefetch'],
+            max_overlap=params['max_train_sequence_overlap'],
             seed=42,
             shuffle=True
         )
@@ -265,6 +270,7 @@ def main():
             device_id=0,  # Assuming single GPU setup
             num_threads=params['dali_num_threads'],
             gpu_prefetch=params['gpu_prefetch'],
+            max_overlap=params['max_test_sequence_overlap'],
             seed=43,  # Different seed for test set
             shuffle=False
         )
@@ -339,6 +345,10 @@ def main():
         raw_batch_losses = []  # Track individual batch losses
         best_test_loss = float('inf')
         
+        # Add for frequent validation tracking
+        validation_step_indices = []
+        validation_losses = []
+        
         # Add running average tracking for loss spike detection
         running_avg_loss = None
         running_avg_alpha = 0.95  # Exponential moving average factor
@@ -356,7 +366,11 @@ def main():
         scaler = torch.cuda.amp.GradScaler(enabled=True)
         
         # Calculate quarter epoch size for video generation
-        quarter_epoch_size = len(train_loader) // 4
+        video_gen_batch_count = len(train_loader) // params['generate_n_comparison_videos']
+        
+        # Calculate validation frequency in batches
+        validation_interval = len(train_loader) // params['validation_per_epoch']
+        tqdm.write(f"Validating every {validation_interval} batches ({params['validation_per_epoch']} times per epoch)")
         
         for epoch in range(params['num_epochs']):
             if MEMORY_DIAGNOSTICS:
@@ -380,6 +394,9 @@ def main():
 
             # Checkpoint per N batches
             checkpoint_batch_every = 64
+
+            # Initialize running average loss
+            running_avg_loss = None
             
             for batch_idx in train_loop:
                 if MEMORY_DIAGNOSTICS:
@@ -486,17 +503,112 @@ def main():
                     train_loop.set_postfix(loss=current_loss, avg=running_avg_loss, 
                                           skipped=skipped_batches, reverted=reverted_batches)
                     
-                    # Update loss graph and CSV every 128 batches
-                    if (len(raw_batch_losses) % 128 == 0):
-                        # Update plots and save losses
+                    # Run validation at specified intervals
+                    global_step = epoch * len(train_loader) + batch_idx
+                    if (batch_idx + 1) % validation_interval == 0 or batch_idx == len(train_loader) - 1:
+                        tqdm.write(f"Running validation at step {global_step} (epoch {epoch+1}, batch {batch_idx+1})")
+                        
+                        # Clean up memory before evaluation
+                        torch.cuda.empty_cache()
+                        
+                        # Switch to evaluation mode
+                        model.eval()
+                        test_loss = 0.0
+                        test_batch_count = 0
+                        
+                        # Reset test data loader
+                        test_loader.reset()
+                        test_iter = iter(test_loader)
+                        
+                        with torch.no_grad():
+                            for test_batch_idx in range(len(test_loader)):
+                                try:
+                                    # Get batch with automatic GPU transfer
+                                    test_batch = next(test_iter)
+                                    
+                                    # Ensure batch is on GPU
+                                    if test_batch.device.type != 'cuda':
+                                        test_batch = test_batch.cuda(non_blocking=True)
+                                    
+                                    # Get predictions and calculate loss
+                                    test_predictions = model(test_batch)
+                                    test_batch_loss = model.compute_loss(test_predictions, test_batch[:, 1:])
+                                    
+                                    test_loss += test_batch_loss.item()
+                                    test_batch_count += 1
+                                    
+                                except StopIteration:
+                                    break
+                        
+                        # Calculate average test loss
+                        if test_batch_count > 0:
+                            avg_test_loss = test_loss / test_batch_count
+                        else:
+                            avg_test_loss = float('inf')
+                            
+                        # Record validation result
+                        validation_step_indices.append(global_step)
+                        validation_losses.append(avg_test_loss)
+                        
+                        # Switch back to training mode
+                        model.train()
+                        
+                        tqdm.write(f"Validation loss at step {global_step}: {avg_test_loss:.6f}")
+                        
+                        # Update plots with more frequent validation
                         current_avg_loss = epoch_loss / batch_count if batch_count > 0 else 0
                         temp_train_losses = train_losses + [current_avg_loss]
-                        temp_test_losses = test_losses + [test_losses[-1] if test_losses else 0]
                         
-                        update_loss_plot(temp_train_losses, temp_test_losses, raw_batch_losses,
-                                      os.path.join(exp_dir, 'plots', 'loss_plot.png'))
+                        # Create or update plot
+                        plt.figure(figsize=(12, 8))
                         
-                        # Save raw batch losses
+                        # Plot raw batch losses
+                        plt.subplot(2, 1, 1)
+                        plt.plot(raw_batch_losses, 'b-', alpha=0.3)
+                        plt.title('Raw Batch Losses')
+                        plt.xlabel('Batch')
+                        plt.ylabel('Loss')
+                        plt.grid(True)
+                        
+                        # Plot train and validation losses
+                        plt.subplot(2, 1, 2)
+                        
+                        # Plot epoch-level train and test losses if available
+                        if train_losses:
+                            epochs = list(range(1, len(train_losses) + 1))
+                            plt.plot(epochs, train_losses, 'b-', label='Train Loss (epoch)')
+                        if test_losses:
+                            epochs = list(range(1, len(test_losses) + 1))
+                            plt.plot(epochs, test_losses, 'r-', label='Test Loss (epoch)')
+                        
+                        # Plot the more frequent validation losses
+                        if validation_losses:
+                            # Normalize steps to epoch fraction for plotting
+                            epoch_fractions = [step / len(train_loader) for step in validation_step_indices]
+                            plt.plot(epoch_fractions, validation_losses, 'g--', marker='o', label='Validation Loss (frequent)')
+                        
+                        plt.title('Training and Validation Losses')
+                        plt.xlabel('Epoch')
+                        plt.ylabel('Loss')
+                        plt.legend()
+                        plt.grid(True)
+                        
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(exp_dir, 'plots', 'loss_plot.png'))
+                        plt.close()
+                        
+                        # Save validation losses to CSV
+                        if validation_losses:
+                            save_losses_to_csv(
+                                {'step': validation_step_indices,
+                                 'epoch': [step / len(train_loader) for step in validation_step_indices],
+                                 'validation_loss': validation_losses},
+                                os.path.join(exp_dir, 'logs', 'validation_losses.csv')
+                            )
+                            
+                    # Update loss graph and CSV every 128 batches
+                    if (len(raw_batch_losses) % 128 == 0):
+                        # Update raw batch losses
                         save_losses_to_csv(
                             {'batch': list(range(1, len(raw_batch_losses) + 1)),
                              'raw_loss': raw_batch_losses},
@@ -504,21 +616,19 @@ def main():
                         )
                         
                         tqdm.write(f"Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_loader)}: Current Loss = {current_loss:.6f}, "
-                                  f"Avg Loss = {current_avg_loss:.6f}, Running Avg = {running_avg_loss:.6f}, "
+                                  f"Avg Loss = {running_avg_loss:.6f}, "
                                   f"Skipped = {skipped_batches}, Reverted = {reverted_batches}")
                     
                     # Generate comparison video every quarter epoch
-                    if (batch_idx + 1) % quarter_epoch_size == 0:
-                        quarter = (batch_idx + 1) // quarter_epoch_size
-                        tqdm.write(f"Generating quarter epoch comparison video ({quarter}/4)...")
-                        
+                    if (batch_idx + 1) % video_gen_batch_count == 0:
+                        video_count = (batch_idx + 1) // video_gen_batch_count
+                        tqdm.write(f"Generating comparison video ({video_count}/{params['generate_n_comparison_videos']})...")
                         # Clean up memory before video creation
                         torch.cuda.empty_cache()
                         
                         # Create prediction video
-                        video_path = os.path.join(exp_dir, 'videos', f'predictions_epoch_{epoch+1:03d}_quarter_{quarter}.mp4')
+                        video_path = os.path.join(exp_dir, 'videos', f"predictions_epoch_{epoch+1:03d}_comparison_{video_count}of{params['generate_n_comparison_videos']}.mp4")
                         create_prediction_video(model, test_loader, video_path, num_frames=330)
-                    
                     # Clean up memory
                     if batch_idx % 50 == 0:
                         # Forced garbage collection every 50 batches to control memory growth
@@ -527,9 +637,9 @@ def main():
                 
                 except StopIteration:
                     break
-            
-            # Append actual epoch average loss
-            avg_train_loss = epoch_loss / batch_count if batch_count > 0 else float('inf')
+                    
+            # Append running average loss instead of calculating from epoch_loss
+            avg_train_loss = running_avg_loss if running_avg_loss is not None else float('inf')
             train_losses.append(avg_train_loss)
             
             # Clean up memory before evaluation
@@ -594,14 +704,49 @@ def main():
                     'scheduler_state_dict': lr_scheduler.state_dict(),
                     'train_losses': train_losses,
                     'test_losses': test_losses,
+                    'validation_losses': validation_losses,
+                    'validation_steps': validation_step_indices,
                     'raw_batch_losses': raw_batch_losses,
                     'params': params,
                     'best_test_loss': best_test_loss,
                 }, os.path.join(exp_dir, 'checkpoints', 'best_model.pt'))
             
-            # Update plots and save losses
-            update_loss_plot(train_losses, test_losses, raw_batch_losses,
-                           os.path.join(exp_dir, 'plots', 'loss_plot.png'))
+            # Create or update final plot with both epoch and frequent validation data
+            plt.figure(figsize=(12, 8))
+            
+            # Plot raw batch losses
+            plt.subplot(2, 1, 1)
+            plt.plot(raw_batch_losses, 'b-', alpha=0.3)
+            plt.title('Raw Batch Losses')
+            plt.xlabel('Batch')
+            plt.ylabel('Loss')
+            plt.grid(True)
+            
+            # Plot train and validation losses
+            plt.subplot(2, 1, 2)
+            
+            # Plot epoch-level train and test losses
+            epochs = list(range(1, len(train_losses) + 1))
+            plt.plot(epochs, train_losses, 'b-', label='Train Loss (epoch)')
+            plt.plot(epochs, test_losses, 'r-', label='Test Loss (epoch)')
+            
+            # Plot the more frequent validation losses
+            if validation_losses:
+                # Normalize steps to epoch fraction for plotting
+                epoch_fractions = [step / len(train_loader) for step in validation_step_indices]
+                plt.plot(epoch_fractions, validation_losses, 'g--', marker='o', label='Validation Loss (frequent)')
+            
+            plt.title('Training and Validation Losses')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(exp_dir, 'plots', 'loss_plot.png'))
+            plt.close()
+            
+            # Save all losses to CSV files
             save_losses_to_csv(
                 {'epoch': list(range(1, len(train_losses) + 1)),
                  'train_loss': train_losses,
@@ -615,6 +760,15 @@ def main():
                     {'batch': list(range(1, len(raw_batch_losses) + 1)),
                      'raw_loss': raw_batch_losses},
                     os.path.join(exp_dir, 'logs', 'raw_batch_losses.csv')
+                )
+            
+            # Save validation losses
+            if validation_losses:
+                save_losses_to_csv(
+                    {'step': validation_step_indices,
+                     'epoch': [step / len(train_loader) for step in validation_step_indices],
+                     'validation_loss': validation_losses},
+                    os.path.join(exp_dir, 'logs', 'validation_losses.csv')
                 )
             
             tqdm.write(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.6f}, "
@@ -636,6 +790,8 @@ def main():
             'scheduler_state_dict': lr_scheduler.state_dict(),
             'train_losses': train_losses,
             'test_losses': test_losses,
+            'validation_losses': validation_losses,
+            'validation_steps': validation_step_indices,
             'raw_batch_losses': raw_batch_losses,
             'params': params,
             'final_train_loss': avg_train_loss,

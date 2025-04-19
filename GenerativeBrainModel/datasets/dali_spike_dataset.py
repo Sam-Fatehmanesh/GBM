@@ -83,7 +83,7 @@ class H5Loader:
         # Implement timepoint-based separation
         # 1. Create blocks of timepoints
         # Size of each block - make sure it's larger than sequence length to avoid boundary issues
-        block_size = max(self.seq_len, self.seq_len * 2)  # Double sequence length for safety
+        block_size = self.seq_len * 2 # Double sequence length for safety
         
         # Check if we have enough timepoints for proper blocking
         if self.num_timepoints < block_size * 2:  # Need at least 2 blocks
