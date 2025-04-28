@@ -208,7 +208,7 @@ def main():
             'preaugmented_dir': 'preaugmented_training_spike_data_2018',  # Directory with preaugmented data
             'batch_size': 128, 
             'num_epochs': 1,
-            'learning_rate': 6e-3,
+            'learning_rate': 6e-4,
             'weight_decay': 0.1,         # Weight decay for AdamW
             'warmup_ratio': 0.1,         # Warmup ratio (percentage of total steps)
             'min_lr': 1e-5,              # Minimum learning rate for cosine decay
