@@ -90,3 +90,15 @@ __pycache__
 *.tar.lzma
 
 *.txt
+
+*.nrrd
+*.tiff
+*.tif
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+
+__MACOSX
+.DS_Store
