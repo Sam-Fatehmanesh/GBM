@@ -166,8 +166,10 @@ class GBM(nn.Module):
             samples: Tensor of shape (batch_size, num_samples, seq_len-1, 256, 128) containing
                      generated samples
         """
-        
-        return torch.bernoulli(x)
+        # Ensure input values are probabilities in range [0,1]
+        # This prevents CUDA assertion failures with torch.bernoulli
+        clamped_probs = torch.clamp(x, min=0.0, max=1.0)
+        return torch.bernoulli(clamped_probs)
 
     def generate_autoregressive_brain(self, init_x, num_steps=30):
         """Generate a brain sequence from an initial grid sequence using autoregressive sampling.
@@ -181,7 +183,13 @@ class GBM(nn.Module):
         """
         x = init_x
         for i in range(num_steps):
-            prediction = self.sample_binary_predictions(self.forward(x)[:, -1, :, :]).unsqueeze(1)
+            # Get logits for the next frame
+            logits = self.forward(x)[:, -1, :, :]
+            # Convert logits to probabilities with sigmoid and ensure valid range
+            probs = torch.clamp(torch.sigmoid(logits), min=0.0, max=1.0)
+            # Sample binary values
+            prediction = torch.bernoulli(probs).unsqueeze(1)
+            # Concatenate with existing sequence
             x = torch.cat((x, prediction), dim=1)
         return x
         

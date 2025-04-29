@@ -146,7 +146,7 @@ def load_model(timestamp: str, device: torch.device, checkpoint_file: Optional[s
 
 
 # Data loading
-def load_test_data_h5(test_h5_path: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def load_test_data_h5(test_h5_path: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Load test data and predictions from HDF5 file.
     
@@ -157,6 +157,7 @@ def load_test_data_h5(test_h5_path: str) -> Tuple[torch.Tensor, torch.Tensor, to
         test_data: Test input sequences (B, T, H, W)
         pred_probs: Predicted probabilities (B, T-1, H, W)
         pred_samples: Binary predictions (B, T-1, H, W)
+        z_starts: Starting z-plane indices for each sequence (B) or None if not available
     """
     if not os.path.exists(test_h5_path):
         raise FileNotFoundError(f"Test data file not found: {test_h5_path}")
@@ -175,17 +176,25 @@ def load_test_data_h5(test_h5_path: str) -> Tuple[torch.Tensor, torch.Tensor, to
         pred_probs = torch.from_numpy(f['predicted_probabilities'][:])
         pred_samples = torch.from_numpy(f['predicted_samples'][:])
         
+        # Load z_starts if available
+        z_starts = None
+        if 'sequence_z_starts' in f:
+            z_starts = torch.from_numpy(f['sequence_z_starts'][:])
+            logging.info(f"Loaded sequence z-plane start indices, shape: {z_starts.shape}")
+        else:
+            logging.warning("No sequence_z_starts found in H5 file. Using default z_start=0 assumption.")
+        
         # Log dataset shapes
         logging.info(f"Test data shape: {test_data.shape}")
         logging.info(f"Predicted probabilities shape: {pred_probs.shape}")
         logging.info(f"Predicted samples shape: {pred_samples.shape}")
     
-    return test_data, pred_probs, pred_samples
+    return test_data, pred_probs, pred_samples, z_starts
 
 
-def create_test_loader(preaugmented_dir: str, target_subject: str, params: Dict) -> torch.Tensor:
+def create_test_loader(preaugmented_dir: str, target_subject: str, params: Dict) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
-    Create a DALI data loader for test data.
+    Create a DALI data loader for test data and retrieve first batch with z-start values.
     
     Args:
         preaugmented_dir: Directory containing preaugmented data
@@ -194,6 +203,7 @@ def create_test_loader(preaugmented_dir: str, target_subject: str, params: Dict)
         
     Returns:
         test_batch: First batch from test loader (B, T, H, W)
+        z_starts: Starting z-plane indices (B) or None if not available
     """
     logging.info(f"Creating DALI loader for subject: {target_subject}")
     
@@ -217,9 +227,17 @@ def create_test_loader(preaugmented_dir: str, target_subject: str, params: Dict)
     test_loader.reset()
     test_batch = next(iter(test_loader))
     
+    # Get z-start values if available
+    z_starts = None
+    if hasattr(test_loader, 'batch_z_starts') and test_loader.batch_z_starts:
+        z_starts = torch.tensor(test_loader.batch_z_starts, dtype=torch.long)
+        logging.info(f"Retrieved {len(test_loader.batch_z_starts)} z-start values from data loader")
+    else:
+        logging.warning("No z-plane start values available from loader. Using default z_start=0 assumption.")
+    
     logging.info(f"Test batch shape: {test_batch.shape}")
     
-    return test_batch
+    return test_batch, z_starts
 
 
 # Brain region mask processing
@@ -497,7 +515,12 @@ class BinaryMetrics:
         specificity = self.tn / (self.tn + self.fp) if (self.tn + self.fp) > 0 else 0.0
         
         # Calculate F1 score
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        # If there are no actual positives (tp+fn==0) AND no predicted positives (tp+fp==0),
+        # F1 is undefined → mark as NaN instead of zero
+        if (self.tp + self.fn) == 0 and (self.tp + self.fp) == 0:
+            f1 = float('nan')  # No positives in either ground truth or predictions
+        else:
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
         
         # Calculate balanced accuracy
         balanced_acc = (recall + specificity) / 2
@@ -527,7 +550,8 @@ class BinaryMetrics:
 
 # Evaluation functions
 def evaluate_next_frame(model: GBM, test_data: torch.Tensor, region_masks: Dict[str, np.ndarray], 
-                        device: torch.device, subj_z_planes: int) -> Dict[str, Dict[str, float]]:
+                        device: torch.device, subj_z_planes: int, 
+                        z_starts: Optional[torch.Tensor] = None) -> Dict[str, Dict[str, float]]:
     """
     Evaluate normal next-frame prediction performance by region.
     
@@ -537,6 +561,7 @@ def evaluate_next_frame(model: GBM, test_data: torch.Tensor, region_masks: Dict[
         region_masks: Dictionary of 3D region masks (Z, H, W)
         device: PyTorch device
         subj_z_planes: Number of z-planes for the subject
+        z_starts: Optional tensor of starting z-plane indices for each sequence (B)
         
     Returns:
         results: Dictionary of metrics for each region
@@ -564,9 +589,12 @@ def evaluate_next_frame(model: GBM, test_data: torch.Tensor, region_masks: Dict[
     for region_name, region_mask_3d in tqdm(region_masks.items(), desc="Processing regions (next-frame)"):
         # Evaluate each batch and timestep
         for b in range(pred_binary.shape[0]):
+            # Get z_start for this sequence (default to 0 if not provided)
+            z_start = int(z_starts[b].item()) if z_starts is not None else 0
+            
             for t in range(pred_binary.shape[1]):
-                # Calculate z-plane index
-                z_idx = t % subj_z_planes
+                # Calculate z-plane index using sequence-specific z_start
+                z_idx = (z_start + t) % subj_z_planes
                 
                 # Get the corresponding 2D mask for this z-plane
                 mask_2d = region_mask_3d[z_idx]
@@ -592,7 +620,7 @@ def evaluate_next_frame(model: GBM, test_data: torch.Tensor, region_masks: Dict[
 def evaluate_long_horizon(model: GBM, test_data: torch.Tensor, region_masks: Dict[str, np.ndarray],
                          device: torch.device, subj_z_planes: int, seed_length: Optional[int] = None, 
                          horizon_length: int = 330, per_step: bool = True, 
-                         cumulative: bool = True) -> Dict[str, Dict[str, Any]]:
+                         cumulative: bool = True, z_starts: Optional[torch.Tensor] = None) -> Dict[str, Dict[str, Any]]:
     """
     Evaluate long-horizon autoregressive prediction by region.
     
@@ -606,6 +634,7 @@ def evaluate_long_horizon(model: GBM, test_data: torch.Tensor, region_masks: Dic
         horizon_length: Maximum prediction horizon
         per_step: Whether to compute per-step metrics
         cumulative: Whether to compute cumulative metrics
+        z_starts: Optional tensor of starting z-plane indices for each sequence (B)
         
     Returns:
         results: Dictionary of metrics for each region
@@ -642,9 +671,12 @@ def evaluate_long_horizon(model: GBM, test_data: torch.Tensor, region_masks: Dic
         }
     
     # Process each sample in the batch
-    num_samples = min(test_data.shape[0], 10)  # Process at most 10 samples for efficiency
+    num_samples = test_data.shape[0]  # Process at most 10 samples for efficiency
     
     for sample_idx in tqdm(range(num_samples), desc="Processing samples (long-horizon)"):
+        # Get z_start for this sequence (default to 0 if not provided)
+        z_start = int(z_starts[sample_idx].item()) if z_starts is not None else 0
+        
         # Get seed sequence
         seed = test_data[sample_idx:sample_idx+1, :seed_length]
         
@@ -665,7 +697,8 @@ def evaluate_long_horizon(model: GBM, test_data: torch.Tensor, region_masks: Dic
             if per_step:
                 for h in range(max_horizon):
                     # Calculate z-plane index for this horizon step
-                    z_idx = (seed_length + h) % subj_z_planes
+                    # Use z_start for this sequence instead of assuming we start at z=0
+                    z_idx = (z_start + seed_length + h) % subj_z_planes
                     
                     # Get the corresponding 2D mask for this z-plane
                     mask_2d = region_mask_3d[z_idx]
@@ -681,7 +714,8 @@ def evaluate_long_horizon(model: GBM, test_data: torch.Tensor, region_masks: Dic
             if cumulative:
                 for h in range(max_horizon):
                     # Calculate z-plane index for this horizon step
-                    z_idx = (seed_length + h) % subj_z_planes
+                    # Use z_start for this sequence instead of assuming we start at z=0
+                    z_idx = (z_start + seed_length + h) % subj_z_planes
                     
                     # Get the corresponding 2D mask for this z-plane
                     mask_2d = region_mask_3d[z_idx]
@@ -717,7 +751,7 @@ def evaluate_long_horizon(model: GBM, test_data: torch.Tensor, region_masks: Dic
 
 def run_multiple_samples(model: GBM, test_data: torch.Tensor, region_masks: Dict[str, np.ndarray],
                          device: torch.device, num_samples: int = 5, subj_z_planes: int = 30,
-                         **kwargs) -> Dict[str, Dict[str, Any]]:
+                         z_starts: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, Dict[str, Any]]:
     """
     Run long-horizon evaluation multiple times and average results.
     
@@ -728,6 +762,7 @@ def run_multiple_samples(model: GBM, test_data: torch.Tensor, region_masks: Dict
         device: PyTorch device
         num_samples: Number of stochastic samples to generate
         subj_z_planes: Number of z-planes for the subject
+        z_starts: Optional tensor of starting z-plane indices for each sequence (B)
         **kwargs: Additional arguments for evaluate_long_horizon
         
     Returns:
@@ -741,7 +776,7 @@ def run_multiple_samples(model: GBM, test_data: torch.Tensor, region_masks: Dict
         # Run evaluation
         results = evaluate_long_horizon(
             model, test_data, region_masks, device, 
-            subj_z_planes=subj_z_planes, **kwargs
+            subj_z_planes=subj_z_planes, z_starts=z_starts, **kwargs
         )
         all_results.append(results)
     
@@ -848,9 +883,24 @@ def create_accuracy_curves(results: Dict[str, Any], output_dir: str, prefix: str
         logging.warning("No per-step results found. Skipping accuracy curve generation.")
         return
     
-    os.makedirs(output_dir, exist_ok=True)
+    # Create subfolders for different types of graphs
+    accuracy_dir = os.path.join(output_dir, 'accuracy_graphs')
+    f1_dir = os.path.join(output_dir, 'f1_score_graphs')
+    next_frame_dir = os.path.join(output_dir, 'next_frame_graphs')
     
-    # Extract key regions to plot (whole brain + major subdivisions)
+    os.makedirs(accuracy_dir, exist_ok=True)
+    os.makedirs(f1_dir, exist_ok=True)
+    os.makedirs(next_frame_dir, exist_ok=True)
+    
+    # Extract key regions to ensure we always include whole brain
+    available_regions = list(results['long_horizon']['per_step'].keys())
+    
+    # Ensure 'whole_brain' is first if available
+    if 'whole_brain' in available_regions:
+        available_regions.remove('whole_brain')
+        available_regions = ['whole_brain'] + available_regions
+    
+    # 1. Combined plot with major regions (traditional plot)
     key_regions = [
         'whole_brain', 'telencephalon', 'cerebellum', 'midbrain', 
         'rhombencephalon_(hindbrain)', 'prosencephalon_(forebrain)'
@@ -858,9 +908,9 @@ def create_accuracy_curves(results: Dict[str, Any], output_dir: str, prefix: str
     available_key_regions = [r for r in key_regions if r in results['long_horizon']['per_step']]
     
     if not available_key_regions:
-        available_key_regions = list(results['long_horizon']['per_step'].keys())[:5]  # First 5 regions
+        available_key_regions = available_regions[:min(6, len(available_regions))]
     
-    # Plot accuracy vs horizon step
+    # 1a. Plot accuracy vs horizon step for major regions
     plt.figure(figsize=(12, 8))
     
     for region in available_key_regions:
@@ -869,38 +919,178 @@ def create_accuracy_curves(results: Dict[str, Any], output_dir: str, prefix: str
         y = [step['accuracy'] for step in steps]
         plt.plot(x, y, label=region)
     
-    plt.title('Prediction Accuracy vs Horizon Step')
+    plt.title('Prediction Accuracy vs Horizon Step (Major Regions)')
     plt.xlabel('Horizon Step')
     plt.ylabel('Accuracy')
     plt.grid(True, alpha=0.3)
     plt.legend()
     
-    # Save plot
-    acc_path = os.path.join(output_dir, f'{prefix}accuracy_vs_horizon.png')
+    # Save combined plot
+    acc_path = os.path.join(accuracy_dir, f'{prefix}accuracy_combined.png')
     plt.savefig(acc_path, dpi=300, bbox_inches='tight')
     plt.close()
-    logging.info(f"Saved accuracy curve plot to {acc_path}")
+    logging.info(f"Saved combined accuracy plot to {acc_path}")
     
-    # Plot F1 score vs horizon step
+    # 1b. Plot F1 score vs horizon step for major regions
     plt.figure(figsize=(12, 8))
     
     for region in available_key_regions:
         steps = results['long_horizon']['per_step'][region]
-        x = list(range(1, len(steps) + 1))
-        y = [step['f1'] for step in steps]
-        plt.plot(x, y, label=region)
+        x = np.array(list(range(1, len(steps) + 1)))
+        y = np.array([step['f1'] for step in steps])
+        
+        # Handle NaN values (where F1 is undefined due to no positives)
+        mask = ~np.isnan(y)
+        if np.any(mask):
+            # Plot defined F1 scores
+            plt.plot(x[mask], y[mask], label=region)
+            
+            # Mark undefined points with gray crosses
+            if np.any(~mask):
+                plt.scatter(x[~mask], np.zeros_like(x[~mask]), 
+                           marker='x', color='gray', alpha=0.5)
     
-    plt.title('F1 Score vs Horizon Step')
+    plt.title('F1 Score vs Horizon Step (Major Regions)')
     plt.xlabel('Horizon Step')
     plt.ylabel('F1 Score')
     plt.grid(True, alpha=0.3)
     plt.legend()
+    plt.figtext(0.01, 0.01, 'Gray X marks indicate timesteps with no positive events (F1 undefined)', 
+                ha='left', fontsize=8, style='italic')
     
-    # Save plot
-    f1_path = os.path.join(output_dir, f'{prefix}f1_vs_horizon.png')
+    # Save combined plot
+    f1_path = os.path.join(f1_dir, f'{prefix}f1_combined.png')
     plt.savefig(f1_path, dpi=300, bbox_inches='tight')
     plt.close()
-    logging.info(f"Saved F1 curve plot to {f1_path}")
+    logging.info(f"Saved combined F1 plot to {f1_path}")
+    
+    # 2. Individual plots for each region
+    for region in available_regions:
+        # Only process regions with data
+        if region not in results['long_horizon']['per_step']:
+            continue
+            
+        steps = results['long_horizon']['per_step'][region]
+        x = np.array(list(range(1, len(steps) + 1)))
+        
+        # 2a. Individual accuracy plot
+        plt.figure(figsize=(10, 6))
+        y = [step['accuracy'] for step in steps]
+        plt.plot(x, y, 'b-', linewidth=2)
+        plt.title(f'Accuracy vs Horizon Step: {region}')
+        plt.xlabel('Horizon Step')
+        plt.ylabel('Accuracy')
+        plt.grid(True, alpha=0.3)
+        
+        # Add reference line for random guessing (0.5)
+        plt.axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='Random Guess')
+        plt.legend()
+        
+        # Save individual accuracy plot
+        region_filename = region.replace(' ', '_').replace('(', '').replace(')', '').replace('&', 'and')
+        acc_region_path = os.path.join(accuracy_dir, f'{prefix}accuracy_{region_filename}.png')
+        plt.savefig(acc_region_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 2b. Individual F1 score plot
+        plt.figure(figsize=(10, 6))
+        y = np.array([step['f1'] for step in steps])
+        
+        # Handle NaN values (where F1 is undefined due to no positives)
+        mask = ~np.isnan(y)
+        if np.any(mask):
+            # Plot defined F1 scores
+            plt.plot(x[mask], y[mask], 'g-', linewidth=2)
+            
+            # Mark undefined points with gray crosses
+            if np.any(~mask):
+                plt.scatter(x[~mask], np.zeros_like(x[~mask]), 
+                           marker='x', color='gray', alpha=0.5, 
+                           label='No positive events (F1 undefined)')
+        
+        plt.title(f'F1 Score vs Horizon Step: {region}')
+        plt.xlabel('Horizon Step')
+        plt.ylabel('F1 Score')
+        plt.grid(True, alpha=0.3)
+        
+        if np.any(~mask):
+            plt.legend()
+        
+        # Save individual F1 plot
+        f1_region_path = os.path.join(f1_dir, f'{prefix}f1_{region_filename}.png')
+        plt.savefig(f1_region_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    # 3. Average next-frame metrics plots
+    if 'next_frame' in results:
+        # Convert next-frame results to a sortable format
+        region_metrics = []
+        for region, metrics in results['next_frame'].items():
+            region_metrics.append((region, metrics))
+        
+        # 3a. Accuracy bar chart
+        plt.figure(figsize=(20, 10))  # Larger figure to accommodate all regions
+        # Sort by accuracy
+        sorted_by_acc = sorted(region_metrics, key=lambda x: x[1]['accuracy'], reverse=True)
+        regions = [r[0] for r in sorted_by_acc]
+        accuracies = [r[1]['accuracy'] for r in sorted_by_acc]
+        
+        colors = ['red' if r == 'whole_brain' else 'blue' for r in regions]
+        bars = plt.bar(range(len(regions)), accuracies, color=colors)
+        plt.xticks(range(len(regions)), regions, rotation=90, fontsize=8)
+        plt.title('Next-Frame Prediction Accuracy by Brain Region')
+        plt.ylabel('Accuracy')
+        plt.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        
+        # Save accuracy bar chart
+        next_frame_acc_path = os.path.join(next_frame_dir, f'{prefix}next_frame_accuracy.png')
+        plt.savefig(next_frame_acc_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logging.info(f"Saved next-frame accuracy plot to {next_frame_acc_path}")
+        
+        # 3b. F1 Score bar chart
+        plt.figure(figsize=(20, 10))  # Larger figure to accommodate all regions
+        # Sort by F1 score
+        sorted_by_f1 = sorted(region_metrics, key=lambda x: x[1]['f1'] if not np.isnan(x[1]['f1']) else -1, reverse=True)
+        regions = [r[0] for r in sorted_by_f1]
+        f1_scores = [r[1]['f1'] for r in sorted_by_f1]
+        
+        # Identify regions with NaN F1 scores (no positive events)
+        nan_mask = np.isnan(f1_scores)
+        valid_regions = [r for i, r in enumerate(regions) if not nan_mask[i]]
+        valid_f1 = [f for f in f1_scores if not np.isnan(f)]
+        nan_regions = [r for i, r in enumerate(regions) if nan_mask[i]]
+        
+        # First plot valid F1 scores
+        if valid_regions:
+            colors = ['red' if r == 'whole_brain' else 'green' for r in valid_regions]
+            plt.bar(range(len(valid_regions)), valid_f1, color=colors)
+            plt.xticks(range(len(valid_regions)), valid_regions, rotation=90, fontsize=8)
+        
+        # Then plot NaN regions with a special color and note
+        if nan_regions:
+            # Plot at the end with a special gray color
+            start_idx = len(valid_regions)
+            plt.bar(range(start_idx, start_idx + len(nan_regions)), 
+                   [0] * len(nan_regions), color='lightgray', 
+                   hatch='///', alpha=0.7)
+            plt.xticks(range(start_idx, start_idx + len(nan_regions)), 
+                      nan_regions, rotation=90, fontsize=8)
+            plt.figtext(0.5, 0.01, 
+                       f"{len(nan_regions)} regions had no positive events (F1 undefined)", 
+                       ha='center', fontsize=10, style='italic')
+        
+        plt.title('Next-Frame Prediction F1 Score by Brain Region')
+        plt.ylabel('F1 Score')
+        plt.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        
+        # Save F1 bar chart
+        next_frame_f1_path = os.path.join(next_frame_dir, f'{prefix}next_frame_f1.png')
+        plt.savefig(next_frame_f1_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logging.info(f"Saved next-frame F1 plot to {next_frame_f1_path}")
 
 
 def print_summary(results: Dict[str, Any]) -> None:
@@ -986,30 +1176,6 @@ def get_subject_z_planes(preaugmented_dir: str, target_subject: str) -> int:
     return num_z_planes
 
 
-def resize_3d_binary_mask(mask: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
-    """
-    Resize a 3D binary mask to the target shape while preserving binary values.
-    
-    Args:
-        mask: 3D binary mask array (Z, H, W)
-        target_shape: Target shape (Z', H', W')
-        
-    Returns:
-        resized_mask: Resized binary mask (Z', H', W')
-    """
-    # Convert to float for resize operation
-    mask_float = mask.astype(float)
-    
-    # Resize using nearest neighbor interpolation for z-axis and bilinear for x,y
-    resized = resize(mask_float, target_shape, order=1, 
-                     mode='constant', anti_aliasing=False)
-    
-    # Convert back to binary
-    binary_mask = resized > 0.5
-    
-    return binary_mask
-
-
 # Main function
 def main():
     """Main function to run the evaluation."""
@@ -1055,15 +1221,34 @@ def main():
         model, params = load_model(args.exp_timestamp, device, args.model_checkpoint)
         
         # Load test data
+        z_starts = None  # Default to None if not available
         if args.test_h5:
-            test_data, _, _ = load_test_data_h5(args.test_h5)
+            test_data, pred_probs, pred_samples, z_starts = load_test_data_h5(args.test_h5)
+            
+            if z_starts is not None:
+                logging.info(f"Using sequence-specific z-plane start indices from HDF5 file")
+                if device.type == 'cuda':
+                    z_starts = z_starts.to(device)
+            else:
+                logging.info("No z-plane start indices found in HDF5 file. Using default z-plane cycling.")
         else:
             # Use DALI loader
-            test_data = create_test_loader(
+            test_data, z_starts = create_test_loader(
                 params['preaugmented_dir'], 
                 args.target_subject, 
                 params
             )
+            
+            if z_starts is not None:
+                logging.info("Using z-plane start indices from data loader")
+                if device.type == 'cuda':
+                    z_starts = z_starts.to(device)
+            else:
+                logging.warning("Using DALI loader but no z-plane start indices available. Using default z-plane cycling.")
+        
+        # Ensure test data is on the correct device
+        if test_data.device != device:
+            test_data = test_data.to(device)
         
         # Get subject's number of z-planes
         subj_z_planes = get_subject_z_planes(
@@ -1084,23 +1269,25 @@ def main():
             region_masks = group_brain_regions(region_masks, args.region_group)
         
         # Evaluate next-frame prediction
+        logging.info("Evaluating next-frame prediction performance")
         next_frame_results = evaluate_next_frame(
-            model, test_data, region_masks, device, subj_z_planes
+            model, test_data, region_masks, device, subj_z_planes, z_starts
         )
         
         # Evaluate long-horizon prediction
+        logging.info("Evaluating long-horizon prediction performance")
         if args.multi_sample > 1:
             # Multiple sample runs
             long_horizon_results = run_multiple_samples(
                 model, test_data, region_masks, device, num_samples=args.multi_sample,
-                subj_z_planes=subj_z_planes, seed_length=args.seed_length, 
+                subj_z_planes=subj_z_planes, z_starts=z_starts, seed_length=args.seed_length, 
                 horizon_length=args.horizon_length
             )
         else:
             # Single run
             long_horizon_results = evaluate_long_horizon(
                 model, test_data, region_masks, device, subj_z_planes,
-                seed_length=args.seed_length, horizon_length=args.horizon_length
+                seed_length=args.seed_length, horizon_length=args.horizon_length, z_starts=z_starts
             )
         
         # Combine results
@@ -1108,6 +1295,12 @@ def main():
             'next_frame': next_frame_results,
             'long_horizon': long_horizon_results
         }
+        
+        # Save used z-starts for reference
+        if z_starts is not None:
+            z_starts_path = os.path.join(output_dir, 'sequence_z_starts.npy')
+            np.save(z_starts_path, z_starts.cpu().numpy())
+            logging.info(f"Saved sequence z-start values to {z_starts_path}")
         
         # Save results
         save_results(all_results, output_dir)

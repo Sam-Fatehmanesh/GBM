@@ -102,3 +102,21 @@ __pycache__
 
 __MACOSX
 .DS_Store
+
+*.log
+*.npy
+*.npy.gz
+*.npy.bz2
+*.npy.xz
+*.npy.lzma
+*.npy.tar
+*.npy.tar.gz
+*.npy.tar.bz2
+
+*.pkl
+*.pkl.gz
+*.pkl.bz2
+*.pkl.xz
+*.pkl.lzma
+*.pkl.tar
+*.pkl.tar.gz
