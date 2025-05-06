@@ -49,6 +49,10 @@ class FastGridLoader:
         self.split = split  # Store split for later checks
         self.stride = stride  # New parameter for striding
         
+        # Track z-start values for the current batch
+        self.current_batch_z_starts = []
+        self.current_batch_indices = []
+        
         # Extract subject name
         self.subject_name = os.path.basename(os.path.dirname(h5_file_path))
         
@@ -206,6 +210,12 @@ class FastGridLoader:
                 batch_size = 1
                 indices = [0]
         
+        # Store batch indices for later reference
+        self.current_batch_indices = indices.copy()
+        
+        # Clear previous batch z-starts and populate with new ones
+        self.current_batch_z_starts = []
+        
         # Create batch of sequences
         batch = np.zeros((batch_size, self.seq_len, 256, 128), dtype=np.uint8)
         
@@ -220,6 +230,9 @@ class FastGridLoader:
                 
                 # Get starting timepoint and z-plane
                 tp_start, z_start = self.valid_starts[idx]
+                
+                # Store z-start for this sequence
+                self.current_batch_z_starts.append(z_start)
                 
                 # Fill the sequence with frames
                 seq_idx = 0
@@ -251,6 +264,10 @@ class FastGridLoader:
             print(f"FastGridLoader call took {time.time() - start_time:.2f}s for batch of {batch_size}")
         
         return batch
+    
+    def get_batch_z_starts(self):
+        """Get the z-start values for the current batch."""
+        return self.current_batch_z_starts
 
 @pipeline_def
 def create_fast_brain_data_pipeline(grid_loader, device="gpu"):
@@ -302,6 +319,8 @@ class FastDALIBrainDataLoader:
         self.batch_size = batch_size
         self.device_id = device_id
         
+        # Store z-start information for the current batch
+        self.current_batch_z_starts = []
 
         self.stride = stride
         
@@ -381,6 +400,7 @@ class FastDALIBrainDataLoader:
         self.current_iter = None
         self.accumulated_batch = None
         self.accumulated_count = 0
+        self.current_batch_indices = []
         
         # Print memory stats after initialization
         print_memory_stats("After Fast DALI loader init:")
@@ -391,6 +411,7 @@ class FastDALIBrainDataLoader:
         self.current_iter = iter(self.iterators[0])
         self.accumulated_batch = None
         self.accumulated_count = 0
+        self.current_batch_z_starts = []
         return self
     
     def __next__(self):
@@ -413,6 +434,9 @@ class FastDALIBrainDataLoader:
             if MEMORY_DIAGNOSTICS:
                 print(f"Returning accumulated batch: {result.shape}, dtype={result.dtype}")
                 print_memory_stats("After returning accumulated batch:")
+            
+            # Update z-start information for the current batch
+            self._update_z_starts_for_current_batch()
                 
             return result
         
@@ -458,6 +482,9 @@ class FastDALIBrainDataLoader:
                     print(f"Batch fetch took {time.time() - start_time:.2f}s")
                     print_memory_stats("After returning batch:")
                 
+                # Update z-start information for the current batch
+                self._update_z_starts_for_current_batch()
+                
                 return result
             
             # Otherwise, try to get more data from the next iterator
@@ -482,6 +509,9 @@ class FastDALIBrainDataLoader:
                         print(f"Batch fetch took {time.time() - start_time:.2f}s")
                         print_memory_stats("After returning partial batch:")
                     
+                    # Update z-start information for the current batch
+                    self._update_z_starts_for_current_batch()
+                    
                     return result
                 else:
                     # Reset for next epoch and raise StopIteration
@@ -492,6 +522,26 @@ class FastDALIBrainDataLoader:
             self.current_iter = iter(self.iterators[self.current_iterator])
             return self.__next__()
     
+    def _update_z_starts_for_current_batch(self):
+        """Update the z-start information for the current batch."""
+        # Clear previous batch z-starts
+        self.current_batch_z_starts = []
+        
+        # Get z-start values from the current grid loader
+        current_grid_loader = self.grid_loaders[self.current_iterator]
+        if hasattr(current_grid_loader, 'current_batch_z_starts'):
+            # Copy z-start values from the GridLoader
+            self.current_batch_z_starts = current_grid_loader.current_batch_z_starts.copy()
+    
+    @property
+    def batch_z_starts(self):
+        """Get the z-start values for the current batch."""
+        return self.current_batch_z_starts
+    
+    def get_z_starts(self):
+        """Get z-start values for the current batch (convenience method)."""
+        return self.current_batch_z_starts
+    
     def __len__(self):
         return self.steps_per_epoch
     
@@ -501,6 +551,7 @@ class FastDALIBrainDataLoader:
             iterator.reset()
         self.accumulated_batch = None
         self.accumulated_count = 0
+        self.current_batch_z_starts = []
         
         if MEMORY_DIAGNOSTICS:
             # Force garbage collection to free up memory

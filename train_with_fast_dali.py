@@ -203,12 +203,12 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, min_lr=1e-5):
 
 def main():
     try:
-        # Parameters
+        # Parameters - hardcoded, no CLI args
         params = {
             'preaugmented_dir': 'preaugmented_training_spike_data_2018',  # Directory with preaugmented data
             'batch_size': 128, 
             'num_epochs': 1,
-            'learning_rate': 6e-4,
+            'learning_rate': 6e-3,
             'weight_decay': 0.1,         # Weight decay for AdamW
             'warmup_ratio': 0.1,         # Warmup ratio (percentage of total steps)
             'min_lr': 1e-5,              # Minimum learning rate for cosine decay
@@ -265,7 +265,7 @@ def main():
             gpu_prefetch=params['gpu_prefetch'],
             seed=42,
             shuffle=True,
-            stride=params['seq_stride']  # Pass the max_overlap parameter
+            stride=params['seq_stride']  # Pass the stride parameter
         )
         
         print_memory_stats("After train loader:")
@@ -281,7 +281,7 @@ def main():
             gpu_prefetch=params['gpu_prefetch'],
             seed=43,  # Different seed for test set
             shuffle=False,
-            stride=params['seq_stride']  # Pass the max_overlap parameter
+            stride=params['seq_stride']  # Pass the stride parameter
         )
         
         print_memory_stats("After test loader:")
