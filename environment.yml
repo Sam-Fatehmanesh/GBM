@@ -1,8 +1,8 @@
 name: brainsim
 channels:
   - pytorch
-  - nvidia
   - defaults
+  - nvidia
   - conda-forge
   - https://repo.anaconda.com/pkgs/main
   - https://repo.anaconda.com/pkgs/r
@@ -18,11 +18,11 @@ dependencies:
   - brotli-python=1.1.0=py311hb755f60_1
   - bzip2=1.0.8=h4bc722e_7
   - c-ares=1.32.2=h4bc722e_0
-  - ca-certificates=2024.7.4=hbcca054_0
+  - ca-certificates=2025.1.31=hbcca054_0
   - cached-property=1.5.2=hd8ed1ab_1
   - cached_property=1.5.2=pyha770c72_1
   - cairo=1.18.0=hbb29018_2
-  - certifi=2024.7.4=py311h06a4308_0
+  - certifi=2025.1.31=pyhd8ed1ab_0
   - cffi=1.16.0=py311hb3a22ac_0
   - charset-normalizer=3.3.2=pyhd8ed1ab_0
   - cloudpickle=3.0.0=pyhd8ed1ab_0
@@ -115,14 +115,15 @@ dependencies:
   - libexpat=2.6.2=h59595ed_0
   - libffi=3.4.2=h7f98852_5
   - libflac=1.4.3=h59595ed_0
-  - libgcc-ng=14.1.0=h77fa898_0
+  - libgcc=14.1.0=h77fa898_1
+  - libgcc-ng=14.1.0=h69a702a_1
   - libgcrypt=1.11.0=h4ab18f5_1
   - libgettextpo=0.22.5=h59595ed_2
   - libgettextpo-devel=0.22.5=h59595ed_2
   - libgfortran-ng=14.1.0=h69a702a_0
   - libgfortran5=14.1.0=hc5f4f2c_0
   - libglib=2.80.3=h8a4344b_1
-  - libgomp=14.1.0=h77fa898_0
+  - libgomp=14.1.0=h77fa898_1
   - libgpg-error=1.50=h4f305b6_0
   - libhwloc=2.11.1=default_hecaa2ac_1000
   - libiconv=1.17=hd590300_2
@@ -159,7 +160,8 @@ dependencies:
   - libsndfile=1.2.2=hc60ed4a_1
   - libsqlite=3.46.0=hde9e2c9_0
   - libssh2=1.11.0=h0841786_0
-  - libstdcxx-ng=14.1.0=hc0a3c3a_0
+  - libstdcxx=14.1.0=hc0a3c3a_1
+  - libstdcxx-ng=14.1.0=h4852527_1
   - libsystemd0=255=h3516f8a_1
   - libtasn1=4.19.0=h166bdaf_0
   - libtiff=4.6.0=h1dd3fc0_3
@@ -196,11 +198,12 @@ dependencies:
   - nspr=4.35=h27087fc_0
   - nss=3.102=h593d115_0
   - numpy=1.26.4=py311h64a7726_0
+  - oasis-deconv=0.2.1=py311hd49b95e_0
   - ocl-icd=2.3.2=hd590300_1
   - openh264=2.4.1=h59595ed_0
   - openjpeg=2.5.2=h488ebb8_0
   - openmpi=5.0.3=h9a79eee_110
-  - openssl=3.3.1=h4bc722e_2
+  - openssl=3.5.0=h7b32b05_0
   - p11-kit=0.24.1=hc5aa10d_0
   - packaging=24.1=pyhd8ed1ab_0
   - pandas=2.2.2=py311h14de704_1
@@ -284,6 +287,8 @@ dependencies:
   - zstd=1.5.6=ha6fb4c9_0
   - pip:
       - absl-py==2.1.0
+      - altair==5.5.0
+      - array-record==0.7.1
       - astunparse==1.6.3
       - attrs==25.1.0
       - black==24.4.2
@@ -291,30 +296,56 @@ dependencies:
       - causal-conv1d==1.4.0
       - chex==0.1.87
       - click==8.1.7
+      - clu==0.0.12
       - configmypy==0.2.0
+      - connectomics==0.0.3
+      - dataclasses-json==0.6.7
+      - decorator==5.2.1
+      - distrax==0.1.5
+      - dm-pix==0.4.4
       - dm-tree==0.1.9
       - docker-pycreds==0.4.0
+      - edt==3.0.0
       - einops==0.8.0
       - etils==1.10.0
+      - flatbuffers==25.2.10
       - flax==0.10.0
       - fsspec==2024.6.1
       - gast==0.6.0
+      - gin-config==0.5.0
       - gitdb==4.0.11
       - gitpython==3.1.43
+      - google-pasta==0.2.0
+      - grain-nightly==0.0.10
+      - grpcio==1.71.0
       - gymnasium==1.0.0
       - huggingface-hub==0.24.0
       - humanize==4.11.0
       - imageio-ffmpeg==0.5.1
+      - immutabledict==4.2.1
       - importlib-resources==6.4.5
       - iniconfig==2.0.0
       - jax==0.4.34
       - jaxlib==0.4.34
+      - jaxtyping==0.3.1
+      - joblib==1.4.2
+      - jsonschema==4.23.0
+      - jsonschema-specifications==2024.10.1
+      - keras==3.9.2
+      - lazy-loader==0.4
+      - libclang==18.1.1
       - mamba-ssm==2.2.2
+      - markdown==3.7
       - markdown-it-py==3.0.0
+      - marshmallow==3.26.1
       - mdurl==0.1.2
-      - ml-dtypes==0.5.0
+      - ml-collections==1.0.0
+      - ml-dtypes==0.5.1
+      - more-itertools==10.6.0
       - msgpack==1.1.0
       - mypy-extensions==1.0.0
+      - namex==0.0.8
+      - narwhals==1.34.1
       - nest-asyncio==1.6.0
       - neuraloperator==0.3.0
       - nfnets-pytorch==0.1.3
@@ -326,6 +357,7 @@ dependencies:
       - opencv-python==4.10.0.84
       - opt-einsum==3.3.0
       - optax==0.2.3
+      - optree==0.15.0
       - orbax-checkpoint==0.7.0
       - pathspec==0.12.1
       - platformdirs==4.2.2
@@ -336,27 +368,43 @@ dependencies:
       - pygments==2.18.0
       - pytest==8.3.1
       - pytest-mock==3.14.0
+      - referencing==0.36.2
       - regex==2024.5.15
       - rich==13.9.2
+      - rpds-py==0.24.0
       - ruamel-yaml==0.18.6
       - ruamel-yaml-clib==0.2.8
       - safetensors==0.4.3
+      - scikit-image==0.25.2
+      - scikit-learn==1.6.1
       - seaborn==0.13.2
       - sentry-sdk==2.10.0
       - setproctitle==1.3.3
       - smmap==5.0.1
+      - sofima==0.1
       - soft-moe-pytorch==0.1.8
       - swig==4.2.1
+      - tensorboard==2.19.0
+      - tensorboard-data-server==0.7.2
+      - tensorflow==2.19.0
+      - tensorflow-io-gcs-filesystem==0.37.1
+      - tensorflow-probability==0.25.0
       - tensorly==0.8.1
       - tensorly-torch==0.5.0
       - tensorstore==0.1.66
+      - termcolor==3.0.1
+      - tf-keras==2.19.0
+      - threadpoolctl==3.6.0
+      - tifffile==2025.3.30
       - tokenizers==0.19.1
       - toolz==1.0.0
       - torch-harmonics==0.6.5
       - transformers==4.42.4
+      - typing-inspect==0.9.0
+      - wadler-lindig==0.1.4
       - wandb==0.17.5
+      - werkzeug==3.1.3
       - wrapt==1.17.2
+      - zapbench==0.1.0
       - zipp==3.20.2
 prefix: /home/user/miniconda3/envs/brainsim
-# Note: NVIDIA DALI for PyTorch was installed via pip using install_dali_deps.sh
-# If recreating this environment, run install_dali_deps.sh after conda env create
