@@ -485,6 +485,9 @@ def run_phase(
     # Add for frequent validation tracking
     validation_step_indices = []
     validation_losses = []
+    # Add F1 score tracking for validation and test
+    validation_f1_scores = []
+    test_f1_scores = []
     
     # Add running average tracking for loss spike detection
     running_avg_loss = None
@@ -623,6 +626,7 @@ def run_phase(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Using gradient clip value 1.0
                 scaler.step(optimizer)
                 scaler.update()
+                del loss, predictions
                 
                 # Update learning rate scheduler
                 lr_scheduler.step()
@@ -649,12 +653,13 @@ def run_phase(
                     tqdm.write(f"Running validation at step {global_step} (epoch {epoch+1}, batch {batch_idx+1})")
                     
                     # Clean up memory before evaluation
-                    torch.cuda.empty_cache()
+                    
                     
                     # Switch to evaluation mode
                     model.eval()
                     test_loss = 0.0
                     test_batch_count = 0
+                    total_tp, total_fp, total_fn = 0, 0, 0
                     
                     # Reset test data loader
                     test_loader.reset()
@@ -677,9 +682,16 @@ def run_phase(
                                 test_loss += test_batch_loss.item()
                                 test_batch_count += 1
                                 
+                                # Calculate F1 metrics using sigmoid on test_predictions
+                                probs = torch.sigmoid(test_predictions)
+                                preds = (probs > 0.5).int()
+                                targets = test_batch[:, 1:].int()
+                                total_tp += int(((preds == 1) & (targets == 1)).sum().item())
+                                total_fp += int(((preds == 1) & (targets == 0)).sum().item())
+                                total_fn += int(((preds == 0) & (targets == 1)).sum().item())
                             except StopIteration:
                                 break
-                    
+                    torch.cuda.empty_cache()
                     # Calculate average test loss
                     if test_batch_count > 0:
                         avg_test_loss = test_loss / test_batch_count
@@ -689,6 +701,14 @@ def run_phase(
                     # Record validation result
                     validation_step_indices.append(global_step)
                     validation_losses.append(avg_test_loss)
+                    
+                    # Calculate F1 score
+                    if total_tp + total_fp + total_fn > 0:
+                        val_f1 = 2 * total_tp / float(2 * total_tp + total_fp + total_fn)
+                    else:
+                        val_f1 = 0.0
+                    validation_f1_scores.append(val_f1)
+                    tqdm.write(f"Validation F1 at step {global_step}: {val_f1:.6f}")
                     
                     # Switch back to training mode
                     model.train()
@@ -700,10 +720,10 @@ def run_phase(
                     temp_train_losses = train_losses + [current_avg_loss]
                     
                     # Create or update plot
-                    plt.figure(figsize=(12, 8))
+                    plt.figure(figsize=(12, 12))
                     
                     # Plot raw batch losses
-                    plt.subplot(2, 1, 1)
+                    plt.subplot(3, 1, 1)
                     plt.plot(raw_batch_losses, 'b-', alpha=0.3)
                     plt.title(f'{phase_name.capitalize()} Phase - Raw Batch Losses')
                     plt.xlabel('Batch')
@@ -711,7 +731,7 @@ def run_phase(
                     plt.grid(True)
                     
                     # Plot train and validation losses
-                    plt.subplot(2, 1, 2)
+                    plt.subplot(3, 1, 2)
                     
                     # Plot epoch-level train and test losses if available
                     if train_losses:
@@ -733,6 +753,26 @@ def run_phase(
                     plt.legend()
                     plt.grid(True)
                     
+                    # Add subplot for F1 scores
+                    plt.subplot(3, 1, 3)
+                    
+                    # Plot validation F1 scores
+                    if validation_f1_scores:
+                        epoch_fractions = [step / len(train_loader) for step in validation_step_indices]
+                        plt.plot(epoch_fractions, validation_f1_scores, 'm--', marker='x', label='Validation F1 (frequent)')
+                    
+                    # Plot test F1 scores if available
+                    if test_f1_scores:
+                        epochs = list(range(1, len(test_f1_scores) + 1))
+                        plt.plot(epochs, test_f1_scores, 'k--', marker='s', label='Test F1 (epoch)')
+                    
+                    plt.title(f'{phase_name.capitalize()} Phase - F1 Scores')
+                    plt.xlabel('Epoch')
+                    plt.ylabel('F1 Score')
+                    plt.ylim(0, 1)  # F1 score ranges from 0 to 1
+                    plt.legend()
+                    plt.grid(True)
+                    
                     plt.tight_layout()
                     plt.savefig(os.path.join(phase_dir, 'plots', 'loss_plot.png'))
                     plt.close()
@@ -742,7 +782,8 @@ def run_phase(
                         save_losses_to_csv(
                             {'step': validation_step_indices,
                              'epoch': [step / len(train_loader) for step in validation_step_indices],
-                             'validation_loss': validation_losses},
+                             'validation_loss': validation_losses,
+                             'validation_f1': validation_f1_scores},
                             os.path.join(phase_dir, 'logs', 'validation_losses.csv')
                         )
                     
@@ -816,8 +857,11 @@ def run_phase(
         # Reset DALI loader for testing
         test_loader.reset()
         test_iter = iter(test_loader)
-        
         with torch.no_grad():
+            test_loss = 0.0
+            test_batch_count = 0
+            total_tp, total_fp, total_fn = 0, 0, 0
+            
             for test_batch_idx in range(len(test_loader)):
                 try:
                     # Get batch with automatic GPU transfer
@@ -835,16 +879,31 @@ def run_phase(
                     test_loss += loss.item()
                     test_batch_count += 1
                     
+                    # Calculate F1 metrics using sigmoid on predictions
+                    probs = torch.sigmoid(predictions)
+                    preds = (probs > 0.5).int()
+                    targets = batch[:, 1:].int()
+                    total_tp += int(((preds == 1) & (targets == 1)).sum().item())
+                    total_fp += int(((preds == 1) & (targets == 0)).sum().item())
+                    total_fn += int(((preds == 0) & (targets == 1)).sum().item())
+                    
                 except StopIteration:
                     break
         
+        # Calculate average test loss
         if test_batch_count > 0:
             avg_test_loss = test_loss / test_batch_count
         else:
             avg_test_loss = float('inf')
-            
         test_losses.append(avg_test_loss)
         
+        # Calculate F1 score
+        if total_tp + total_fp + total_fn > 0:
+            epoch_f1 = 2 * total_tp / float(2 * total_tp + total_fp + total_fn)
+        else:
+            epoch_f1 = 0.0
+        test_f1_scores.append(epoch_f1)
+        tqdm.write(f"Test F1 at epoch {epoch+1}: {epoch_f1:.6f}")
         # Clean up memory before video creation
         torch.cuda.empty_cache()
         if MEMORY_DIAGNOSTICS:
@@ -874,10 +933,10 @@ def run_phase(
             tqdm.write(f"Saved new best model with test loss: {best_test_loss:.6f}")
         
         # Create or update final plot with both epoch and frequent validation data
-        plt.figure(figsize=(12, 8))
+        plt.figure(figsize=(12, 12))
         
         # Plot raw batch losses
-        plt.subplot(2, 1, 1)
+        plt.subplot(3, 1, 1)
         plt.plot(raw_batch_losses, 'b-', alpha=0.3)
         plt.title(f'{phase_name.capitalize()} Phase - Raw Batch Losses')
         plt.xlabel('Batch')
@@ -885,7 +944,7 @@ def run_phase(
         plt.grid(True)
         
         # Plot train and validation losses
-        plt.subplot(2, 1, 2)
+        plt.subplot(3, 1, 2)
         
         # Plot epoch-level train and test losses
         epochs = list(range(1, len(train_losses) + 1))
@@ -904,6 +963,25 @@ def run_phase(
         plt.legend()
         plt.grid(True)
         
+        # Add subplot for F1 scores
+        plt.subplot(3, 1, 3)
+        
+        # Plot validation F1 scores
+        if validation_f1_scores:
+            epoch_fractions = [step / len(train_loader) for step in validation_step_indices]
+            plt.plot(epoch_fractions, validation_f1_scores, 'm--', marker='x', label='Validation F1 (frequent)')
+        
+        # Plot epoch-level test F1 scores
+        if test_f1_scores:
+            plt.plot(epochs, test_f1_scores, 'k--', marker='s', label='Test F1 (epoch)')
+        
+        plt.title(f'{phase_name.capitalize()} Phase - F1 Scores')
+        plt.xlabel('Epoch')
+        plt.ylabel('F1 Score')
+        plt.ylim(0, 1)  # F1 score ranges from 0 to 1
+        plt.legend()
+        plt.grid(True)
+        
         plt.tight_layout()
         plt.savefig(os.path.join(phase_dir, 'plots', 'loss_plot.png'))
         plt.close()
@@ -912,7 +990,8 @@ def run_phase(
         save_losses_to_csv(
             {'epoch': list(range(1, len(train_losses) + 1)),
              'train_loss': train_losses,
-             'test_loss': test_losses},
+             'test_loss': test_losses,
+             'test_f1': test_f1_scores},
             os.path.join(phase_dir, 'logs', 'losses.csv')
         )
         
@@ -929,7 +1008,8 @@ def run_phase(
             save_losses_to_csv(
                 {'step': validation_step_indices,
                  'epoch': [step / len(train_loader) for step in validation_step_indices],
-                 'validation_loss': validation_losses},
+                 'validation_loss': validation_losses,
+                 'validation_f1': validation_f1_scores},
                 os.path.join(phase_dir, 'logs', 'validation_losses.csv')
             )
         
