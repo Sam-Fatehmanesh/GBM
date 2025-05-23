@@ -5,6 +5,9 @@ import numpy as np
 from GenerativeBrainModel.models.mambacore import StackedMamba
 from GenerativeBrainModel.models.simple_autoencoder import SimpleAutoencoder
 from GenerativeBrainModel.models.local_autoencoder import LocallyConnectedAutoencoder
+from GenerativeBrainModel.models.cnn import CNNLayer, DeCNNLayer, InterpolateLayer
+from GenerativeBrainModel.models.mlp import MLP
+from GenerativeBrainModel.custom_functions.utils import RMSNorm
 
 def binary_focal_loss(pred, target, alpha=0.25, gamma=2.0, reduction='mean', eps=1e-8):
     """
@@ -60,8 +63,39 @@ class GBM(nn.Module):
         # Save dimensions
         self.latent_dim = mamba_dim
         self.grid_size = (256, 128)
-        self.flat_size = np.prod(self.grid_size)
-    
+        self.flat_size = int(np.prod(self.grid_size))
+
+
+
+        # CNN encoder which will be used in addition to the autoencoder and reduce the dimention to mamba_dim
+        # self.cnn_encoder = nn.Sequential(
+        #     nn.Conv2d(1, 1, 3, padding=1),
+        #     nn.BatchNorm2d(1),
+        #     nn.GELU(),
+        #     nn.AvgPool2d(kernel_size=4, stride=4),
+        #     nn.Flatten(),
+        #     nn.Linear(int(self.flat_size/(4**2)), mamba_dim),
+        #     RMSNorm(mamba_dim),
+        #     nn.GELU(),
+        # )
+
+        # self.deconv_encoder = nn.Sequential(
+        #     RMSNorm(mamba_dim),
+        #     nn.GELU(),
+        #     nn.Linear(mamba_dim, int(self.flat_size/(4**2))),
+        #     nn.LayerNorm(int(self.flat_size/(4**2))),
+        #     nn.GELU(),
+        #     nn.Unflatten(1, (1, 64, 32)),
+        #     InterpolateLayer(4, mode='nearest'),
+        #     nn.Conv2d(1, 1, 3, padding=1),
+        #     nn.Flatten(),
+        # )
+
+
+
+
+        
+
     def encode(self, x_flat):
         """Encode flattened grids to latent vectors.
         
@@ -73,8 +107,16 @@ class GBM(nn.Module):
         # Ensure input is float32 for autoencoder compatibility
         if x_flat.dtype != torch.float32:
             x_flat = x_flat.float()
-            
-        return self.autoencoder.encoder(x_flat)
+
+        # Flatten input for linear encoder
+        input_flat = x_flat.view(-1, self.flat_size)
+        linear_encoding = self.autoencoder.encoder(input_flat)
+        # Prepare grid input for CNN
+        # grid = x_flat.view(-1, *self.grid_size).unsqueeze(1)
+        # cnn_encoding = self.cnn_encoder(grid)
+        # Combine encodings and reshape
+        combined =  linear_encoding # cnn_encoding + 
+        return combined.view(*x_flat.shape[:-1], self.latent_dim)
     
     def decode(self, z):
         """Decode latent vectors to flattened grid logits.
@@ -85,7 +127,15 @@ class GBM(nn.Module):
             grids_flat: Tensor of shape (batch_size, 256*128) or (batch_size, seq_len, 256*128)
         """
         # Return logits directly without sigmoid for use with binary_cross_entropy_with_logits
-        return self.autoencoder.decoder(z)
+
+        lin_decode = self.autoencoder.decoder(z)
+        # decnn_out = self.deconv_decoder(z.view(-1, self.latent_dim)).view(*lin_decode.shape)
+        # if z.ndim == 2:
+        #     deconv_out = self.deconv_encoder(z.view(-1, self.latent_dim)).view(-1, self.flat_size)
+        # else:
+        #     deconv_out = self.deconv_encoder(z.view(-1, self.latent_dim)).view(-1, z.shape[1], self.flat_size)
+        
+        return  lin_decode 
     
     def forward(self, x):
         """Forward pass predicting next frame in sequence.

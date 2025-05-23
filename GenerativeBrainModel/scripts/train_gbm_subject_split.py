@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from torch.cuda.amp import autocast, GradScaler
 import math
 import numpy as np
 from tqdm import tqdm
@@ -165,11 +166,12 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330):
     # Generate predictions
     model.eval()
     with torch.no_grad():
-        # Get probability predictions from the model
-        predictions = model.get_predictions(batch)
-        
-        # Generate sampled binary predictions from the predicted probability distributions
-        sampled_predictions = model.sample_binary_predictions(predictions)
+        with autocast():
+            # Get probability predictions from the model
+            predictions = model.get_predictions(batch)
+            
+            # Generate sampled binary predictions from the predicted probability distributions
+            sampled_predictions = model.sample_binary_predictions(predictions)
     
     # Convert predictions to numpy for visualization
     # We'll choose multiple sequences from the batch for visualization (up to 100)
@@ -208,6 +210,8 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, min_lr=1e-5):
         # Linear warmup
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
+        else:
+            return 1.0
         
         # Cosine annealing after warmup with decay to min_lr
         progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
@@ -503,7 +507,7 @@ def run_phase(
     prev_batch_loss = None
     
     # Use GradScaler for gradient stability even in FP32 mode
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    scaler = GradScaler()
     
     # Calculate quarter epoch size for video generation
     quarter_epoch_size = len(train_loader) // 4
@@ -556,10 +560,11 @@ def run_phase(
                 # Process batch - model handles dtype conversion internally
                 optimizer.zero_grad()
                 
-                # Get logits from model (no sigmoid)
-                predictions = model(batch)
-                # BCE loss
-                loss = model.compute_loss(predictions, batch[:, 1:])
+                # Get logits from model (no sigmoid) with autocast for mixed precision
+                with autocast():
+                    predictions = model(batch)
+                    # BCE loss
+                    loss = model.compute_loss(predictions, batch[:, 1:])
                 
                 # Check if loss is abnormally high compared to running average
                 current_loss = loss.item()
@@ -626,7 +631,7 @@ def run_phase(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Using gradient clip value 1.0
                 scaler.step(optimizer)
                 scaler.update()
-                del loss, predictions
+                del loss, predictions, batch
                 
                 # Update learning rate scheduler
                 lr_scheduler.step()
@@ -675,22 +680,35 @@ def run_phase(
                                 if test_batch.device.type != 'cuda':
                                     test_batch = test_batch.cuda(non_blocking=True)
                                 
-                                # Get predictions and calculate loss
-                                test_predictions = model(test_batch)
-                                test_batch_loss = model.compute_loss(test_predictions, test_batch[:, 1:])
+                                # Get logits from model (no sigmoid)
+                                with autocast():
+                                    test_predictions = model(test_batch)
+                                    test_batch_loss = model.compute_loss(test_predictions, test_batch[:, 1:])
                                 
                                 test_loss += test_batch_loss.item()
                                 test_batch_count += 1
+                                del test_batch_loss
                                 
                                 # Calculate F1 metrics using sigmoid on test_predictions
                                 probs = torch.sigmoid(test_predictions)
-                                preds = (probs > 0.5).int()
-                                targets = test_batch[:, 1:].int()
-                                total_tp += int(((preds == 1) & (targets == 1)).sum().item())
-                                total_fp += int(((preds == 1) & (targets == 0)).sum().item())
-                                total_fn += int(((preds == 0) & (targets == 1)).sum().item())
+                                del test_predictions
+                                # Keep predictions as bool to save memory (1 byte vs 4 bytes for int)
+                                preds = (probs > 0.5)
+                                del probs
+                                # Keep targets as bool as well
+                                targets = test_batch[:, 1:].bool()
+                                del test_batch
+                                torch.cuda.empty_cache()
+                                # Use boolean operations for memory efficiency
+                                total_tp += (preds & targets).sum().item()
+                                total_fp += (preds & ~targets).sum().item()
+                                total_fn += (~preds & targets).sum().item()
+                                # Clean up
+                                del preds, targets
                             except StopIteration:
                                 break
+                    
+                    
                     torch.cuda.empty_cache()
                     # Calculate average test loss
                     if test_batch_count > 0:
@@ -872,21 +890,30 @@ def run_phase(
                         batch = batch.cuda(non_blocking=True)
                     
                     # Get logits from model (no sigmoid)
-                    predictions = model(batch)
-                    # Loss function handles type conversion
-                    loss = model.compute_loss(predictions, batch[:, 1:])
+                    with autocast():
+                        predictions = model(batch)
+                        # Loss function handles type conversion
+                        loss = model.compute_loss(predictions, batch[:, 1:])
                     
                     test_loss += loss.item()
                     test_batch_count += 1
                     
                     # Calculate F1 metrics using sigmoid on predictions
                     probs = torch.sigmoid(predictions)
-                    preds = (probs > 0.5).int()
-                    targets = batch[:, 1:].int()
-                    total_tp += int(((preds == 1) & (targets == 1)).sum().item())
-                    total_fp += int(((preds == 1) & (targets == 0)).sum().item())
-                    total_fn += int(((preds == 0) & (targets == 1)).sum().item())
-                    
+                    del predictions
+                    # Keep predictions as bool to save memory (1 byte vs 4 bytes for int)
+                    preds = (probs > 0.5)
+                    del probs
+                    # Keep targets as bool as well
+                    targets = batch[:, 1:].bool()
+                    del batch
+                    torch.cuda.empty_cache()
+                    # Use boolean operations for memory efficiency
+                    total_tp += (preds & targets).sum().item()
+                    total_fp += (preds & ~targets).sum().item()
+                    total_fn += (~preds & targets).sum().item()
+                    # Clean up
+                    del preds, targets
                 except StopIteration:
                     break
         
@@ -1092,11 +1119,12 @@ def save_test_data_and_predictions(model, data_loader, save_dir, num_samples=100
     # Generate predictions
     model.eval()
     with torch.no_grad():
-        # Get probability predictions from the model
-        predictions = model.get_predictions(batch)
-        
-        # Generate sampled binary predictions
-        sampled_predictions = model.sample_binary_predictions(predictions)
+        with autocast():
+            # Get probability predictions from the model
+            predictions = model.get_predictions(batch)
+            
+            # Generate sampled binary predictions
+            sampled_predictions = model.sample_binary_predictions(predictions)
     
     # Choose a subset of samples for saving
     num_sequences = min(num_samples, batch.size(0))
@@ -1246,7 +1274,7 @@ def main():
             'min_lr': 1e-5,
             'mamba_layers': 8,
             'mamba_dim': 1024,
-            'mamba_state_multiplier': 4,
+            'mamba_state_multiplier': 8,
             'timesteps_per_sequence': 10,
             'train_ratio': 0.95,
             'dali_num_threads': 2,
