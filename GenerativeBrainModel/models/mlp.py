@@ -33,8 +33,6 @@ class MLP(nn.Module):
             x = layer(x)
             x = residual + x
 
-
-
         # Output layer
         x = self.output_layer(x)
 

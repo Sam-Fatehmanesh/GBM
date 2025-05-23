@@ -5,38 +5,6 @@ import numpy as np
 from GenerativeBrainModel.models.mambacore import StackedMamba
 from GenerativeBrainModel.models.simple_autoencoder import SimpleAutoencoder
 
-
-def binary_focal_loss(pred, target, alpha=0.25, gamma=2.0, reduction='mean', eps=1e-8):
-    """
-    Compute binary focal loss for a batch of predictions.
-    
-    Args:
-      pred (torch.Tensor): raw logits
-      target (torch.Tensor): binary labels (0 or 1) of the same shape as pred.
-      alpha (float): balancing factor.
-      gamma (float): focusing parameter.
-      reduction (str): reduction method ('mean', 'sum', or 'none').
-      eps (float): small value for numerical stability.
-    
-    Returns:
-      torch.Tensor: focal loss value.
-    """
-    # Apply sigmoid to get probabilities
-    p = torch.sigmoid(pred)
-    
-    # Compute p_t depending on the true label
-    p_t = p * target + (1 - p) * (1 - target)
-    
-    # Compute the loss
-    loss = -alpha * (1 - p_t)**gamma * torch.log(p_t + eps)
-    
-    if reduction == 'mean':
-        return loss.mean()
-    elif reduction == 'sum':
-        return loss.sum()
-    else:
-        return loss
-
 class GBM(nn.Module):
     def __init__(self, mamba_layers=1, mamba_dim=1024, mamba_state_multiplier=1, pretrained_ae_path="trained_simpleAE/checkpoints/best_model.pt"):
         """Generative Brain Model combining pretrained autoencoder with Mamba for sequential prediction.
@@ -62,37 +30,6 @@ class GBM(nn.Module):
         self.grid_size = (256, 128)
         self.flat_size = int(np.prod(self.grid_size))
 
-
-
-        # CNN encoder which will be used in addition to the autoencoder and reduce the dimention to mamba_dim
-        # self.cnn_encoder = nn.Sequential(
-        #     nn.Conv2d(1, 1, 3, padding=1),
-        #     nn.BatchNorm2d(1),
-        #     nn.GELU(),
-        #     nn.AvgPool2d(kernel_size=4, stride=4),
-        #     nn.Flatten(),
-        #     nn.Linear(int(self.flat_size/(4**2)), mamba_dim),
-        #     RMSNorm(mamba_dim),
-        #     nn.GELU(),
-        # )
-
-        # self.deconv_encoder = nn.Sequential(
-        #     RMSNorm(mamba_dim),
-        #     nn.GELU(),
-        #     nn.Linear(mamba_dim, int(self.flat_size/(4**2))),
-        #     nn.LayerNorm(int(self.flat_size/(4**2))),
-        #     nn.GELU(),
-        #     nn.Unflatten(1, (1, 64, 32)),
-        #     InterpolateLayer(4, mode='nearest'),
-        #     nn.Conv2d(1, 1, 3, padding=1),
-        #     nn.Flatten(),
-        # )
-
-
-
-
-        
-
     def encode(self, x_flat):
         """Encode flattened grids to latent vectors.
         
@@ -101,19 +38,7 @@ class GBM(nn.Module):
         Returns:
             latents: Tensor of shape (batch_size, latent_dim) or (batch_size, seq_len, latent_dim)
         """
-        # Ensure input is float32 for autoencoder compatibility
-        if x_flat.dtype != torch.float32:
-            x_flat = x_flat.float()
-
-        # Flatten input for linear encoder
-        input_flat = x_flat.view(-1, self.flat_size)
-        linear_encoding = self.autoencoder.encoder(input_flat)
-        # Prepare grid input for CNN
-        # grid = x_flat.view(-1, *self.grid_size).unsqueeze(1)
-        # cnn_encoding = self.cnn_encoder(grid)
-        # Combine encodings and reshape
-        combined =  linear_encoding # cnn_encoding + 
-        return combined.view(*x_flat.shape[:-1], self.latent_dim)
+        return self.autoencoder.encoder(x_flat)
     
     def decode(self, z):
         """Decode latent vectors to flattened grid logits.
@@ -123,16 +48,7 @@ class GBM(nn.Module):
         Returns:
             grids_flat: Tensor of shape (batch_size, 256*128) or (batch_size, seq_len, 256*128)
         """
-        # Return logits directly without sigmoid for use with binary_cross_entropy_with_logits
-
-        lin_decode = self.autoencoder.decoder(z)
-        # decnn_out = self.deconv_decoder(z.view(-1, self.latent_dim)).view(*lin_decode.shape)
-        # if z.ndim == 2:
-        #     deconv_out = self.deconv_encoder(z.view(-1, self.latent_dim)).view(-1, self.flat_size)
-        # else:
-        #     deconv_out = self.deconv_encoder(z.view(-1, self.latent_dim)).view(-1, z.shape[1], self.flat_size)
-        
-        return  lin_decode 
+        return  self.autoencoder.decoder(z) 
     
     def forward(self, x):
         """Forward pass predicting next frame in sequence.
@@ -243,7 +159,4 @@ class GBM(nn.Module):
             # Concatenate with existing sequence
             x = torch.cat((x, prediction), dim=1)
         return x
-        
-        
-        
-            
+          
