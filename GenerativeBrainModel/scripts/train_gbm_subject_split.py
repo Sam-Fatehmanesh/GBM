@@ -148,7 +148,7 @@ def save_losses_to_csv(losses_dict, filepath):
     df.to_csv(filepath, index=False)
 
 def create_prediction_video(model, data_loader, output_path, num_frames=330):
-    """Create a video of model predictions vs actual brain activity."""
+    """Create a video of model predictions vs actual brain activity with color-coded bottom right panel."""
     # Get a single batch
     data_loader.reset()
     batch = next(iter(data_loader))
@@ -178,15 +178,200 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330):
     num_sequences = min(100, batch.size(0))
     rand_indices = torch.randperm(batch.size(0))[:num_sequences]
     
-    # Create comparison visualization with 1fps, including the sampled predictions
-    create_comparison_video(
+    # Create color-coded comparison visualization
+    create_color_coded_comparison_video(
         actual=batch_viz[rand_indices].cpu().numpy(),
         predicted=predictions[rand_indices].cpu().numpy(),
+        sampled_predictions=sampled_predictions[rand_indices].cpu().numpy(),
         output_path=output_path,
         num_frames=num_frames,
-        fps=1,  # Set to 1fps as requested
-        sampled_predictions=sampled_predictions[rand_indices].cpu().numpy()
+        fps=1
     )
+
+def create_color_coded_comparison_video(actual, predicted, sampled_predictions, output_path, num_frames=330, fps=1):
+    """Create video comparing actual brain activity with model predictions, with color-coded bottom right panel.
+    
+    Args:
+        actual: numpy array of shape (batch_size, seq_len, 256, 128) with actual data
+        predicted: numpy array of shape (batch_size, seq_len-1, 256, 128) with predictions
+        sampled_predictions: numpy array of shape (batch_size, seq_len-1, 256, 128) with sampled binary predictions
+        output_path: Path to save the video
+        num_frames: Maximum sequence length to use (default: 330 for full sequences)
+        fps: Frames per second for the video (default: 1)
+    """
+    try:
+        # Set up video parameters
+        width = 128
+        height = 256
+        scale = 2
+        scaled_width = width * scale
+        scaled_height = height * scale
+        
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # 2x2 grid layout
+        video_width = scaled_width * 2
+        video_height = scaled_height * 2
+        
+        # Use H264 codec for MP4
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, 
+                            (video_width, video_height), 
+                            isColor=True)
+        
+        if not out.isOpened():
+            # Try an alternative codec silently
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            out = cv2.VideoWriter(output_path, fourcc, fps, 
+                                (video_width, video_height), 
+                                isColor=True)
+            
+            if not out.isOpened():
+                print(f"Failed to create video writer. Skipping video creation.")
+                return
+        
+        # Process each sequence in the batch
+        batch_size = min(actual.shape[0], 100)  # Limit to at most 100 sequences
+        total_frames = 0
+        max_total_frames = 1000  # Safety limit to prevent extremely large videos
+        
+        for batch_idx in range(batch_size):
+            # Get current sequence
+            current_seq = actual[batch_idx]
+            predicted_seq = predicted[batch_idx]
+            sampled_seq = sampled_predictions[batch_idx]
+            
+            # Use full sequence length, limited by available frames
+            seq_len = min(current_seq.shape[0]-1, predicted_seq.shape[0], num_frames)
+            
+            # Check if adding this sequence would exceed the max frames limit
+            frames_left = max_total_frames - total_frames
+            if frames_left <= 0:
+                # We've reached the maximum, stop adding sequences
+                break
+                
+            # If this sequence would exceed the limit, truncate it
+            if seq_len > frames_left:
+                seq_len = frames_left
+            
+            for t in range(seq_len):
+                try:
+                    # Get current frame, prediction, and ground truth next frame
+                    current = current_seq[t]
+                    next_frame = current_seq[t+1]  # Ground truth
+                    prediction = predicted_seq[t]   # Model prediction (probabilities)
+                    sampled = sampled_seq[t]  # Sampled binary prediction
+                    
+                    # Ensure values are in appropriate ranges
+                    if current.dtype == np.uint8:
+                        current = current.astype(np.float32) / 255.0
+                    if next_frame.dtype == np.uint8:
+                        next_frame = next_frame.astype(np.float32) / 255.0
+                    if prediction.dtype == np.uint8:
+                        prediction = prediction.astype(np.float32) / 255.0
+                    if sampled.dtype == np.uint8:
+                        sampled = sampled.astype(np.float32) / 255.0
+                    
+                    # Convert binary values to 0/1 for classification
+                    sampled_binary = (sampled > 0.5).astype(np.uint8)
+                    actual_binary = (next_frame > 0.5).astype(np.uint8)
+                    
+                    # Debug: ensure we have the right dimensions
+                    if current.shape != (height, width):
+                        tqdm.write(f"Warning: Unexpected data shape {current.shape}, expected ({height}, {width})")
+                    
+                    # Create color-coded image for bottom right panel
+                    # Green: True positive (predicted=1, actual=1)
+                    # Red: False positive (predicted=1, actual=0)  
+                    # Black: True negative and False negative (predicted=0 or actual=0)
+                    color_coded = np.zeros((height, width, 3), dtype=np.uint8)
+                    
+                    # Ensure masks have the same shape as the color_coded array's spatial dimensions
+                    assert sampled_binary.shape == (height, width), f"sampled_binary shape {sampled_binary.shape} doesn't match expected ({height}, {width})"
+                    assert actual_binary.shape == (height, width), f"actual_binary shape {actual_binary.shape} doesn't match expected ({height}, {width})"
+                    
+                    # True positives: Green
+                    tp_mask = (sampled_binary == 1) & (actual_binary == 1)
+                    color_coded[tp_mask] = [0, 255, 0]  # Green in BGR
+                    
+                    # False positives: Red
+                    fp_mask = (sampled_binary == 1) & (actual_binary == 0)
+                    color_coded[fp_mask] = [0, 0, 255]  # Red in BGR
+                    
+                    # True negatives and False negatives: Black (already initialized to black)
+                    # No need to set these explicitly as they're already [0, 0, 0]
+                    
+                    # Convert other images to uint8
+                    curr_img = (current * 255).astype(np.uint8)
+                    pred_img = (prediction * 255).astype(np.uint8)
+                    next_img = (next_frame * 255).astype(np.uint8)
+                    
+                    # Scale up images
+                    curr_img = cv2.resize(curr_img, (scaled_width, scaled_height), 
+                                        interpolation=cv2.INTER_NEAREST)
+                    pred_img = cv2.resize(pred_img, (scaled_width, scaled_height), 
+                                        interpolation=cv2.INTER_NEAREST)
+                    next_img = cv2.resize(next_img, (scaled_width, scaled_height), 
+                                        interpolation=cv2.INTER_NEAREST)
+                    color_coded_scaled = cv2.resize(color_coded, (scaled_width, scaled_height), 
+                                                  interpolation=cv2.INTER_NEAREST)
+                    
+                    # Convert grayscale images to RGB
+                    curr_rgb = cv2.cvtColor(curr_img, cv2.COLOR_GRAY2BGR)
+                    pred_rgb = cv2.cvtColor(pred_img, cv2.COLOR_GRAY2BGR)
+                    next_rgb = cv2.cvtColor(next_img, cv2.COLOR_GRAY2BGR)
+                    # color_coded_scaled is already in BGR format
+                    
+                    # Add text labels
+                    cv2.putText(curr_rgb, 'Current', (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.putText(pred_rgb, 'Predicted Spike Probabilities', (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.putText(next_rgb, 'Actual Next', (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.putText(color_coded_scaled, 'Predictions: TP=Green, FP=Red', (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)  # White text
+                    
+                    # Add frame number and sequence info
+                    cv2.putText(curr_rgb, f'Seq {batch_idx+1}/{batch_size}, Frame {t+1}/{seq_len}', (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    
+                    # Create 2x2 grid: current | predicted
+                    #                  actual  | color_coded
+                    top_row = np.hstack([curr_rgb, pred_rgb])
+                    bottom_row = np.hstack([next_rgb, color_coded_scaled])
+                    combined = np.vstack([top_row, bottom_row])
+                    
+                    out.write(combined)
+                    total_frames += 1
+                    
+                except Exception as frame_error:
+                    tqdm.write(f"Error processing frame {t} in sequence {batch_idx}: {str(frame_error)}")
+                    # Skip this frame and continue
+                    continue
+            
+            # Check if we've reached the maximum frames
+            if total_frames >= max_total_frames:
+                tqdm.write(f"Reached maximum frame limit ({max_total_frames}). Truncating video.")
+                break
+        
+        out.release()
+        # Simplify the output message
+        tqdm.write(f"Color-coded video saved: {os.path.basename(output_path)} ({total_frames} frames, {batch_size} sequences)")
+        
+        # Verify the video file was created successfully
+        if os.path.exists(output_path):
+            file_size = os.path.getsize(output_path)
+            if file_size < 1000:  # If file is very small, it likely failed
+                tqdm.write(f"Warning: Video file is unusually small ({file_size} bytes), generation may have failed")
+        else:
+            tqdm.write(f"Warning: Video file was not created at {output_path}")
+        
+    except Exception as e:
+        tqdm.write(f"Error creating color-coded video: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 def get_lr_scheduler(optimizer, warmup_steps, total_steps, min_lr=1e-5):
     """Creates a learning rate scheduler with linear warmup and cosine decay to specified min_lr.
@@ -492,6 +677,11 @@ def run_phase(
     # Add F1 score tracking for validation and test
     validation_f1_scores = []
     test_f1_scores = []
+    # Add recall and precision tracking for validation and test
+    validation_recall_scores = []
+    validation_precision_scores = []
+    test_recall_scores = []
+    test_precision_scores = []
     
     # Add running average tracking for loss spike detection
     running_avg_loss = None
@@ -728,6 +918,22 @@ def run_phase(
                     validation_f1_scores.append(val_f1)
                     tqdm.write(f"Validation F1 at step {global_step}: {val_f1:.6f}")
                     
+                    # Calculate Recall and Precision
+                    if total_tp + total_fn > 0:
+                        val_recall = total_tp / float(total_tp + total_fn)
+                    else:
+                        val_recall = 0.0
+                    
+                    if total_tp + total_fp > 0:
+                        val_precision = total_tp / float(total_tp + total_fp)
+                    else:
+                        val_precision = 0.0
+                    
+                    validation_recall_scores.append(val_recall)
+                    validation_precision_scores.append(val_precision)
+                    tqdm.write(f"Validation Recall at step {global_step}: {val_recall:.6f}")
+                    tqdm.write(f"Validation Precision at step {global_step}: {val_precision:.6f}")
+                    
                     # Switch back to training mode
                     model.train()
                     
@@ -774,20 +980,36 @@ def run_phase(
                     # Add subplot for F1 scores
                     plt.subplot(3, 1, 3)
                     
-                    # Plot validation F1 scores
+                    # Plot validation metrics
                     if validation_f1_scores:
                         epoch_fractions = [step / len(train_loader) for step in validation_step_indices]
-                        plt.plot(epoch_fractions, validation_f1_scores, 'm--', marker='x', label='Validation F1 (frequent)')
+                        plt.plot(epoch_fractions, validation_f1_scores, 'm--', marker='x', label='Validation F1')
+                        
+                    if validation_recall_scores:
+                        epoch_fractions = [step / len(train_loader) for step in validation_step_indices]
+                        plt.plot(epoch_fractions, validation_recall_scores, 'g--', marker='o', label='Validation Recall')
+                        
+                    if validation_precision_scores:
+                        epoch_fractions = [step / len(train_loader) for step in validation_step_indices]
+                        plt.plot(epoch_fractions, validation_precision_scores, 'b--', marker='^', label='Validation Precision')
                     
-                    # Plot test F1 scores if available
+                    # Plot test metrics if available
                     if test_f1_scores:
                         epochs = list(range(1, len(test_f1_scores) + 1))
-                        plt.plot(epochs, test_f1_scores, 'k--', marker='s', label='Test F1 (epoch)')
+                        plt.plot(epochs, test_f1_scores, 'k-', marker='s', label='Test F1')
+                        
+                    if test_recall_scores:
+                        epochs = list(range(1, len(test_recall_scores) + 1))
+                        plt.plot(epochs, test_recall_scores, 'r-', marker='d', label='Test Recall')
+                        
+                    if test_precision_scores:
+                        epochs = list(range(1, len(test_precision_scores) + 1))
+                        plt.plot(epochs, test_precision_scores, 'c-', marker='v', label='Test Precision')
                     
-                    plt.title(f'{phase_name.capitalize()} Phase - F1 Scores')
+                    plt.title(f'{phase_name.capitalize()} Phase - Performance Metrics (F1, Recall, Precision)')
                     plt.xlabel('Epoch')
-                    plt.ylabel('F1 Score')
-                    plt.ylim(0, 1)  # F1 score ranges from 0 to 1
+                    plt.ylabel('Score')
+                    plt.ylim(0, 1)  # All metrics range from 0 to 1
                     plt.legend()
                     plt.grid(True)
                     
@@ -801,7 +1023,9 @@ def run_phase(
                             {'step': validation_step_indices,
                              'epoch': [step / len(train_loader) for step in validation_step_indices],
                              'validation_loss': validation_losses,
-                             'validation_f1': validation_f1_scores},
+                             'validation_f1': validation_f1_scores,
+                             'validation_recall': validation_recall_scores,
+                             'validation_precision': validation_precision_scores},
                             os.path.join(phase_dir, 'logs', 'validation_losses.csv')
                         )
                     
@@ -931,6 +1155,23 @@ def run_phase(
             epoch_f1 = 0.0
         test_f1_scores.append(epoch_f1)
         tqdm.write(f"Test F1 at epoch {epoch+1}: {epoch_f1:.6f}")
+        
+        # Calculate Recall and Precision
+        if total_tp + total_fn > 0:
+            epoch_recall = total_tp / float(total_tp + total_fn)
+        else:
+            epoch_recall = 0.0
+        
+        if total_tp + total_fp > 0:
+            epoch_precision = total_tp / float(total_tp + total_fp)
+        else:
+            epoch_precision = 0.0
+        
+        test_recall_scores.append(epoch_recall)
+        test_precision_scores.append(epoch_precision)
+        tqdm.write(f"Test Recall at epoch {epoch+1}: {epoch_recall:.6f}")
+        tqdm.write(f"Test Precision at epoch {epoch+1}: {epoch_precision:.6f}")
+        
         # Clean up memory before video creation
         torch.cuda.empty_cache()
         if MEMORY_DIAGNOSTICS:
@@ -993,19 +1234,36 @@ def run_phase(
         # Add subplot for F1 scores
         plt.subplot(3, 1, 3)
         
-        # Plot validation F1 scores
+        # Plot validation metrics
         if validation_f1_scores:
             epoch_fractions = [step / len(train_loader) for step in validation_step_indices]
-            plt.plot(epoch_fractions, validation_f1_scores, 'm--', marker='x', label='Validation F1 (frequent)')
+            plt.plot(epoch_fractions, validation_f1_scores, 'm--', marker='x', label='Validation F1')
+            
+        if validation_recall_scores:
+            epoch_fractions = [step / len(train_loader) for step in validation_step_indices]
+            plt.plot(epoch_fractions, validation_recall_scores, 'g--', marker='o', label='Validation Recall')
+            
+        if validation_precision_scores:
+            epoch_fractions = [step / len(train_loader) for step in validation_step_indices]
+            plt.plot(epoch_fractions, validation_precision_scores, 'b--', marker='^', label='Validation Precision')
         
-        # Plot epoch-level test F1 scores
+        # Plot test metrics if available
         if test_f1_scores:
-            plt.plot(epochs, test_f1_scores, 'k--', marker='s', label='Test F1 (epoch)')
+            epochs = list(range(1, len(test_f1_scores) + 1))
+            plt.plot(epochs, test_f1_scores, 'k-', marker='s', label='Test F1')
+            
+        if test_recall_scores:
+            epochs = list(range(1, len(test_recall_scores) + 1))
+            plt.plot(epochs, test_recall_scores, 'r-', marker='d', label='Test Recall')
+            
+        if test_precision_scores:
+            epochs = list(range(1, len(test_precision_scores) + 1))
+            plt.plot(epochs, test_precision_scores, 'c-', marker='v', label='Test Precision')
         
-        plt.title(f'{phase_name.capitalize()} Phase - F1 Scores')
+        plt.title(f'{phase_name.capitalize()} Phase - Performance Metrics (F1, Recall, Precision)')
         plt.xlabel('Epoch')
-        plt.ylabel('F1 Score')
-        plt.ylim(0, 1)  # F1 score ranges from 0 to 1
+        plt.ylabel('Score')
+        plt.ylim(0, 1)  # All metrics range from 0 to 1
         plt.legend()
         plt.grid(True)
         
@@ -1018,7 +1276,9 @@ def run_phase(
             {'epoch': list(range(1, len(train_losses) + 1)),
              'train_loss': train_losses,
              'test_loss': test_losses,
-             'test_f1': test_f1_scores},
+             'test_f1': test_f1_scores,
+             'test_recall': test_recall_scores,
+             'test_precision': test_precision_scores},
             os.path.join(phase_dir, 'logs', 'losses.csv')
         )
         
@@ -1036,7 +1296,9 @@ def run_phase(
                 {'step': validation_step_indices,
                  'epoch': [step / len(train_loader) for step in validation_step_indices],
                  'validation_loss': validation_losses,
-                 'validation_f1': validation_f1_scores},
+                 'validation_f1': validation_f1_scores,
+                 'validation_recall': validation_recall_scores,
+                 'validation_precision': validation_precision_scores},
                 os.path.join(phase_dir, 'logs', 'validation_losses.csv')
             )
         

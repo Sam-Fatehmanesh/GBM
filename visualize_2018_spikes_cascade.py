@@ -29,7 +29,7 @@ WINDOW_FRAMES = int(WINDOW_SEC * SAMPLING_RATE)
 def compute_dff(calcium_data):
     """
     Compute ΔF/F using an 8th-percentile, 30s sliding window per cell.
-    calcium_data: (T, N) array
+    calcium_data F/F0: (T, N) array
     returns dff of same shape.
     """
     T, N = calcium_data.shape
@@ -115,13 +115,9 @@ def process_and_visualize_subject(subject_dir, output_dir, num_neurons=10, batch
             raise ValueError("Unexpected batch_probs shape")
         prob_data[start:end] = batch_probs
 
-    # Clamp probabilities and sample binary spikes
-    print("  → Sampling binary spikes from probabilities…")
-    rng = np.random.default_rng()
-    # Clamp all probabilities at once
-    prob_data = np.clip(prob_data, 0.0, 1.0)
-    # Sample binary spikes for all neurons simultaneously
-    spike_data = (rng.random(prob_data.shape) < prob_data).astype(int)
+    # Threshold probabilities at 0.5
+    print("  → Thresholding binary spikes from probabilities…")
+    spike_data = (prob_data > 0.5).astype(int)
 
     # Save HDF5
     print(f"  → Saving H5 to {h5_out}")

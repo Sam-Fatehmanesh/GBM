@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from GenerativeBrainModel.custom_functions.utils import RMSNorm
+from GenerativeBrainModel.models.rms import RMSNorm
 
 class MLP(nn.Module):
     def __init__(self, layers_num, input_size, hidden_size, output_size):

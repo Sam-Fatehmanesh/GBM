@@ -4,10 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from GenerativeBrainModel.models.mambacore import StackedMamba
 from GenerativeBrainModel.models.simple_autoencoder import SimpleAutoencoder
-from GenerativeBrainModel.models.local_autoencoder import LocallyConnectedAutoencoder
-from GenerativeBrainModel.models.cnn import CNNLayer, DeCNNLayer, InterpolateLayer
-from GenerativeBrainModel.models.mlp import MLP
-from GenerativeBrainModel.custom_functions.utils import RMSNorm
+
 
 def binary_focal_loss(pred, target, alpha=0.25, gamma=2.0, reduction='mean', eps=1e-8):
     """
@@ -189,21 +186,25 @@ class GBM(nn.Module):
         
         return F.binary_cross_entropy_with_logits(pred, target, reduction='mean')
             
-    def get_predictions(self, x):
+    def get_predictions(self, x, temperature=1.0):
         """Forward pass returning the sigmoid of logits for actual probabilities.
         Useful for inference when probabilities are needed rather than logits.
         
         Args:
             x: Tensor of shape (batch_size, seq_len, 256, 128) containing sequence of grids
+            temperature: Temperature for sampling
         Returns:
             next_frame_probs: Tensor of shape (batch_size, seq_len-1, 256, 128) containing
                             predicted probabilities for next frame in sequence
         """
         # Get logits from forward pass
         logits = self.forward(x)
-        
+
+        # Add a small epsilon to the temperature to avoid division by zero
+        temperature += 1e-8
+
         # Apply sigmoid to get probabilities
-        return torch.sigmoid(logits)
+        return torch.sigmoid(logits / temperature)
 
     def sample_binary_predictions(self, x):
         """Sample predictions from the model.
@@ -219,7 +220,7 @@ class GBM(nn.Module):
         # Ensure input values are probabilities in range [0,1]
         # This prevents CUDA assertion failures with torch.bernoulli
         clamped_probs = torch.clamp(x, min=0.0, max=1.0)
-        return torch.bernoulli(clamped_probs)
+        return (clamped_probs > 0.5).float()
 
     def generate_autoregressive_brain(self, init_x, num_steps=30):
         """Generate a brain sequence from an initial grid sequence using autoregressive sampling.

@@ -18,11 +18,11 @@ dependencies:
   - brotli-python=1.1.0=py311hb755f60_1
   - bzip2=1.0.8=h4bc722e_7
   - c-ares=1.32.2=h4bc722e_0
-  - ca-certificates=2025.1.31=hbcca054_0
+  - ca-certificates=2025.4.26=hbd8a1cb_0
   - cached-property=1.5.2=hd8ed1ab_1
   - cached_property=1.5.2=pyha770c72_1
   - cairo=1.18.0=hbb29018_2
-  - certifi=2025.1.31=pyhd8ed1ab_0
+  - certifi=2025.4.26=pyhd8ed1ab_0
   - cffi=1.16.0=py311hb3a22ac_0
   - charset-normalizer=3.3.2=pyhd8ed1ab_0
   - cloudpickle=3.0.0=pyhd8ed1ab_0
@@ -197,13 +197,12 @@ dependencies:
   - networkx=3.3=pyhd8ed1ab_1
   - nspr=4.35=h27087fc_0
   - nss=3.102=h593d115_0
-  - numpy=1.26.4=py311h64a7726_0
   - oasis-deconv=0.2.1=py311hd49b95e_0
   - ocl-icd=2.3.2=hd590300_1
   - openh264=2.4.1=h59595ed_0
   - openjpeg=2.5.2=h488ebb8_0
   - openmpi=5.0.3=h9a79eee_110
-  - openssl=3.5.0=h7b32b05_0
+  - openssl=3.5.0=h7b32b05_1
   - p11-kit=0.24.1=hc5aa10d_0
   - packaging=24.1=pyhd8ed1ab_0
   - pandas=2.2.2=py311h14de704_1
@@ -252,7 +251,6 @@ dependencies:
   - torchvision=0.18.1=py311_cu121
   - tornado=6.4.1=py311h331c9d8_0
   - tqdm=4.66.4=pyhd8ed1ab_0
-  - typing_extensions=4.12.2=pyha770c72_0
   - tzdata=2024a=h0c530f3_0
   - urllib3=2.2.2=pyhd8ed1ab_1
   - wayland=1.23.0=h5291e77_0
@@ -288,15 +286,19 @@ dependencies:
   - pip:
       - absl-py==2.1.0
       - altair==5.5.0
+      - argclz==1.0.0
       - array-record==0.7.1
       - astunparse==1.6.3
       - attrs==25.1.0
+      - beautifulsoup4==4.13.4
       - black==24.4.2
       - box2d-py==2.3.5
+      - cachetools==5.5.2
       - causal-conv1d==1.4.0
       - chex==0.1.87
       - click==8.1.7
       - clu==0.0.12
+      - colorlog==6.9.0
       - configmypy==0.2.0
       - connectomics==0.0.3
       - dataclasses-json==0.6.7
@@ -311,10 +313,13 @@ dependencies:
       - flatbuffers==25.2.10
       - flax==0.10.0
       - fsspec==2024.6.1
-      - gast==0.6.0
+      - gast==0.4.0
+      - gdown==5.2.0
       - gin-config==0.5.0
       - gitdb==4.0.11
       - gitpython==3.1.43
+      - google-auth==2.40.1
+      - google-auth-oauthlib==1.0.0
       - google-pasta==0.2.0
       - grain-nightly==0.0.10
       - grpcio==1.71.0
@@ -331,29 +336,47 @@ dependencies:
       - joblib==1.4.2
       - jsonschema==4.23.0
       - jsonschema-specifications==2024.10.1
-      - keras==3.9.2
+      - keras==2.15.0
       - lazy-loader==0.4
       - libclang==18.1.1
+      - llvmlite==0.44.0
       - mamba-ssm==2.2.2
       - markdown==3.7
       - markdown-it-py==3.0.0
       - marshmallow==3.26.1
+      - matplotlib-venn==1.1.2
       - mdurl==0.1.2
       - ml-collections==1.0.0
-      - ml-dtypes==0.5.1
+      - ml-dtypes==0.3.2
       - more-itertools==10.6.0
       - msgpack==1.1.0
       - mypy-extensions==1.0.0
       - namex==0.0.8
       - narwhals==1.34.1
       - nest-asyncio==1.6.0
+      - neura-library==0.5.0
       - neuraloperator==0.3.0
       - nfnets-pytorch==0.1.3
       - ninja==1.11.1.1
+      - numba==0.61.2
+      - numpy==1.24.3
+      - nvidia-cublas-cu12==12.2.5.6
+      - nvidia-cuda-cupti-cu12==12.2.142
+      - nvidia-cuda-nvcc-cu12==12.2.140
+      - nvidia-cuda-nvrtc-cu12==12.2.140
+      - nvidia-cuda-runtime-cu12==12.2.140
+      - nvidia-cudnn-cu12==8.9.4.25
+      - nvidia-cufft-cu12==11.0.8.103
+      - nvidia-curand-cu12==10.3.3.141
+      - nvidia-cusolver-cu12==11.5.2.141
+      - nvidia-cusparse-cu12==12.1.2.141
       - nvidia-dali-cuda110==1.47.0
+      - nvidia-nccl-cu12==2.16.5
       - nvidia-nvimgcodec-cu11==0.4.1.21
+      - nvidia-nvjitlink-cu12==12.2.140
       - nvidia-nvjpeg2k-cu11==0.8.1.40
       - nvidia-nvtiff-cu11==0.4.0.62
+      - oauthlib==3.2.2
       - opencv-python==4.10.0.84
       - opt-einsum==3.3.0
       - optax==0.2.3
@@ -362,16 +385,22 @@ dependencies:
       - pathspec==0.12.1
       - platformdirs==4.2.2
       - pluggy==1.5.0
-      - protobuf==5.27.2
+      - polars==1.29.0
+      - protobuf==4.25.7
       - psutil==6.0.0
+      - pyarrow==20.0.0
+      - pyasn1==0.6.1
+      - pyasn1-modules==0.4.2
       - pygame==2.6.0
       - pygments==2.18.0
       - pytest==8.3.1
       - pytest-mock==3.14.0
       - referencing==0.36.2
       - regex==2024.5.15
+      - requests-oauthlib==2.0.0
       - rich==13.9.2
       - rpds-py==0.24.0
+      - rsa==4.9.1
       - ruamel-yaml==0.18.6
       - ruamel-yaml-clib==0.2.8
       - safetensors==0.4.3
@@ -383,10 +412,12 @@ dependencies:
       - smmap==5.0.1
       - sofima==0.1
       - soft-moe-pytorch==0.1.8
+      - soupsieve==2.7
       - swig==4.2.1
-      - tensorboard==2.19.0
+      - tensorboard==2.15.2
       - tensorboard-data-server==0.7.2
-      - tensorflow==2.19.0
+      - tensorflow==2.15.1
+      - tensorflow-estimator==2.15.0
       - tensorflow-io-gcs-filesystem==0.37.1
       - tensorflow-probability==0.25.0
       - tensorly==0.8.1
@@ -400,11 +431,12 @@ dependencies:
       - toolz==1.0.0
       - torch-harmonics==0.6.5
       - transformers==4.42.4
+      - typing-extensions==4.5.0
       - typing-inspect==0.9.0
       - wadler-lindig==0.1.4
       - wandb==0.17.5
       - werkzeug==3.1.3
-      - wrapt==1.17.2
+      - wrapt==1.14.1
       - zapbench==0.1.0
       - zipp==3.20.2
 prefix: /home/user/miniconda3/envs/brainsim

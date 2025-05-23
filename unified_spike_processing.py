@@ -9,6 +9,8 @@ This script combines the functionality of:
 
 The unified pipeline processes raw calcium traces directly to final grid format
 while generating visualization PDFs and eliminating intermediate files.
+
+Support for both OASIS (default) and CASCADE spike detection methods.
 """
 
 import os
@@ -24,16 +26,27 @@ import gc
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 
-# CASCADE functional import
-from neuralib.imaging.spikes.cascade import cascade_predict
+# Spike detection imports
+try:
+    from neuralib.imaging.spikes.cascade import cascade_predict
+    CASCADE_AVAILABLE = True
+except ImportError:
+    CASCADE_AVAILABLE = False
 
-# TensorFlow tuning (optional)
-import tensorflow as tf
-tf.config.threading.set_inter_op_parallelism_threads(1)
-tf.config.threading.set_intra_op_parallelism_threads(1)
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    tf.config.experimental.set_memory_growth(gpus[0], True)
+try:
+    from oasis.functions import estimate_parameters, deconvolve
+    OASIS_AVAILABLE = True
+except ImportError:
+    OASIS_AVAILABLE = False
+
+# TensorFlow tuning (optional) - only if CASCADE is available
+if CASCADE_AVAILABLE:
+    import tensorflow as tf
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        tf.config.experimental.set_memory_growth(gpus[0], True)
 
 # Parameters for ΔF/F baseline computation
 SAMPLING_RATE = 2.0      # Hz
@@ -97,6 +110,9 @@ def run_cascade_inference(dff, batch_size=30000, model_type='Global_EXC_2Hz_smoo
         prob_data: (N, T) array of spike probabilities
         spike_data: (T, N) array of binary spikes
     """
+    if not CASCADE_AVAILABLE:
+        raise ImportError("CASCADE not available. Please install neuralib or use OASIS method.")
+    
     T, N = dff.shape
     
     # Prepare containers
@@ -124,13 +140,96 @@ def run_cascade_inference(dff, batch_size=30000, model_type='Global_EXC_2Hz_smoo
         
         prob_data[start:end] = batch_probs
     
-    # Clamp probabilities and sample binary spikes
-    print("  → Sampling binary spikes from probabilities…")
-    rng = np.random.default_rng()
-    prob_data = np.clip(prob_data, 0.0, 1.0)
-    spike_data = (rng.random(prob_data.shape) < prob_data).astype(int).T  # (T, N)
+    # Threshold probabilities at 0.5
+    print("  → Thresholding binary spikes from probabilities…")
+    spike_data = (prob_data > 0.5).astype(int)
     
     return prob_data, spike_data
+
+def run_oasis_inference(calcium_data, fudge_factor=0.98, penalty=1, threshold_factor=0.333):
+    """
+    Run OASIS deconvolution on raw calcium data to get spike probabilities.
+    
+    Args:
+        calcium_data: (T, N) array of raw calcium fluorescence data
+        fudge_factor: Fudge factor for parameter estimation
+        penalty: Penalty parameter for deconvolution
+        threshold_factor: Factor to multiply noise standard deviation for thresholding
+        
+    Returns:
+        prob_data: (N, T) array of spike probabilities (denoised calcium)
+        spike_data: (T, N) array of binary spikes
+    """
+    if not OASIS_AVAILABLE:
+        raise ImportError("OASIS not available. Please install oasis-deconvolution or use CASCADE method.")
+    
+    T, N = calcium_data.shape
+    
+    # Initialize arrays for results
+    spike_data = np.zeros_like(calcium_data, dtype=np.float32)
+    calcium_denoised = np.zeros_like(calcium_data, dtype=np.float32)
+    g_values = np.zeros(N)
+    
+    print("  → Running OASIS deconvolution...")
+    
+    for i in tqdm(range(N), desc="OASIS processing"):
+        y = calcium_data[:, i].astype(np.float64)
+        
+        # Check for NaN values
+        if np.isnan(y).any():
+            print(f"Warning: NaN values found in cell {i}, replacing with zeros")
+            y = np.nan_to_num(y)
+        
+        try:
+            # Estimate parameters
+            est = estimate_parameters(y, p=1, fudge_factor=fudge_factor)
+            g = est[0]
+            sn = est[1]
+            g_values[i] = g[0] if len(g) > 0 else 0.95
+            
+            # Deconvolve
+            out = deconvolve(y, g=g, sn=sn, penalty=penalty)
+            c = out[0]  # Denoised calcium
+            s = out[1]  # Spike amplitudes
+            
+            # Apply threshold to get binary spikes
+            threshold = threshold_factor * sn
+            s_binary = np.where(s >= threshold, 1, 0)
+            
+            calcium_denoised[:, i] = c
+            spike_data[:, i] = s_binary
+            
+        except Exception as e:
+            print(f"Warning: Error processing cell {i}: {str(e)}")
+            # Use default values if processing fails
+            calcium_denoised[:, i] = y
+            spike_data[:, i] = 0
+    
+    # For OASIS, we use denoised calcium as "probabilities" and return binary spikes
+    # Transpose to match CASCADE format: (N, T) for prob_data
+    prob_data = calcium_denoised.T.astype(np.float32)
+    
+    return prob_data, spike_data
+
+def run_spike_inference(data, method='oasis', **kwargs):
+    """
+    Run spike inference using the specified method.
+    
+    Args:
+        data: Input data (ΔF/F for CASCADE, raw calcium for OASIS)
+        method: 'cascade' or 'oasis'
+        **kwargs: Additional arguments passed to the specific method
+        
+    Returns:
+        prob_data: (N, T) array of spike probabilities
+        spike_data: (T, N) array of binary spikes
+    """
+    if method.lower() == 'cascade':
+        return run_cascade_inference(data, **kwargs)
+    elif method.lower() == 'oasis':
+        return run_oasis_inference(data, **kwargs)
+    else:
+        raise ValueError(f"Unknown spike inference method: {method}. Use 'cascade' or 'oasis'.")
 
 def augment_z_frames(frame, z_index, height=GRID_HEIGHT, width=GRID_WIDTH):
     """
@@ -305,19 +404,21 @@ def convert_to_grids(spike_data, cell_positions, split_ratio=0.95, seed=42):
     
     return grids, metadata
 
-def create_visualization_pdf(dff, prob_data, spike_data, subject_name, output_path, num_neurons=10):
+def create_visualization_pdf(calcium_data, prob_data, spike_data, subject_name, output_path, 
+                           num_neurons=10, method='oasis'):
     """
-    Create visualization PDF showing ΔF/F, probabilities, and discrete spikes.
+    Create visualization PDF showing calcium, probabilities, and discrete spikes.
     
     Args:
-        dff: (T, N) array of ΔF/F data
+        calcium_data: (T, N) array of raw calcium data
         prob_data: (N, T) array of spike probabilities  
         spike_data: (T, N) array of binary spikes
         subject_name: Name of the subject
         output_path: Path to save PDF
         num_neurons: Number of neurons to visualize
+        method: Spike detection method used
     """
-    T, N = dff.shape
+    T, N = calcium_data.shape
     
     print(f"  → Writing PDF to {output_path}")
     with PdfPages(output_path) as pdf:
@@ -327,19 +428,24 @@ def create_visualization_pdf(dff, prob_data, spike_data, subject_name, output_pa
         for idx in sel:
             fig, ax = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
             
-            # ΔF/F trace
-            ax[0].plot(dff[:, idx], 'k')
-            ax[0].set_title(f'Neuron {idx}: ΔF/F')
-            ax[0].set_ylabel('ΔF/F')
+            # Raw calcium trace
+            ax[0].plot(calcium_data[:, idx], 'k')
+            ax[0].set_title(f'Neuron {idx}: Raw Calcium')
+            ax[0].set_ylabel('Fluorescence')
             
-            # Spike probabilities
-            ax[1].plot(prob_data[idx], 'm')
-            ax[1].set_title('Inferred Spike Rate')
-            ax[1].set_ylabel('Rate (spikes/frame)')
+            # Spike probabilities/denoised calcium
+            if method.lower() == 'cascade':
+                ax[1].plot(prob_data[idx], 'm')
+                ax[1].set_title('Inferred Spike Rate (CASCADE)')
+                ax[1].set_ylabel('Rate (spikes/frame)')
+            else:  # OASIS
+                ax[1].plot(prob_data[idx], 'b')
+                ax[1].set_title('Denoised Calcium (OASIS)')
+                ax[1].set_ylabel('Fluorescence')
             
             # Discrete spikes
             ax[2].plot(spike_data[:, idx], 'r')
-            ax[2].set_title('Discrete Spikes')
+            ax[2].set_title(f'Discrete Spikes ({method.upper()})')
             ax[2].set_ylabel('Spike (0/1)')
             ax[2].set_xlabel('Frame')
             
@@ -348,7 +454,9 @@ def create_visualization_pdf(dff, prob_data, spike_data, subject_name, output_pa
             plt.close(fig)
 
 def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000, 
-                   split_ratio=0.95, seed=42, cascade_model='Global_EXC_2Hz_smoothing500ms'):
+                   split_ratio=0.95, seed=42, spike_method='oasis', 
+                   cascade_model='Global_EXC_2Hz_smoothing500ms',
+                   oasis_fudge_factor=0.98, oasis_penalty=1, oasis_threshold_factor=0.333):
     """
     Process a single subject through the complete pipeline.
     
@@ -359,13 +467,17 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
         batch_size: Batch size for CASCADE processing
         split_ratio: Train/test split ratio
         seed: Random seed
-        cascade_model: CASCADE model type to use
+        spike_method: 'oasis' or 'cascade' for spike detection method
+        cascade_model: CASCADE model type to use (if using CASCADE)
+        oasis_fudge_factor: Fudge factor for OASIS parameter estimation
+        oasis_penalty: Penalty parameter for OASIS deconvolution
+        oasis_threshold_factor: Factor to multiply noise std for OASIS thresholding
         
     Returns:
         subject_output_dir: Path to subject's output directory
     """
     subject_name = os.path.basename(os.path.normpath(subject_dir))
-    print(f"\nProcessing subject: {subject_name}")
+    print(f"\nProcessing subject: {subject_name} using {spike_method.upper()}")
     
     # Create subject output directory
     subject_output_dir = os.path.join(output_dir, subject_name)
@@ -409,18 +521,36 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
         T, N = calcium.shape
         assert N == cell_xyz.shape[0], f"Cell count mismatch: {N} vs {cell_xyz.shape[0]}"
         
-        # Step 2: Compute ΔF/F
-        print("  → Computing ΔF/F (8th-percentile, 30s sliding window)...")
-        dff = compute_dff(calcium)
+        # Step 2: Run spike inference based on method
+        if spike_method.lower() == 'cascade':
+            # Compute ΔF/F for CASCADE
+            print("  → Computing ΔF/F (8th-percentile, 30s sliding window)...")
+            dff = compute_dff(calcium)
+            
+            # Run CASCADE inference
+            prob_data, spike_data = run_spike_inference(
+                dff, method='cascade', 
+                batch_size=batch_size, 
+                model_type=cascade_model
+            )
+            
+        elif spike_method.lower() == 'oasis':
+            # Run OASIS directly on raw calcium
+            dff = compute_dff(calcium)
+            prob_data, spike_data = run_spike_inference(
+                dff, method='oasis',
+                fudge_factor=oasis_fudge_factor,
+                penalty=oasis_penalty, 
+                threshold_factor=oasis_threshold_factor
+            )
+        else:
+            raise ValueError(f"Unknown spike method: {spike_method}. Use 'oasis' or 'cascade'.")
         
-        # Step 3: Run CASCADE inference
-        prob_data, spike_data = run_cascade_inference(dff, batch_size, cascade_model)
-        
-        # Step 4: Convert to grid format
+        # Step 3: Convert to grid format
         print("  → Converting to grid format with z-plane augmentation...")
         grids, metadata = convert_to_grids(spike_data, cell_xyz, split_ratio, seed)
         
-        # Step 5: Save final data
+        # Step 4: Save final data
         print(f"  → Saving final data to {final_file}")
         with h5py.File(final_file, 'w') as f:
             # Save main datasets
@@ -439,10 +569,18 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
             f.attrs['num_timepoints'] = metadata['num_timepoints']
             f.attrs['num_z_planes'] = metadata['num_z_planes']
             f.attrs['subject'] = subject_name
-            f.attrs['cascade_model'] = cascade_model
+            f.attrs['spike_method'] = spike_method
             f.attrs['sampling_rate'] = SAMPLING_RATE
-            f.attrs['window_sec'] = WINDOW_SEC
-            f.attrs['percentile'] = PERCENTILE
+            
+            # Method-specific attributes
+            if spike_method.lower() == 'cascade':
+                f.attrs['cascade_model'] = cascade_model
+                f.attrs['window_sec'] = WINDOW_SEC
+                f.attrs['percentile'] = PERCENTILE
+            else:  # OASIS
+                f.attrs['oasis_fudge_factor'] = oasis_fudge_factor
+                f.attrs['oasis_penalty'] = oasis_penalty
+                f.attrs['oasis_threshold_factor'] = oasis_threshold_factor
         
         # Save metadata separately
         metadata_file = os.path.join(subject_output_dir, 'metadata.h5')
@@ -454,12 +592,13 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
             f.create_dataset('test_timepoints', data=metadata['test_timepoints'])
             f.create_dataset('is_train', data=metadata['is_train'])
         
-        # Step 6: Create visualization PDF
+        # Step 5: Create visualization PDF
         print("  → Creating visualization PDF...")
-        create_visualization_pdf(dff, prob_data, spike_data, subject_name, pdf_file, num_neurons)
+        create_visualization_pdf(calcium, prob_data, spike_data, subject_name, 
+                                pdf_file, num_neurons, spike_method)
         
         # Clean up memory
-        del calcium, dff, prob_data, spike_data, grids
+        del calcium, prob_data, spike_data, grids
         gc.collect()
         
         processing_time = time.time() - start_time
@@ -479,6 +618,8 @@ def main():
                         help='Directory containing raw calcium trace data')
     parser.add_argument('--output_dir', type=str, default='processed_spike_grids_2018',
                         help='Output directory for processed grid data')
+    parser.add_argument('--spike_method', type=str, default='oasis', choices=['oasis', 'cascade'],
+                        help='Spike detection method: oasis (default) or cascade')
     parser.add_argument('--num_neurons', type=int, default=10,
                         help='Number of neurons to visualize in PDFs')
     parser.add_argument('--batch_size', type=int, default=30000,
@@ -489,12 +630,31 @@ def main():
                         help='Number of parallel workers')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
+    
+    # CASCADE-specific arguments
     parser.add_argument('--cascade_model', type=str, default='Global_EXC_2Hz_smoothing500ms',
                         help='CASCADE model type to use')
+    
+    # OASIS-specific arguments
+    parser.add_argument('--oasis_fudge_factor', type=float, default=0.98,
+                        help='Fudge factor for OASIS parameter estimation')
+    parser.add_argument('--oasis_penalty', type=int, default=1,
+                        help='Penalty parameter for OASIS deconvolution')
+    parser.add_argument('--oasis_threshold_factor', type=float, default=0.333,
+                        help='Factor to multiply noise std for OASIS thresholding')
+    
     parser.add_argument('--skip', type=str, default='',
                         help='Comma-separated list of subjects to skip')
     
     args = parser.parse_args()
+    
+    # Check method availability
+    if args.spike_method.lower() == 'cascade' and not CASCADE_AVAILABLE:
+        print("Error: CASCADE not available. Please install neuralib or use OASIS method.")
+        return
+    elif args.spike_method.lower() == 'oasis' and not OASIS_AVAILABLE:
+        print("Error: OASIS not available. Please install oasis-deconvolution or use CASCADE method.")
+        return
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -513,6 +673,7 @@ def main():
         return
     
     print(f"Found {len(subjects)} subjects; skipping {skips}")
+    print(f"Using spike detection method: {args.spike_method.upper()}")
     
     # Process subjects
     processed_subjects = []
@@ -529,7 +690,11 @@ def main():
                     args.batch_size,
                     args.split_ratio,
                     args.seed,
-                    args.cascade_model
+                    args.spike_method,
+                    args.cascade_model,
+                    args.oasis_fudge_factor,
+                    args.oasis_penalty,
+                    args.oasis_threshold_factor
                 )
                 for subject_dir in subjects
             ]
@@ -551,7 +716,11 @@ def main():
                     args.batch_size,
                     args.split_ratio,
                     args.seed,
-                    args.cascade_model
+                    args.spike_method,
+                    args.cascade_model,
+                    args.oasis_fudge_factor,
+                    args.oasis_penalty,
+                    args.oasis_threshold_factor
                 )
                 processed_subjects.append(result)
             except Exception as e:
@@ -580,13 +749,14 @@ def main():
     # Save combined metadata
     combined_metadata_path = os.path.join(args.output_dir, 'combined_metadata.h5')
     with h5py.File(combined_metadata_path, 'w') as f:
+        f.attrs['spike_method'] = args.spike_method
         for subject, data in combined_metadata.items():
             subject_group = f.create_group(subject)
             for key, value in data.items():
                 subject_group.create_dataset(key, data=value)
     
     print(f"\nUnified processing complete!")
-    print(f"Processed {len(processed_subjects)} subjects")
+    print(f"Processed {len(processed_subjects)} subjects using {args.spike_method.upper()}")
     print(f"Output saved to: {args.output_dir}")
     print(f"Combined metadata: {combined_metadata_path}")
     
@@ -595,6 +765,7 @@ def main():
     total_z_planes = sum(data['num_z_planes'] for data in combined_metadata.values())
     
     print(f"\nSummary:")
+    print(f"  Spike detection method: {args.spike_method.upper()}")
     print(f"  Total timepoints: {total_timepoints}")
     print(f"  Total z-planes: {total_z_planes}")
     print(f"  Grid size: {GRID_HEIGHT}x{GRID_WIDTH}")

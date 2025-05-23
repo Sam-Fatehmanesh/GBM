@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from mamba_ssm import Mamba2 as Mamba
-from GenerativeBrainModel.custom_functions.utils import RMSNorm
+from GenerativeBrainModel.models.rms import RMSNorm
 
 class StackedMamba(nn.Module):
     def __init__(self, d_model, num_layers, state_multiplier):
