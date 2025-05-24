@@ -136,7 +136,7 @@ class GBM(nn.Module):
         # Ensure input values are probabilities in range [0,1]
         # This prevents CUDA assertion failures with torch.bernoulli
         clamped_probs = torch.clamp(x, min=0.0, max=1.0)
-        return (clamped_probs > 0.5).float()
+        return torch.bernoulli(clamped_probs)
 
     def generate_autoregressive_brain(self, init_x, num_steps=30):
         """Generate a brain sequence from an initial grid sequence using autoregressive sampling.

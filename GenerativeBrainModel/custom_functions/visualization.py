@@ -408,7 +408,7 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
             predictions = model.get_predictions(batch)
             
             # Generate sampled binary predictions from the predicted probability distributions
-            sampled_predictions = model.sample_binary_predictions(predictions)
+            sampled_predictions = (predictions > 0.5).float()
     
     # Calculate metrics for THIS batch only if requested
     if print_batch_metrics:
