@@ -172,7 +172,7 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
         print(f"Error creating video: {str(e)}")
 
 
-def create_color_coded_comparison_video(actual, predicted, sampled_predictions, output_path, num_frames=330, fps=1):
+def create_color_coded_comparison_video(actual, predicted, sampled_predictions, output_path, num_frames=330, fps=1, threshold_left_panels=False):
     """Create video comparing actual brain activity with model predictions, with color-coded bottom right panel.
     
     Args:
@@ -182,6 +182,7 @@ def create_color_coded_comparison_video(actual, predicted, sampled_predictions, 
         output_path: Path to save the video
         num_frames: Maximum sequence length to use (default: 330 for full sequences)
         fps: Frames per second for the video (default: 1)
+        threshold_left_panels: If True, threshold left panels at 0.5 for binary display (for probability data)
     """
     try:
         # Set up video parameters
@@ -286,10 +287,19 @@ def create_color_coded_comparison_video(actual, predicted, sampled_predictions, 
                     # True negatives and False negatives: Black (already initialized to black)
                     # No need to set these explicitly as they're already [0, 0, 0]
                     
+                    # Threshold left panels if using probability data
+                    if threshold_left_panels:
+                        # Threshold at 0.5 for binary display
+                        current_display = (current > 0.5).astype(np.float32)
+                        next_frame_display = (next_frame > 0.5).astype(np.float32)
+                    else:
+                        current_display = current
+                        next_frame_display = next_frame
+                    
                     # Convert other images to uint8
-                    curr_img = (current * 255).astype(np.uint8)
+                    curr_img = (current_display * 255).astype(np.uint8)
                     pred_img = (prediction * 255).astype(np.uint8)
-                    next_img = (next_frame * 255).astype(np.uint8)
+                    next_img = (next_frame_display * 255).astype(np.uint8)
                     
                     # Scale up images
                     curr_img = cv2.resize(curr_img, (scaled_width, scaled_height), 
@@ -307,12 +317,19 @@ def create_color_coded_comparison_video(actual, predicted, sampled_predictions, 
                     next_rgb = cv2.cvtColor(next_img, cv2.COLOR_GRAY2BGR)
                     # color_coded_scaled is already in BGR format
                     
-                    # Add text labels
-                    cv2.putText(curr_rgb, 'Current', (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    # Add text labels based on whether we're thresholding left panels
+                    if threshold_left_panels:
+                        cv2.putText(curr_rgb, 'Current Spikes (Binary)', (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                        cv2.putText(next_rgb, 'Actual Next Spikes (Binary)', (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    else:
+                        cv2.putText(curr_rgb, 'Current', (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                        cv2.putText(next_rgb, 'Actual Next', (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    
                     cv2.putText(pred_rgb, 'Predicted Spike Probabilities', (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    cv2.putText(next_rgb, 'Actual Next', (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                     cv2.putText(color_coded_scaled, 'Predictions: TP=Green, FP=Red', (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)  # White text
@@ -416,14 +433,24 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
     num_sequences = min(100, batch.size(0))
     rand_indices = torch.randperm(batch.size(0))[:num_sequences]
     
+    # Detect if we're using probability data by checking if the batch contains continuous values
+    # between 0 and 1 (rather than just binary 0/1 values)
+    batch_np = batch_viz[rand_indices].cpu().numpy()
+    unique_values = np.unique(batch_np)
+    is_probability_data = len(unique_values) > 10 and np.any((unique_values > 0) & (unique_values < 1))
+    
+    if is_probability_data:
+        tqdm.write("Detected probability data - left panels will show binary spikes (thresholded at 0.5)")
+    
     # Create color-coded comparison visualization
     create_color_coded_comparison_video(
-        actual=batch_viz[rand_indices].cpu().numpy(),
+        actual=batch_np,
         predicted=predictions[rand_indices].cpu().numpy(),
         sampled_predictions=sampled_predictions[rand_indices].cpu().numpy(),
         output_path=output_path,
         num_frames=num_frames,
-        fps=1
+        fps=1,
+        threshold_left_panels=is_probability_data
     )
 
 

@@ -68,6 +68,35 @@ def print_memory_stats(prefix=""):
     except ImportError:
         print(f"{prefix} Memory: psutil not available")
 
+# def compute_dff(calcium_data):
+#     """
+#     Compute ΔF/F using an 8th-percentile, 30s sliding window per cell.
+    
+#     Args:
+#         calcium_data: (T, N) array of calcium fluorescence traces
+        
+#     Returns:
+#         dff: ΔF/F data of same shape
+#     """
+#     T, N = calcium_data.shape
+#     half_w = WINDOW_FRAMES // 2
+#     dff = np.zeros_like(calcium_data, dtype=np.float32)
+    
+#     # Create sliding window indices for all timepoints
+#     starts = np.maximum(0, np.arange(T) - half_w)
+#     ends = np.minimum(T, np.arange(T) + half_w + 1)
+    
+#     # Compute F0 for all cells at once using vectorized operations
+#     F0 = np.zeros((T, N), dtype=np.float32)
+#     for t in tqdm(range(T), desc="Computing baselines"):
+#         start, end = starts[t], ends[t]
+#         F0[t] = np.percentile(calcium_data[start:end], PERCENTILE, axis=0)
+    
+#     # Compute ΔF/F for all cells
+#     dff = (calcium_data - F0)
+    
+#     return dff
+
 def compute_dff(calcium_data):
     """
     Compute ΔF/F using an 8th-percentile, 30s sliding window per cell.
@@ -78,21 +107,18 @@ def compute_dff(calcium_data):
     Returns:
         dff: ΔF/F data of same shape
     """
+    """Compute ΔF/F using causal (past-only) sliding window."""
     T, N = calcium_data.shape
-    half_w = WINDOW_FRAMES // 2
     dff = np.zeros_like(calcium_data, dtype=np.float32)
     
-    # Create sliding window indices for all timepoints
-    starts = np.maximum(0, np.arange(T) - half_w)
-    ends = np.minimum(T, np.arange(T) + half_w + 1)
-    
-    # Compute F0 for all cells at once using vectorized operations
+    # Use CAUSAL window - only past and current frames
     F0 = np.zeros((T, N), dtype=np.float32)
     for t in tqdm(range(T), desc="Computing baselines"):
-        start, end = starts[t], ends[t]
+        # Only use frames from max(0, t-window_size) to t (inclusive)
+        start = max(0, t - WINDOW_FRAMES + 1)
+        end = t + 1
         F0[t] = np.percentile(calcium_data[start:end], PERCENTILE, axis=0)
     
-    # Compute ΔF/F for all cells
     dff = (calcium_data - F0)
     
     return dff

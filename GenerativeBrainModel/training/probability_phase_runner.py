@@ -1,4 +1,4 @@
-"""Phase runner for two-phase GBM training."""
+"""Probability-aware phase runner for two-phase GBM training with probability targets."""
 
 import os
 import torch
@@ -7,6 +7,8 @@ from torch.optim import AdamW
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')  # Set non-interactive backend for headless environment  
 import matplotlib.pyplot as plt
 import gc
 import time
@@ -14,7 +16,7 @@ from typing import Dict, Any, Optional, List
 
 # Import our modules
 from GenerativeBrainModel.models.gbm import GBM
-from GenerativeBrainModel.datasets.subject_filtered_loader import SubjectFilteredFastDALIBrainDataLoader
+from GenerativeBrainModel.datasets.probability_data_loader import SubjectFilteredProbabilityDALIBrainDataLoader
 from GenerativeBrainModel.training.memory_utils import print_memory_stats
 from GenerativeBrainModel.training.schedulers import get_lr_scheduler
 from GenerativeBrainModel.evaluation.metrics import track_metrics_during_validation
@@ -22,10 +24,11 @@ from GenerativeBrainModel.evaluation.data_saver import save_test_data_and_predic
 from GenerativeBrainModel.custom_functions.visualization import create_prediction_video
 from GenerativeBrainModel.utils.file_utils import create_experiment_dir, save_losses_to_csv
 from GenerativeBrainModel.utils.data_utils import get_max_z_planes
+from .phase_runner import TwoPhaseTrainer
 
 
-class TwoPhaseTrainer:
-    """Orchestrates two-phase GBM training: pretrain on multiple subjects, then finetune on target subject."""
+class ProbabilityTwoPhaseTrainer(TwoPhaseTrainer):
+    """Orchestrates two-phase GBM training with probability targets: pretrain on multiple subjects, then finetune on target subject."""
     
     def __init__(
         self,
@@ -34,9 +37,10 @@ class TwoPhaseTrainer:
         finetune_params: Dict[str, Any],
         target_subject: str,
         skip_pretrain: bool = False,
-        pretrain_checkpoint: Optional[str] = None
+        pretrain_checkpoint: Optional[str] = None,
+        use_probabilities: bool = True
     ):
-        """Initialize the two-phase trainer.
+        """Initialize the probability-aware two-phase trainer.
         
         Args:
             exp_root: Root experiment directory
@@ -45,140 +49,30 @@ class TwoPhaseTrainer:
             target_subject: Name of target subject for finetuning
             skip_pretrain: Whether to skip pretraining phase
             pretrain_checkpoint: Path to existing pretrain checkpoint
+            use_probabilities: If True, use probability grids as targets. If False, use binary spikes.
         """
-        self.exp_root = exp_root
-        self.pretrain_params = pretrain_params
-        self.finetune_params = finetune_params
-        self.target_subject = target_subject
-        self.skip_pretrain = skip_pretrain
-        self.pretrain_checkpoint = pretrain_checkpoint
-        
-        # Initialize results
-        self.results = {
-            'pretrain_checkpoint': None,
-            'finetune_checkpoint': None
-        }
-        
-    def run(self) -> Dict[str, Any]:
-        """Run the complete two-phase training process.
-        
-        Returns:
-            dict: Training results including checkpoint paths
-        """
-        # Phase 1: Pretraining
-        if not self.skip_pretrain and self.pretrain_checkpoint is None:
-            tqdm.write(f"Running pretraining phase on all subjects except '{self.target_subject}'...")
-            
-            self.results['pretrain_checkpoint'] = self._run_phase(
-                phase_name="pretrain",
-                params=self.pretrain_params,
-                subjects_exclude=[self.target_subject],
-                subjects_include=None,
-                init_checkpoint=None
-            )
-        elif self.pretrain_checkpoint:
-            tqdm.write(f"Skipping pretraining, using provided checkpoint: {self.pretrain_checkpoint}")
-            self.results['pretrain_checkpoint'] = self.pretrain_checkpoint
-        else:
-            tqdm.write(f"Skipping pretraining phase as requested.")
-            
-        # Phase 2: Finetuning
-        tqdm.write(f"Running finetuning phase on target subject '{self.target_subject}'...")
-        
-        self.results['finetune_checkpoint'] = self._run_phase(
-            phase_name="finetune",
-            params=self.finetune_params,
-            subjects_include=[self.target_subject],
-            subjects_exclude=None,
-            init_checkpoint=self.results['pretrain_checkpoint']
+        # Initialize parent class
+        super().__init__(
+            exp_root=exp_root,
+            pretrain_params=pretrain_params,
+            finetune_params=finetune_params,
+            target_subject=target_subject,
+            skip_pretrain=skip_pretrain,
+            pretrain_checkpoint=pretrain_checkpoint
         )
         
-        return self.results
-    
-    def _run_phase(
-        self,
-        phase_name: str,
-        params: Dict[str, Any],
-        subjects_include: Optional[List[str]] = None,
-        subjects_exclude: Optional[List[str]] = None,
-        init_checkpoint: Optional[str] = None
-    ) -> str:
-        """Run a single training phase.
+        # Store probability-specific parameters
+        self.use_probabilities = use_probabilities
         
-        Args:
-            phase_name: Name of the phase ('pretrain' or 'finetune')
-            params: Parameters for this phase
-            subjects_include: List of subjects to include
-            subjects_exclude: List of subjects to exclude
-            init_checkpoint: Path to checkpoint to initialize from
-            
-        Returns:
-            str: Path to best checkpoint from this phase
-        """
-        tqdm.write(f"\n{'='*20} Starting {phase_name.upper()} phase {'='*20}\n")
+        # Add probability info to both phase parameters
+        self.pretrain_params['use_probabilities'] = use_probabilities
+        self.finetune_params['use_probabilities'] = use_probabilities
         
-        # Create phase directory
-        phase_dir = create_experiment_dir(self.exp_root, phase_name)
-        tqdm.write(f"Saving {phase_name} results to: {phase_dir}")
+        tqdm.write(f"Probability Training Mode: {'ENABLED' if use_probabilities else 'DISABLED (using binary spikes)'}")
         
-        print_memory_stats(f"Initial ({phase_name}):")
-        
-        # Get maximum number of z-planes from preaugmented data
-        max_z_planes = get_max_z_planes(params['preaugmented_dir'])
-        params['seq_len'] = int(params['timesteps_per_sequence'] * max_z_planes)    
-        params['seq_stride'] = int(params['timestep_stride'] * max_z_planes)
-        
-        tqdm.write(f"Maximum z-planes across subjects: {max_z_planes}")
-        tqdm.write(f"Total sequence length: {params['seq_len']} ({params['timesteps_per_sequence']} timepoints × {max_z_planes} z-planes)")
-        
-        # Create data loaders
-        train_loader = self._create_data_loader(
-            params, subjects_include, subjects_exclude, split='train', shuffle=True
-        )
-        test_loader = self._create_data_loader(
-            params, subjects_include, subjects_exclude, split='test', shuffle=False
-        )
-        
-        print_memory_stats(f"After data loaders ({phase_name}):")
-        
-        # Create and initialize model
-        model = self._create_model(params, init_checkpoint, phase_dir, phase_name)
-        
-        # Create optimizer and scheduler
-        optimizer = AdamW(model.parameters(), lr=params['learning_rate'], 
-                         weight_decay=params['weight_decay'], betas=(0.9, 0.95))
-        
-        total_steps = len(train_loader) * params['num_epochs']
-        warmup_steps = int(total_steps * params['warmup_ratio'])
-        lr_scheduler = get_lr_scheduler(optimizer, warmup_steps, total_steps, min_lr=params['min_lr'])
-        
-        tqdm.write(f"Using AdamW optimizer with weight decay: {params['weight_decay']}")
-        tqdm.write(f"Learning rate scheduler: Linear warmup for {warmup_steps} steps, then constant learning rate")
-        
-        # Create initial prediction video
-        tqdm.write(f"Creating initial comparison video for {phase_name}...")
-        video_path = os.path.join(phase_dir, 'videos', 'predictions_initial.mp4')
-        create_prediction_video(model, test_loader, video_path, num_frames=330)
-        
-        # Run training
-        best_checkpoint_path = self._run_training_loop(
-            model, optimizer, lr_scheduler, train_loader, test_loader,
-            phase_dir, phase_name, params
-        )
-        
-        # Save test data and predictions if this is the finetuning phase
-        if phase_name == "finetune":
-            tqdm.write("Saving test data and predictions for analysis...")
-            save_data_dir = os.path.join(phase_dir, 'test_data')
-            os.makedirs(save_data_dir, exist_ok=True)
-            save_test_data_and_predictions(model, test_loader, save_data_dir, 
-                                          num_samples=100, params=params)
-        
-        return best_checkpoint_path
-    
     def _create_data_loader(self, params, subjects_include, subjects_exclude, split, shuffle):
-        """Create a subject-filtered data loader."""
-        return SubjectFilteredFastDALIBrainDataLoader(
+        """Create a subject-filtered probability data loader."""
+        return SubjectFilteredProbabilityDALIBrainDataLoader(
             params['preaugmented_dir'],
             include_subjects=subjects_include,
             exclude_subjects=subjects_exclude,
@@ -190,51 +84,30 @@ class TwoPhaseTrainer:
             gpu_prefetch=params['gpu_prefetch'],
             seed=42 if split == 'train' else 43,
             shuffle=shuffle,
-            stride=params['seq_stride']
+            stride=params['seq_stride'],
+            use_probabilities=self.use_probabilities
         )
-    
-    def _create_model(self, params, init_checkpoint, phase_dir, phase_name):
-        """Create and initialize the GBM model."""
-        model = GBM(
-            mamba_layers=params['mamba_layers'],
-            mamba_dim=params['mamba_dim'],
-            mamba_state_multiplier=params['mamba_state_multiplier']
-        )
-        
-        # Load from checkpoint if provided
-        if init_checkpoint:
-            tqdm.write(f"Initializing model from checkpoint: {init_checkpoint}")
-            try:
-                checkpoint = torch.load(init_checkpoint, map_location='cpu')
-                model.load_state_dict(checkpoint['model_state_dict'])
-                tqdm.write("Successfully loaded model weights from checkpoint.")
-            except Exception as e:
-                tqdm.write(f"Error loading checkpoint: {str(e)}")
-                if phase_name == 'finetune':
-                    tqdm.write("WARNING: Starting finetuning from scratch!")
-        
-        # Save model architecture info
-        self._save_model_info(model, params, phase_dir, phase_name)
-        
-        # Move to GPU
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        tqdm.write(f"Using device: {device}")
-        model = model.to(device)
-        
-        print_memory_stats(f"After model creation ({phase_name}):")
-        
-        return model
     
     def _save_model_info(self, model, params, phase_dir, phase_name):
         """Save model architecture and parameters to file."""
         with open(os.path.join(phase_dir, "model_architecture.txt"), "w") as f:
-            f.write(f"{phase_name.upper()} Phase Model Architecture:\n")
+            f.write(f"{phase_name.upper()} Phase Model Architecture (Probability Targets):\n")
             f.write("=" * 50 + "\n\n")
             f.write(str(model))
             f.write("\n\n" + "=" * 50 + "\n\n")
             f.write("Model Parameters:\n")
             for key, value in params.items():
                 f.write(f"{key}: {value}\n")
+            
+            # Add probability-specific information
+            f.write(f"\nProbability Training Configuration:\n")
+            f.write(f"use_probabilities: {self.use_probabilities}\n")
+            if self.use_probabilities:
+                f.write(f"Target type: Continuous probability values (0.0 to ~30.0)\n")
+                f.write(f"Loss function: BCE with logits (supports continuous targets)\n")
+            else:
+                f.write(f"Target type: Binary spike values (0.0 or 1.0)\n")
+                f.write(f"Loss function: BCE with logits (binary targets)\n")
             
             # Add statistics
             total_params = sum(p.numel() for p in model.parameters())
@@ -245,7 +118,7 @@ class TwoPhaseTrainer:
     
     def _run_training_loop(self, model, optimizer, lr_scheduler, train_loader, test_loader,
                           phase_dir, phase_name, params):
-        """Run the main training loop for a phase."""
+        """Run the main training loop for a phase with probability targets."""
         # Training state
         train_losses = []
         test_losses = []
@@ -270,8 +143,17 @@ class TwoPhaseTrainer:
         quarter_epoch_size = len(train_loader) // 4
         best_model_checkpoint_path = os.path.join(phase_dir, 'checkpoints', 'best_model.pt')
         
-        tqdm.write(f"Starting {phase_name} training...")
+        target_type = "probability" if self.use_probabilities else "binary"
+        
+        # Debug logging for data loader size
+        tqdm.write(f"DEBUG: train_loader length = {len(train_loader)}")
+        tqdm.write(f"DEBUG: validation_per_epoch = {params['validation_per_epoch']}")
+        tqdm.write(f"DEBUG: calculated validation_interval = {validation_interval}")
+        tqdm.write(f"DEBUG: quarter_epoch_size = {quarter_epoch_size}")
+        
+        tqdm.write(f"Starting {phase_name} training with {target_type} targets...")
         tqdm.write(f"Validating every {validation_interval} batches ({params['validation_per_epoch']} times per epoch)")
+        tqdm.write(f"Plots and CSV files will update at each validation step and end of epoch")
         
         # Main training loop
         for epoch in range(params['num_epochs']):
@@ -283,7 +165,9 @@ class TwoPhaseTrainer:
             train_iter = iter(train_loader)
             
             train_loop = tqdm(range(len(train_loader)), 
-                            desc=f"{phase_name.capitalize()} Epoch {epoch+1}/{params['num_epochs']}")
+                            desc=f"{phase_name.capitalize()} Epoch {epoch+1}/{params['num_epochs']} ({target_type})")
+            
+            tqdm.write(f"Starting epoch {epoch+1}, expecting {len(train_loader)} batches...")
             
             for batch_idx in train_loop:
                 try:
@@ -346,6 +230,22 @@ class TwoPhaseTrainer:
                                                params, best_test_loss, phase_name,
                                                best_model_checkpoint_path)
                         
+                        # Update plots and save data at validation time
+                        tqdm.write(f"Updating plots and CSV at validation step {global_step}")
+                        
+                        # Get current epoch losses for incomplete epoch  
+                        current_train_loss = epoch_loss / batch_count if batch_count > 0 else 0.0
+                        temp_train_losses = train_losses + [current_train_loss] if train_losses or current_train_loss > 0 else []
+                        
+                        # Update plots and save data with current data
+                        self._update_plots_and_save_data(
+                            phase_dir, phase_name, temp_train_losses, test_losses, raw_batch_losses,
+                            validation_step_indices, validation_losses, validation_f1_scores,
+                            validation_recall_scores, validation_precision_scores,
+                            test_f1_scores, test_recall_scores, test_precision_scores,
+                            len(train_loader)
+                        )
+                        
                         # Switch back to training mode
                         model.train()
                     
@@ -368,6 +268,8 @@ class TwoPhaseTrainer:
             avg_train_loss = epoch_loss / batch_count if batch_count > 0 else float('inf')
             train_losses.append(avg_train_loss)
             
+            tqdm.write(f"EPOCH {epoch+1} COMPLETED! Processed {batch_count} batches. Starting end-of-epoch evaluation...")
+            
             # Test evaluation
             test_metrics = track_metrics_during_validation(model, test_loader, 'cuda')
             test_losses.append(test_metrics['loss'])
@@ -379,10 +281,12 @@ class TwoPhaseTrainer:
                       f"Test Loss = {test_metrics['loss']:.6f}, Test F1 = {test_metrics['f1']:.6f}")
             
             # Create epoch video
+            tqdm.write(f"Creating epoch {epoch+1} final video...")
             video_path = os.path.join(phase_dir, 'videos', f'predictions_epoch_{epoch+1:03d}_final.mp4')
             create_prediction_video(model, test_loader, video_path, num_frames=330)
             
             # Update plots and save data
+            tqdm.write(f"Starting plot and CSV generation for epoch {epoch+1}...")
             self._update_plots_and_save_data(
                 phase_dir, phase_name, train_losses, test_losses, raw_batch_losses,
                 validation_step_indices, validation_losses, validation_f1_scores,
@@ -423,6 +327,7 @@ class TwoPhaseTrainer:
             'params': params,
             'loss_value': loss_value,
             'phase': phase_name,
+            'use_probabilities': self.use_probabilities,  # Add probability flag
         }, checkpoint_path)
     
     def _update_plots_and_save_data(self, phase_dir, phase_name, train_losses, test_losses,
@@ -431,86 +336,127 @@ class TwoPhaseTrainer:
                                    validation_precision_scores, test_f1_scores,
                                    test_recall_scores, test_precision_scores, steps_per_epoch):
         """Update plots and save training data to CSV files."""
-        # Create comprehensive plot
-        plt.figure(figsize=(12, 12))
+        target_type = "Probability" if self.use_probabilities else "Binary"
         
-        # Raw batch losses
-        plt.subplot(3, 1, 1)
-        plt.plot(raw_batch_losses, 'b-', alpha=0.3)
-        plt.title(f'{phase_name.capitalize()} Phase - Raw Batch Losses')
-        plt.xlabel('Batch')
-        plt.ylabel('Loss')
-        plt.grid(True)
+        # Helper function to convert numpy arrays to Python floats
+        def to_python_floats(data_list):
+            """Convert numpy values to Python floats for pandas compatibility."""
+            if not data_list:
+                return []
+            return [float(x) for x in data_list]
         
-        # Training and validation losses
-        plt.subplot(3, 1, 2)
-        if train_losses:
-            epochs = list(range(1, len(train_losses) + 1))
-            plt.plot(epochs, train_losses, 'b-', label='Train Loss (epoch)')
-        if test_losses:
-            epochs = list(range(1, len(test_losses) + 1))
-            plt.plot(epochs, test_losses, 'r-', label='Test Loss (epoch)')
-        if validation_losses:
-            epoch_fractions = [step / steps_per_epoch for step in validation_step_indices]
-            plt.plot(epoch_fractions, validation_losses, 'g--', marker='o', label='Validation Loss (frequent)')
+        # STEP 1: Save plots first (so they don't get lost if CSV fails)
+        try:
+            plt.figure(figsize=(12, 12))
+            
+            # Raw batch losses
+            plt.subplot(3, 1, 1)
+            plt.plot(raw_batch_losses, 'b-', alpha=0.3)
+            plt.title(f'{phase_name.capitalize()} Phase - Raw Batch Losses ({target_type} Targets)')
+            plt.xlabel('Batch')
+            plt.ylabel('Loss')
+            plt.grid(True)
+            
+            # Training and validation losses
+            plt.subplot(3, 1, 2)
+            if train_losses:
+                epochs = list(range(1, len(train_losses) + 1))
+                plt.plot(epochs, train_losses, 'b-', label='Train Loss (epoch)')
+            if test_losses:
+                epochs = list(range(1, len(test_losses) + 1))
+                plt.plot(epochs, test_losses, 'r-', label='Test Loss (epoch)')
+            if validation_losses:
+                epoch_fractions = [step / steps_per_epoch for step in validation_step_indices]
+                plt.plot(epoch_fractions, validation_losses, 'g--', marker='o', label='Validation Loss (frequent)')
+            
+            plt.title(f'{phase_name.capitalize()} Phase - Training and Validation Losses ({target_type} Targets)')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
+            
+            # Performance metrics
+            plt.subplot(3, 1, 3)
+            if validation_f1_scores:
+                epoch_fractions = [step / steps_per_epoch for step in validation_step_indices]
+                plt.plot(epoch_fractions, validation_f1_scores, 'm--', marker='x', label='Validation F1')
+                plt.plot(epoch_fractions, validation_recall_scores, 'g--', marker='o', label='Validation Recall')
+                plt.plot(epoch_fractions, validation_precision_scores, 'b--', marker='^', label='Validation Precision')
+            
+            if test_f1_scores:
+                epochs = list(range(1, len(test_f1_scores) + 1))
+                plt.plot(epochs, test_f1_scores, 'k-', marker='s', label='Test F1')
+                plt.plot(epochs, test_recall_scores, 'r-', marker='d', label='Test Recall')
+                plt.plot(epochs, test_precision_scores, 'c-', marker='v', label='Test Precision')
+            
+            plt.title(f'{phase_name.capitalize()} Phase - Performance Metrics ({target_type} Targets)')
+            plt.xlabel('Epoch')
+            plt.ylabel('Score')
+            plt.ylim(0, 1)
+            plt.legend()
+            plt.grid(True)
+            
+            plt.tight_layout()
+            plot_path = os.path.join(phase_dir, 'plots', 'loss_plot.png')
+            plt.savefig(plot_path)
+            plt.close()
+            tqdm.write(f"Plot saved: {plot_path}")
+        except Exception as e:
+            tqdm.write(f"Plot saving failed: {e}")
         
-        plt.title(f'{phase_name.capitalize()} Phase - Training and Validation Losses')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True)
+        # STEP 2: Save CSV files with proper error handling and data conversion
         
-        # Performance metrics
-        plt.subplot(3, 1, 3)
-        if validation_f1_scores:
-            epoch_fractions = [step / steps_per_epoch for step in validation_step_indices]
-            plt.plot(epoch_fractions, validation_f1_scores, 'm--', marker='x', label='Validation F1')
-            plt.plot(epoch_fractions, validation_recall_scores, 'g--', marker='o', label='Validation Recall')
-            plt.plot(epoch_fractions, validation_precision_scores, 'b--', marker='^', label='Validation Precision')
-        
-        if test_f1_scores:
-            epochs = list(range(1, len(test_f1_scores) + 1))
-            plt.plot(epochs, test_f1_scores, 'k-', marker='s', label='Test F1')
-            plt.plot(epochs, test_recall_scores, 'r-', marker='d', label='Test Recall')
-            plt.plot(epochs, test_precision_scores, 'c-', marker='v', label='Test Precision')
-        
-        plt.title(f'{phase_name.capitalize()} Phase - Performance Metrics (F1, Recall, Precision)')
-        plt.xlabel('Epoch')
-        plt.ylabel('Score')
-        plt.ylim(0, 1)
-        plt.legend()
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(phase_dir, 'plots', 'loss_plot.png'))
-        plt.close()
-        
-        # Save data to CSV files
+        # Main losses CSV
         if train_losses and test_losses:
-            save_losses_to_csv(
-                {'epoch': list(range(1, len(train_losses) + 1)),
-                 'train_loss': train_losses,
-                 'test_loss': test_losses,
-                 'test_f1': test_f1_scores,
-                 'test_recall': test_recall_scores,
-                 'test_precision': test_precision_scores},
-                os.path.join(phase_dir, 'logs', 'losses.csv')
-            )
+            try:
+                losses_data = {
+                    'epoch': list(range(1, len(train_losses) + 1)),
+                    'train_loss': to_python_floats(train_losses),
+                    'test_loss': to_python_floats(test_losses),
+                    'test_f1': to_python_floats(test_f1_scores),
+                    'test_recall': to_python_floats(test_recall_scores),
+                    'test_precision': to_python_floats(test_precision_scores)
+                }
+                csv_path = os.path.join(phase_dir, 'logs', 'losses.csv')
+                save_losses_to_csv(losses_data, csv_path)
+                tqdm.write(f"Main losses CSV saved: {csv_path}")
+            except Exception as e:
+                tqdm.write(f"Main losses CSV failed: {e}")
+                tqdm.write(f"   train_losses length: {len(train_losses) if train_losses else 0}")
+                tqdm.write(f"   test_losses length: {len(test_losses) if test_losses else 0}")
+                tqdm.write(f"   test_f1_scores length: {len(test_f1_scores) if test_f1_scores else 0}")
         
+        # Raw batch losses CSV
         if raw_batch_losses:
-            save_losses_to_csv(
-                {'batch': list(range(1, len(raw_batch_losses) + 1)),
-                 'raw_loss': raw_batch_losses},
-                os.path.join(phase_dir, 'logs', 'raw_batch_losses.csv')
-            )
+            try:
+                batch_data = {
+                    'batch': list(range(1, len(raw_batch_losses) + 1)),
+                    'raw_loss': to_python_floats(raw_batch_losses)
+                }
+                csv_path = os.path.join(phase_dir, 'logs', 'raw_batch_losses.csv')
+                save_losses_to_csv(batch_data, csv_path)
+                tqdm.write(f"Raw batch losses CSV saved: {csv_path}")
+            except Exception as e:
+                tqdm.write(f"Raw batch losses CSV failed: {e}")
+                tqdm.write(f"   raw_batch_losses length: {len(raw_batch_losses)}")
         
+        # Validation losses CSV
         if validation_losses:
-            save_losses_to_csv(
-                {'step': validation_step_indices,
-                 'epoch': [step / steps_per_epoch for step in validation_step_indices],
-                 'validation_loss': validation_losses,
-                 'validation_f1': validation_f1_scores,
-                 'validation_recall': validation_recall_scores,
-                 'validation_precision': validation_precision_scores},
-                os.path.join(phase_dir, 'logs', 'validation_losses.csv')
-            ) 
+            try:
+                validation_data = {
+                    'step': validation_step_indices,
+                    'epoch': [float(step / steps_per_epoch) for step in validation_step_indices],
+                    'validation_loss': to_python_floats(validation_losses),
+                    'validation_f1': to_python_floats(validation_f1_scores),
+                    'validation_recall': to_python_floats(validation_recall_scores),
+                    'validation_precision': to_python_floats(validation_precision_scores)
+                }
+                csv_path = os.path.join(phase_dir, 'logs', 'validation_losses.csv')
+                save_losses_to_csv(validation_data, csv_path)
+                tqdm.write(f"Validation losses CSV saved: {csv_path}")
+            except Exception as e:
+                tqdm.write(f"Validation losses CSV failed: {e}")
+                tqdm.write(f"   validation_losses length: {len(validation_losses)}")
+                tqdm.write(f"   validation_step_indices length: {len(validation_step_indices)}")
+        
+        tqdm.write(f"Plot and data saving complete for {phase_name} phase ({target_type} targets)") 

@@ -22,7 +22,7 @@ def calculate_binary_metrics(predictions, targets):
         preds = predictions.bool()
         
     if isinstance(targets, torch.Tensor):
-        targets = targets.bool()
+        targets = (targets > 0.5).bool()
     else:
         targets = targets.bool()
     
@@ -95,8 +95,8 @@ def track_metrics_during_validation(model, data_loader, device):
                 # Keep predictions as bool to save memory
                 preds = (probs > 0.5)
                 del probs
-                # Keep targets as bool as well
-                targets = batch[:, 1:].bool()
+                # Keep targets as bool as well - use 0.5 threshold for consistency with predictions
+                targets = (batch[:, 1:] > 0.5).bool()
                 del batch
                 torch.cuda.empty_cache()
                 

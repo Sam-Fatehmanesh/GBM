@@ -94,13 +94,13 @@ class GBM(nn.Module):
         
         Args:
             pred: Tensor of shape (batch_size, seq_len-1, 256, 128) containing predicted logits
-            target: Tensor of shape (batch_size, seq_len-1, 256, 128) containing target binary grids
+            target: Tensor of shape (batch_size, seq_len-1, 256, 128) containing target binary or probability grids
                    Can be uint8, float16, or float32
         Returns:
             loss: Scalar loss value
         """
         
-        return F.binary_cross_entropy_with_logits(pred, target, reduction='mean')
+        return F.binary_cross_entropy_with_logits(pred, torch.clamp(target, min=0.0, max=1.0), reduction='mean')
             
     def get_predictions(self, x, temperature=1.0):
         """Forward pass returning the sigmoid of logits for actual probabilities.
