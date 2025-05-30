@@ -5,6 +5,8 @@ import numpy as np
 from GenerativeBrainModel.models.mambacore import StackedMamba
 from GenerativeBrainModel.models.simple_autoencoder import SimpleAutoencoder
 import pdb
+import os
+
 class GBM(nn.Module):
     def __init__(self, mamba_layers=1, mamba_dim=1024, mamba_state_multiplier=1, pretrained_ae_path="trained_simpleAE/checkpoints/best_model.pt"):
         """Generative Brain Model combining pretrained autoencoder with Mamba for sequential prediction.
@@ -16,11 +18,15 @@ class GBM(nn.Module):
         """
         super(GBM, self).__init__()
         
-        # Load pretrained autoencoder
-        self.autoencoder = SimpleAutoencoder(input_size=256*128, hidden_size=mamba_dim)#LocallyConnectedAutoencoder(hidden_size=mamba_dim)#(input_size=256*128, hidden_size=mamba_dim)
-        if mamba_dim == 1024:
-            checkpoint = torch.load(pretrained_ae_path, map_location='cpu')  # Load to CPU first for better memory management
-            self.autoencoder.load_state_dict(checkpoint['model_state_dict'])
+        # Initialize autoencoder; load pretrained weights if path exists
+        self.autoencoder = SimpleAutoencoder(input_size=256*128, hidden_size=mamba_dim)
+        if pretrained_ae_path and os.path.exists(pretrained_ae_path):
+            try:
+                checkpoint_ae = torch.load(pretrained_ae_path, map_location='cpu')
+                self.autoencoder.load_state_dict(checkpoint_ae['model_state_dict'])
+            except Exception:
+                # Skip loading if any error
+                pass
         
         # Create Mamba sequence model
         self.mamba = StackedMamba(d_model=mamba_dim, num_layers=mamba_layers, state_multiplier=mamba_state_multiplier)
