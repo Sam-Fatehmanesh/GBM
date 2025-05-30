@@ -26,6 +26,22 @@ def save_test_data_and_predictions(model, data_loader, save_dir, num_samples=100
     # Get first batch
     batch = next(iter(data_loader))
     
+    # Handle both probability mode (tuple) and binary mode (single tensor)
+    if isinstance(batch, tuple):
+        # Probability mode: batch is (input_data, target_data)
+        input_data, target_data = batch
+        # Use input_data for model input (always binary)
+        batch_for_model = input_data
+        batch_size = input_data.shape[0]
+        is_probability_mode = True
+        tqdm.write("Using probability data loader for test data saving")
+    else:
+        # Binary mode: batch is single tensor
+        batch_for_model = batch
+        batch_size = batch.shape[0]
+        is_probability_mode = False
+        tqdm.write("Using binary data loader for test data saving")
+    
     # Get z-start values for each sequence from the dataloader
     # This uses the new property we added to the FastDALIBrainDataLoader
     z_starts = []
@@ -36,28 +52,28 @@ def save_test_data_and_predictions(model, data_loader, save_dir, num_samples=100
     else:
         # Fallback to default assumption that all sequences start at z=0
         tqdm.write("No z-start values available from data loader, assuming z_start=0 for all sequences")
-        z_starts = [0] * batch.shape[0]
+        z_starts = [0] * batch_size
     
     # Ensure batch is on CUDA
-    if batch.device.type != 'cuda':
-        batch = batch.cuda()
+    if batch_for_model.device.type != 'cuda':
+        batch_for_model = batch_for_model.cuda()
     
-    # Generate predictions
+    # Generate predictions using binary input data
     model.eval()
     with torch.no_grad():
         with autocast():
-            # Get probability predictions from the model
-            predictions = model.get_predictions(batch)
+            # Get probability predictions from the model using binary inputs
+            predictions = model.get_predictions(batch_for_model)
             
             # Generate sampled binary predictions
             sampled_predictions = model.sample_binary_predictions(predictions)
     
     # Choose a subset of samples for saving
-    num_sequences = min(num_samples, batch.size(0))
-    rand_indices = torch.randperm(batch.size(0))[:num_sequences]
+    num_sequences = min(num_samples, batch_for_model.size(0))
+    rand_indices = torch.randperm(batch_for_model.size(0))[:num_sequences]
     
-    # Extract the selected samples
-    test_data = batch[rand_indices].cpu().numpy()
+    # Extract the selected samples (use binary input data for storage)
+    test_data = batch_for_model[rand_indices].cpu().numpy()
     pred_probs = predictions[rand_indices].cpu().numpy()
     pred_samples = sampled_predictions[rand_indices].cpu().numpy()
     

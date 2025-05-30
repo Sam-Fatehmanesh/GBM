@@ -7,8 +7,11 @@ This script combines the functionality of:
 2. prepare_dali_training_data.py - Data preparation for training
 3. preprocess_spike_data.py - Grid conversion with z-plane augmentation
 
-The unified pipeline processes raw calcium traces directly to final grid format
-while generating visualization PDFs and eliminating intermediate files.
+The unified pipeline processes either:
+- Raw calcium traces directly to final grid format (original functionality)
+- Pre-computed spike probabilities from CASCADE/OASIS to final grid format (new functionality)
+
+While generating visualization PDFs and eliminating intermediate files.
 
 Support for both OASIS (default) and CASCADE spike detection methods.
 """
@@ -68,34 +71,72 @@ def print_memory_stats(prefix=""):
     except ImportError:
         print(f"{prefix} Memory: psutil not available")
 
-# def compute_dff(calcium_data):
-#     """
-#     Compute ΔF/F using an 8th-percentile, 30s sliding window per cell.
+def load_precomputed_spike_data(precomputed_file):
+    """
+    Load pre-computed spike probabilities and binary spikes from HDF5 file.
     
-#     Args:
-#         calcium_data: (T, N) array of calcium fluorescence traces
+    Args:
+        precomputed_file: Path to HDF5 file with pre-computed spike data
         
-#     Returns:
-#         dff: ΔF/F data of same shape
-#     """
-#     T, N = calcium_data.shape
-#     half_w = WINDOW_FRAMES // 2
-#     dff = np.zeros_like(calcium_data, dtype=np.float32)
+    Returns:
+        tuple: (calcium_data, prob_data, spike_data, cell_xyz, method_used)
+            - calcium_data: (T, N) raw calcium data (if available, else None)
+            - prob_data: (N, T) spike probabilities 
+            - spike_data: (T, N) binary spikes
+            - cell_xyz: (N, 3) cell positions
+            - method_used: string indicating 'cascade' or 'oasis'
+    """
+    print(f"  → Loading pre-computed spike data from {precomputed_file}")
     
-#     # Create sliding window indices for all timepoints
-#     starts = np.maximum(0, np.arange(T) - half_w)
-#     ends = np.minimum(T, np.arange(T) + half_w + 1)
-    
-#     # Compute F0 for all cells at once using vectorized operations
-#     F0 = np.zeros((T, N), dtype=np.float32)
-#     for t in tqdm(range(T), desc="Computing baselines"):
-#         start, end = starts[t], ends[t]
-#         F0[t] = np.percentile(calcium_data[start:end], PERCENTILE, axis=0)
-    
-#     # Compute ΔF/F for all cells
-#     dff = (calcium_data - F0)
-    
-#     return dff
+    with h5py.File(precomputed_file, 'r') as f:
+        # Load cell positions
+        cell_xyz = f['cell_positions'][:]
+        
+        # Load spike data - format varies by method
+        if 'probabilities' in f:
+            # CASCADE format: has 'probabilities' and 'spikes'
+            prob_data = f['probabilities'][:]  # (N, T)
+            spike_data = f['spikes'][:]        # (T, N) 
+            method_used = 'cascade'
+            
+            # Check if we have model_type attribute
+            if 'model_type' in f.attrs:
+                model_type = f.attrs['model_type']
+                if isinstance(model_type, bytes):
+                    model_type = model_type.decode()
+                elif hasattr(model_type, 'item'):  # numpy scalar
+                    model_type = model_type.item()
+                    if isinstance(model_type, bytes):
+                        model_type = model_type.decode()
+                print(f"    Detected CASCADE data with model: {model_type}")
+            else:
+                print("    Detected CASCADE data")
+                
+        elif 'calcium_denoised' in f:
+            # OASIS format: has 'calcium_denoised' (used as probabilities) and 'spikes'
+            prob_data = f['calcium_denoised'][:].T  # (T, N) -> (N, T)
+            spike_data = f['spikes'][:]             # (T, N)
+            method_used = 'oasis'
+            
+            if 'g' in f.attrs:
+                g_val = f.attrs['g']
+                if hasattr(g_val, 'item'):  # numpy scalar
+                    g_val = g_val.item()
+                print(f"    Detected OASIS data with g={g_val:.3f}")
+            else:
+                print("    Detected OASIS data")
+                
+        else:
+            raise ValueError(f"Unrecognized spike data format in {precomputed_file}. Expected 'probabilities' (CASCADE) or 'calcium_denoised' (OASIS)")
+        
+        # Try to load raw calcium data if available (not always present)
+        calcium_data = None
+        if 'calcium_raw' in f:
+            calcium_data = f['calcium_raw'][:]
+        
+        print(f"    Loaded {spike_data.shape[1]} cells, {spike_data.shape[0]} timepoints")
+        
+    return calcium_data, prob_data, spike_data, cell_xyz, method_used
 
 def compute_dff(calcium_data):
     """
@@ -166,9 +207,10 @@ def run_cascade_inference(dff, batch_size=30000, model_type='Global_EXC_2Hz_smoo
         
         prob_data[start:end] = batch_probs
     
-    # Threshold probabilities at 0.5
-    print("  → Thresholding binary spikes from probabilities…")
-    spike_data = (prob_data > 0.5).astype(int)
+    # Sample binary spikes from probabilities
+    print("  → Sampling binary spikes from probabilities…")
+    prob_clamped = np.clip(prob_data, 0, 1)
+    spike_data = np.random.binomial(1, prob_clamped).astype(int)
     
     return prob_data, spike_data
 
@@ -257,13 +299,14 @@ def run_spike_inference(data, method='oasis', **kwargs):
     else:
         raise ValueError(f"Unknown spike inference method: {method}. Use 'cascade' or 'oasis'.")
 
-def augment_z_frames(frame, z_index, height=GRID_HEIGHT, width=GRID_WIDTH):
+def augment_z_frames(frame, z_index, num_z_planes, height=GRID_HEIGHT, width=GRID_WIDTH):
     """
     Apply z-index based augmentation to a frame.
     
     Args:
         frame: Numpy array of shape (height, width) 
         z_index: Current z-index for the frame
+        num_z_planes: Total number of z-planes
         height, width: Frame dimensions
         
     Returns:
@@ -272,15 +315,13 @@ def augment_z_frames(frame, z_index, height=GRID_HEIGHT, width=GRID_WIDTH):
     # Clone the frame to avoid modifying the original
     augmented_frame = frame.copy()
     
-    # Calculate marker dimensions based on z-index
-    marker_height = 2  # Always 2 pixels high
-    marker_width = z_index + 2  # z-index + 2 pixels wide
+    # Zero out the entire z-plane marker area (top-right column down to num_z_planes)
+    marker_area_height = min(num_z_planes, height)
+    augmented_frame[0:marker_area_height, width-1] = 0
     
-    # Ensure marker fits within the frame
-    marker_width = min(marker_width, width)
-    
-    # Set the top-right corner pixels to 1
-    augmented_frame[0:marker_height, width-marker_width:width] = 1
+    # Set only the z-index pixel to 1
+    if z_index < height:
+        augmented_frame[z_index, width-1] = 1
     
     return augmented_frame
 
@@ -396,7 +437,7 @@ def convert_to_grids(spike_data, cell_positions, split_ratio=0.95, seed=42):
             
             # Skip if no cells in this z-plane
             if len(cell_indices) == 0:
-                grid = augment_z_frames(grid, z_idx)
+                grid = augment_z_frames(grid, z_idx, num_z)
                 grids[t, z_idx] = grid
                 continue
             
@@ -415,7 +456,7 @@ def convert_to_grids(spike_data, cell_positions, split_ratio=0.95, seed=42):
                     grid[active_x[i], active_y[i]] = 1
             
             # Apply z-plane augmentation
-            grid = augment_z_frames(grid, z_idx)
+            grid = augment_z_frames(grid, z_idx, num_z)
             grids[t, z_idx] = grid
     
     # Create metadata
@@ -482,170 +523,267 @@ def create_visualization_pdf(calcium_data, prob_data, spike_data, subject_name, 
 def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000, 
                    split_ratio=0.95, seed=42, spike_method='oasis', 
                    cascade_model='Global_EXC_2Hz_smoothing500ms',
-                   oasis_fudge_factor=0.98, oasis_penalty=1, oasis_threshold_factor=0.333):
+                   oasis_fudge_factor=0.98, oasis_penalty=1, oasis_threshold_factor=0.333,
+                   precomputed_dir=None):
     """
     Process a single subject through the complete pipeline.
     
     Args:
-        subject_dir: Path to subject directory containing raw data
+        subject_dir: Path to subject directory containing raw data (ignored if precomputed_dir is provided)
         output_dir: Output directory for processed data
         num_neurons: Number of neurons to visualize in PDF
         batch_size: Batch size for CASCADE processing
         split_ratio: Train/test split ratio
         seed: Random seed
-        spike_method: 'oasis' or 'cascade' for spike detection method
+        spike_method: 'oasis' or 'cascade' for spike detection method (ignored if precomputed_dir is provided)
         cascade_model: CASCADE model type to use (if using CASCADE)
         oasis_fudge_factor: Fudge factor for OASIS parameter estimation
         oasis_penalty: Penalty parameter for OASIS deconvolution
         oasis_threshold_factor: Factor to multiply noise std for OASIS thresholding
+        precomputed_dir: Path to directory with pre-computed spike data (if provided, skips spike inference)
         
     Returns:
         subject_output_dir: Path to subject's output directory
     """
-    subject_name = os.path.basename(os.path.normpath(subject_dir))
-    print(f"\nProcessing subject: {subject_name} using {spike_method.upper()}")
+    if precomputed_dir:
+        # Use pre-computed spike data
+        subject_name = os.path.basename(os.path.normpath(subject_dir))
+        precomputed_file = os.path.join(precomputed_dir, f"{subject_name}_spikes.h5")
+        
+        if not os.path.exists(precomputed_file):
+            print(f"Warning: Pre-computed file not found: {precomputed_file}")
+            return None
+            
+        print(f"\nProcessing subject: {subject_name} using pre-computed spike data")
+        
+        # Create subject output directory
+        subject_output_dir = os.path.join(output_dir, subject_name)
+        os.makedirs(subject_output_dir, exist_ok=True)
+        
+        # Check if already processed
+        final_file = os.path.join(subject_output_dir, 'preaugmented_grids.h5')
+        pdf_file = os.path.join(subject_output_dir, f'{subject_name}_visualization.pdf')
+        
+        if os.path.exists(final_file) and os.path.exists(pdf_file):
+            print("  → Already processed; skipping.")
+            return subject_output_dir
+        
+        start_time = time.time()
+        
+        try:
+            # Load pre-computed spike data
+            calcium_data, prob_data, spike_data, cell_xyz, method_used = load_precomputed_spike_data(precomputed_file)
+            
+            # If we don't have raw calcium data, create dummy data for visualization
+            if calcium_data is None:
+                print("  → No raw calcium data available, creating dummy data for visualization")
+                T, N = spike_data.shape
+                calcium_data = np.random.randn(T, N).astype(np.float32)
+            
+            # Continue with grid conversion and visualization
+            print("  → Converting to grid format with z-plane augmentation...")
+            grids, metadata = convert_to_grids(spike_data, cell_xyz, split_ratio, seed)
+            
+            # Save final data
+            print(f"  → Saving final data to {final_file}")
+            with h5py.File(final_file, 'w') as f:
+                # Save main datasets
+                f.create_dataset('grids', 
+                                data=grids,
+                                chunks=(1, 1, GRID_HEIGHT, GRID_WIDTH),
+                                compression='gzip',
+                                compression_opts=1)
+                
+                f.create_dataset('timepoint_indices', 
+                                data=np.arange(spike_data.shape[0], dtype=np.int32))
+                
+                f.create_dataset('is_train', data=metadata['is_train'])
+                
+                # Save attributes
+                f.attrs['num_timepoints'] = metadata['num_timepoints']
+                f.attrs['num_z_planes'] = metadata['num_z_planes']
+                f.attrs['subject'] = subject_name
+                f.attrs['spike_method'] = method_used
+                f.attrs['data_source'] = 'precomputed'
+                f.attrs['precomputed_file'] = precomputed_file
+            
+            # Save metadata separately
+            metadata_file = os.path.join(subject_output_dir, 'metadata.h5')
+            with h5py.File(metadata_file, 'w') as f:
+                f.create_dataset('num_timepoints', data=metadata['num_timepoints'])
+                f.create_dataset('num_z_planes', data=metadata['num_z_planes'])
+                f.create_dataset('z_values', data=metadata['z_values'])
+                f.create_dataset('train_timepoints', data=metadata['train_timepoints'])
+                f.create_dataset('test_timepoints', data=metadata['test_timepoints'])
+                f.create_dataset('is_train', data=metadata['is_train'])
+            
+            # Create visualization PDF
+            print("  → Creating visualization PDF...")
+            create_visualization_pdf(calcium_data, prob_data, spike_data, subject_name, 
+                                    pdf_file, num_neurons, method_used)
+            
+            # Clean up memory
+            del calcium_data, prob_data, spike_data, grids
+            gc.collect()
+            
+            processing_time = time.time() - start_time
+            print(f"  → Completed {subject_name} in {processing_time:.2f} seconds")
+            
+            return subject_output_dir
+            
+        except Exception as e:
+            print(f"  → Error processing {subject_name}: {e}")
+            raise
     
-    # Create subject output directory
-    subject_output_dir = os.path.join(output_dir, subject_name)
-    os.makedirs(subject_output_dir, exist_ok=True)
-    
-    # Check if already processed
-    final_file = os.path.join(subject_output_dir, 'preaugmented_grids.h5')
-    pdf_file = os.path.join(subject_output_dir, f'{subject_name}_visualization.pdf')
-    
-    if os.path.exists(final_file) and os.path.exists(pdf_file):
-        print("  → Already processed; skipping.")
-        return subject_output_dir
-    
-    start_time = time.time()
-    
-    try:
-        # Step 1: Load raw data
-        print("  → Loading raw data...")
+    else:
+        # Original functionality - process raw calcium data
+        subject_name = os.path.basename(os.path.normpath(subject_dir))
+        print(f"\nProcessing subject: {subject_name} using {spike_method.upper()}")
         
-        # Load cell positions
-        mat = loadmat(os.path.join(subject_dir, 'data_full.mat'))
-        data0 = mat['data'][0, 0]
-        cell_xyz = data0['CellXYZ']
+        # Create subject output directory
+        subject_output_dir = os.path.join(output_dir, subject_name)
+        os.makedirs(subject_output_dir, exist_ok=True)
         
-        if isinstance(cell_xyz, np.ndarray) and cell_xyz.dtype == np.object_:
-            cell_xyz = cell_xyz[0, 0]
+        # Check if already processed
+        final_file = os.path.join(subject_output_dir, 'preaugmented_grids.h5')
+        pdf_file = os.path.join(subject_output_dir, f'{subject_name}_visualization.pdf')
         
-        # Handle invalid anatomical indices
-        if 'IX_inval_anat' in data0.dtype.names:
-            inval = data0['IX_inval_anat']
-            if isinstance(inval, np.ndarray) and inval.dtype == np.object_:
-                inval = inval[0, 0].flatten()
-            mask = np.ones(cell_xyz.shape[0], bool)
-            mask[np.array(inval, int) - 1] = False
-            cell_xyz = cell_xyz[mask]
+        if os.path.exists(final_file) and os.path.exists(pdf_file):
+            print("  → Already processed; skipping.")
+            return subject_output_dir
         
-        # Load raw fluorescence traces
-        with h5py.File(os.path.join(subject_dir, 'TimeSeries.h5'), 'r') as f:
-            calcium = f['CellResp'][:]  # shape = (T, N)
+        start_time = time.time()
         
-        T, N = calcium.shape
-        assert N == cell_xyz.shape[0], f"Cell count mismatch: {N} vs {cell_xyz.shape[0]}"
-        
-        # Step 2: Run spike inference based on method
-        if spike_method.lower() == 'cascade':
-            # Compute ΔF/F for CASCADE
-            print("  → Computing ΔF/F (8th-percentile, 30s sliding window)...")
-            dff = compute_dff(calcium)
+        try:
+            # Step 1: Load raw data
+            print("  → Loading raw data...")
             
-            # Run CASCADE inference
-            prob_data, spike_data = run_spike_inference(
-                dff, method='cascade', 
-                batch_size=batch_size, 
-                model_type=cascade_model
-            )
+            # Load cell positions
+            mat = loadmat(os.path.join(subject_dir, 'data_full.mat'))
+            data0 = mat['data'][0, 0]
+            cell_xyz = data0['CellXYZ']
             
-        elif spike_method.lower() == 'oasis':
-            # Run OASIS directly on raw calcium
-            dff = compute_dff(calcium)
-            prob_data, spike_data = run_spike_inference(
-                dff, method='oasis',
-                fudge_factor=oasis_fudge_factor,
-                penalty=oasis_penalty, 
-                threshold_factor=oasis_threshold_factor
-            )
-        else:
-            raise ValueError(f"Unknown spike method: {spike_method}. Use 'oasis' or 'cascade'.")
-        
-        # Step 3: Convert to grid format
-        print("  → Converting to grid format with z-plane augmentation...")
-        grids, metadata = convert_to_grids(spike_data, cell_xyz, split_ratio, seed)
-        
-        # Step 4: Save final data
-        print(f"  → Saving final data to {final_file}")
-        with h5py.File(final_file, 'w') as f:
-            # Save main datasets
-            f.create_dataset('grids', 
-                            data=grids,
-                            chunks=(1, 1, GRID_HEIGHT, GRID_WIDTH),
-                            compression='gzip',
-                            compression_opts=1)
+            if isinstance(cell_xyz, np.ndarray) and cell_xyz.dtype == np.object_:
+                cell_xyz = cell_xyz[0, 0]
             
-            f.create_dataset('timepoint_indices', 
-                            data=np.arange(T, dtype=np.int32))
+            # Handle invalid anatomical indices
+            if 'IX_inval_anat' in data0.dtype.names:
+                inval = data0['IX_inval_anat']
+                if isinstance(inval, np.ndarray) and inval.dtype == np.object_:
+                    inval = inval[0, 0].flatten()
+                mask = np.ones(cell_xyz.shape[0], bool)
+                mask[np.array(inval, int) - 1] = False
+                cell_xyz = cell_xyz[mask]
             
-            f.create_dataset('is_train', data=metadata['is_train'])
+            # Load raw fluorescence traces
+            with h5py.File(os.path.join(subject_dir, 'TimeSeries.h5'), 'r') as f:
+                calcium = f['CellResp'][:]  # shape = (T, N)
             
-            # Save attributes
-            f.attrs['num_timepoints'] = metadata['num_timepoints']
-            f.attrs['num_z_planes'] = metadata['num_z_planes']
-            f.attrs['subject'] = subject_name
-            f.attrs['spike_method'] = spike_method
-            f.attrs['sampling_rate'] = SAMPLING_RATE
+            T, N = calcium.shape
+            assert N == cell_xyz.shape[0], f"Cell count mismatch: {N} vs {cell_xyz.shape[0]}"
             
-            # Method-specific attributes
+            # Step 2: Run spike inference based on method
             if spike_method.lower() == 'cascade':
-                f.attrs['cascade_model'] = cascade_model
-                f.attrs['window_sec'] = WINDOW_SEC
-                f.attrs['percentile'] = PERCENTILE
-            else:  # OASIS
-                f.attrs['oasis_fudge_factor'] = oasis_fudge_factor
-                f.attrs['oasis_penalty'] = oasis_penalty
-                f.attrs['oasis_threshold_factor'] = oasis_threshold_factor
-        
-        # Save metadata separately
-        metadata_file = os.path.join(subject_output_dir, 'metadata.h5')
-        with h5py.File(metadata_file, 'w') as f:
-            f.create_dataset('num_timepoints', data=metadata['num_timepoints'])
-            f.create_dataset('num_z_planes', data=metadata['num_z_planes'])
-            f.create_dataset('z_values', data=metadata['z_values'])
-            f.create_dataset('train_timepoints', data=metadata['train_timepoints'])
-            f.create_dataset('test_timepoints', data=metadata['test_timepoints'])
-            f.create_dataset('is_train', data=metadata['is_train'])
-        
-        # Step 5: Create visualization PDF
-        print("  → Creating visualization PDF...")
-        create_visualization_pdf(calcium, prob_data, spike_data, subject_name, 
-                                pdf_file, num_neurons, spike_method)
-        
-        # Clean up memory
-        del calcium, prob_data, spike_data, grids
-        gc.collect()
-        
-        processing_time = time.time() - start_time
-        print(f"  → Completed {subject_name} in {processing_time:.2f} seconds")
-        
-        return subject_output_dir
-        
-    except Exception as e:
-        print(f"  → Error processing {subject_name}: {e}")
-        raise
+                # Compute ΔF/F for CASCADE
+                print("  → Computing ΔF/F (8th-percentile, 30s sliding window)...")
+                dff = compute_dff(calcium)
+                
+                # Run CASCADE inference
+                prob_data, spike_data = run_spike_inference(
+                    dff, method='cascade', 
+                    batch_size=batch_size, 
+                    model_type=cascade_model
+                )
+                
+            elif spike_method.lower() == 'oasis':
+                # Run OASIS directly on raw calcium
+                dff = compute_dff(calcium)
+                prob_data, spike_data = run_spike_inference(
+                    dff, method='oasis',
+                    fudge_factor=oasis_fudge_factor,
+                    penalty=oasis_penalty, 
+                    threshold_factor=oasis_threshold_factor
+                )
+            else:
+                raise ValueError(f"Unknown spike method: {spike_method}. Use 'oasis' or 'cascade'.")
+            
+            # Step 3: Convert to grid format
+            print("  → Converting to grid format with z-plane augmentation...")
+            grids, metadata = convert_to_grids(spike_data, cell_xyz, split_ratio, seed)
+            
+            # Step 4: Save final data
+            print(f"  → Saving final data to {final_file}")
+            with h5py.File(final_file, 'w') as f:
+                # Save main datasets
+                f.create_dataset('grids', 
+                                data=grids,
+                                chunks=(1, 1, GRID_HEIGHT, GRID_WIDTH),
+                                compression='gzip',
+                                compression_opts=1)
+                
+                f.create_dataset('timepoint_indices', 
+                                data=np.arange(T, dtype=np.int32))
+                
+                f.create_dataset('is_train', data=metadata['is_train'])
+                
+                # Save attributes
+                f.attrs['num_timepoints'] = metadata['num_timepoints']
+                f.attrs['num_z_planes'] = metadata['num_z_planes']
+                f.attrs['subject'] = subject_name
+                f.attrs['spike_method'] = spike_method
+                f.attrs['sampling_rate'] = SAMPLING_RATE
+                f.attrs['data_source'] = 'raw_calcium'
+                
+                # Method-specific attributes
+                if spike_method.lower() == 'cascade':
+                    f.attrs['cascade_model'] = cascade_model
+                    f.attrs['window_sec'] = WINDOW_SEC
+                    f.attrs['percentile'] = PERCENTILE
+                else:  # OASIS
+                    f.attrs['oasis_fudge_factor'] = oasis_fudge_factor
+                    f.attrs['oasis_penalty'] = oasis_penalty
+                    f.attrs['oasis_threshold_factor'] = oasis_threshold_factor
+            
+            # Save metadata separately
+            metadata_file = os.path.join(subject_output_dir, 'metadata.h5')
+            with h5py.File(metadata_file, 'w') as f:
+                f.create_dataset('num_timepoints', data=metadata['num_timepoints'])
+                f.create_dataset('num_z_planes', data=metadata['num_z_planes'])
+                f.create_dataset('z_values', data=metadata['z_values'])
+                f.create_dataset('train_timepoints', data=metadata['train_timepoints'])
+                f.create_dataset('test_timepoints', data=metadata['test_timepoints'])
+                f.create_dataset('is_train', data=metadata['is_train'])
+            
+            # Step 5: Create visualization PDF
+            print("  → Creating visualization PDF...")
+            create_visualization_pdf(calcium, prob_data, spike_data, subject_name, 
+                                    pdf_file, num_neurons, spike_method)
+            
+            # Clean up memory
+            del calcium, prob_data, spike_data, grids
+            gc.collect()
+            
+            processing_time = time.time() - start_time
+            print(f"  → Completed {subject_name} in {processing_time:.2f} seconds")
+            
+            return subject_output_dir
+            
+        except Exception as e:
+            print(f"  → Error processing {subject_name}: {e}")
+            raise
 
 def main():
     parser = argparse.ArgumentParser(
         description='Unified spike processing pipeline: calcium traces → final grid format with visualizations'
     )
     parser.add_argument('--input_dir', type=str, default='raw_trace_data_2018',
-                        help='Directory containing raw calcium trace data')
+                        help='Directory containing raw calcium trace data (ignored if --precomputed_dir is provided)')
     parser.add_argument('--output_dir', type=str, default='processed_spike_grids_2018',
                         help='Output directory for processed grid data')
+    parser.add_argument('--precomputed_dir', type=str, default=None,
+                        help='Directory containing pre-computed spike data (HDF5 files from CASCADE/OASIS). If provided, skips spike inference.')
     parser.add_argument('--spike_method', type=str, default='oasis', choices=['oasis', 'cascade'],
-                        help='Spike detection method: oasis (default) or cascade')
+                        help='Spike detection method: oasis (default) or cascade (ignored if --precomputed_dir is provided)')
     parser.add_argument('--num_neurons', type=int, default=10,
                         help='Number of neurons to visualize in PDFs')
     parser.add_argument('--batch_size', type=int, default=30000,
@@ -674,32 +812,59 @@ def main():
     
     args = parser.parse_args()
     
-    # Check method availability
-    if args.spike_method.lower() == 'cascade' and not CASCADE_AVAILABLE:
-        print("Error: CASCADE not available. Please install neuralib or use OASIS method.")
-        return
-    elif args.spike_method.lower() == 'oasis' and not OASIS_AVAILABLE:
-        print("Error: OASIS not available. Please install oasis-deconvolution or use CASCADE method.")
-        return
+    # Determine processing mode
+    if args.precomputed_dir:
+        print(f"Using pre-computed spike data from: {args.precomputed_dir}")
+        if not os.path.exists(args.precomputed_dir):
+            print(f"Error: Pre-computed directory not found: {args.precomputed_dir}")
+            return
+        input_dir = args.input_dir  # Still need this for subject directory structure
+        processing_mode = "precomputed"
+    else:
+        print(f"Processing raw calcium data from: {args.input_dir}")
+        # Check method availability for raw processing
+        if args.spike_method.lower() == 'cascade' and not CASCADE_AVAILABLE:
+            print("Error: CASCADE not available. Please install neuralib or use OASIS method.")
+            return
+        elif args.spike_method.lower() == 'oasis' and not OASIS_AVAILABLE:
+            print("Error: OASIS not available. Please install oasis-deconvolution or use CASCADE method.")
+            return
+        input_dir = args.input_dir
+        processing_mode = "raw"
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Find all subject directories
     skips = {s.strip() for s in args.skip.split(',') if s.strip()}
-    subjects = sorted([
-        os.path.join(args.input_dir, d)
-        for d in os.listdir(args.input_dir)
-        if d.startswith('subject_') and d not in skips and
-        os.path.isdir(os.path.join(args.input_dir, d))
-    ])
+    
+    if processing_mode == "precomputed":
+        # Find subjects based on available pre-computed files
+        precomputed_files = [f for f in os.listdir(args.precomputed_dir) if f.endswith('_spikes.h5')]
+        subject_names = [f.replace('_spikes.h5', '') for f in precomputed_files if f.replace('_spikes.h5', '') not in skips]
+        subjects = [os.path.join(input_dir, name) for name in subject_names if name.startswith('subject_')]
+        print(f"Found {len(precomputed_files)} pre-computed spike files")
+    else:
+        # Original logic for raw data
+        subjects = sorted([
+            os.path.join(input_dir, d)
+            for d in os.listdir(input_dir)
+            if d.startswith('subject_') and d not in skips and
+            os.path.isdir(os.path.join(input_dir, d))
+        ])
     
     if not subjects:
-        print(f"No subject directories found in {args.input_dir}!")
+        if processing_mode == "precomputed":
+            print(f"No pre-computed spike files found in {args.precomputed_dir}!")
+        else:
+            print(f"No subject directories found in {input_dir}!")
         return
     
     print(f"Found {len(subjects)} subjects; skipping {skips}")
-    print(f"Using spike detection method: {args.spike_method.upper()}")
+    if processing_mode == "precomputed":
+        print(f"Using pre-computed spike data")
+    else:
+        print(f"Using spike detection method: {args.spike_method.upper()}")
     
     # Process subjects
     processed_subjects = []
@@ -720,7 +885,8 @@ def main():
                     args.cascade_model,
                     args.oasis_fudge_factor,
                     args.oasis_penalty,
-                    args.oasis_threshold_factor
+                    args.oasis_threshold_factor,
+                    args.precomputed_dir
                 )
                 for subject_dir in subjects
             ]
@@ -728,7 +894,8 @@ def main():
             for future in tqdm(futures, desc="Processing subjects"):
                 try:
                     result = future.result()
-                    processed_subjects.append(result)
+                    if result is not None:
+                        processed_subjects.append(result)
                 except Exception as e:
                     print(f"Error in parallel processing: {e}")
     else:
@@ -746,9 +913,11 @@ def main():
                     args.cascade_model,
                     args.oasis_fudge_factor,
                     args.oasis_penalty,
-                    args.oasis_threshold_factor
+                    args.oasis_threshold_factor,
+                    args.precomputed_dir
                 )
-                processed_subjects.append(result)
+                if result is not None:
+                    processed_subjects.append(result)
             except Exception as e:
                 print(f"Error processing {subject_dir}: {e}")
     
@@ -775,14 +944,20 @@ def main():
     # Save combined metadata
     combined_metadata_path = os.path.join(args.output_dir, 'combined_metadata.h5')
     with h5py.File(combined_metadata_path, 'w') as f:
-        f.attrs['spike_method'] = args.spike_method
+        if processing_mode == "precomputed":
+            f.attrs['data_source'] = 'precomputed'
+            f.attrs['precomputed_dir'] = args.precomputed_dir
+        else:
+            f.attrs['data_source'] = 'raw_calcium'
+            f.attrs['spike_method'] = args.spike_method
+        
         for subject, data in combined_metadata.items():
             subject_group = f.create_group(subject)
             for key, value in data.items():
                 subject_group.create_dataset(key, data=value)
     
     print(f"\nUnified processing complete!")
-    print(f"Processed {len(processed_subjects)} subjects using {args.spike_method.upper()}")
+    print(f"Processed {len(processed_subjects)} subjects using {processing_mode} data")
     print(f"Output saved to: {args.output_dir}")
     print(f"Combined metadata: {combined_metadata_path}")
     
@@ -791,7 +966,12 @@ def main():
     total_z_planes = sum(data['num_z_planes'] for data in combined_metadata.values())
     
     print(f"\nSummary:")
-    print(f"  Spike detection method: {args.spike_method.upper()}")
+    if processing_mode == "precomputed":
+        print(f"  Data source: Pre-computed spike data")
+        print(f"  Pre-computed directory: {args.precomputed_dir}")
+    else:
+        print(f"  Data source: Raw calcium traces")
+        print(f"  Spike detection method: {args.spike_method.upper()}")
     print(f"  Total timepoints: {total_timepoints}")
     print(f"  Total z-planes: {total_z_planes}")
     print(f"  Grid size: {GRID_HEIGHT}x{GRID_WIDTH}")

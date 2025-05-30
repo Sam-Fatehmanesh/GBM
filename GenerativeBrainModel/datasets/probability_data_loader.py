@@ -206,15 +206,29 @@ class ProbabilityGridLoader:
         # Clear previous batch z-starts and populate with new ones
         self.current_batch_z_starts = []
         
-        # Create batch of sequences - use float32 for probabilities
+        # For probability training: load both binary inputs and probability targets
+        # For binary training: load only binary data
+        input_batch = np.zeros((batch_size, self.seq_len, 256, 128), dtype=np.uint8)  # Always binary for model input
+        
         if self.use_probabilities:
-            batch = np.zeros((batch_size, self.seq_len, 256, 128), dtype=np.float32)
+            target_batch = np.zeros((batch_size, self.seq_len, 256, 128), dtype=np.float32)  # Probabilities for targets
         else:
-            batch = np.zeros((batch_size, self.seq_len, 256, 128), dtype=np.uint8)
+            target_batch = None  # Will use same as input for binary training
         
         # Open the HDF5 file for reading
         with h5py.File(self.h5_file_path, 'r', libver='latest', swmr=True) as f:
-            grids = f[self.data_key]  # Reference to the dataset (probability_grids or spike_grids)
+            # Load binary spike grids for model input (always binary)
+            if 'spike_grids' in f:
+                input_grids = f['spike_grids']
+            else:
+                # Fallback to old format or thresholded probabilities
+                input_grids = f[self.data_key]
+            
+            # Load target grids based on training mode
+            if self.use_probabilities and 'probability_grids' in f:
+                target_grids = f['probability_grids']
+            else:
+                target_grids = input_grids  # Use same as input
             
             # Process each sample in the batch
             for batch_idx, idx in enumerate(indices):
@@ -235,11 +249,16 @@ class ProbabilityGridLoader:
                 while seq_idx < self.seq_len and tp < self.num_timepoints:
                     # Process z-planes in the current timepoint
                     while current_z < self.num_z and seq_idx < self.seq_len:
-                        # Access the precomputed grid directly
-                        grid = grids[tp, current_z]
+                        # Load input grid (always binary)
+                        input_grid = input_grids[tp, current_z]
+                        if input_grid.max() > 1:  # If probabilities, threshold to binary
+                            input_grid = (input_grid > 0.5).astype(np.uint8)
+                        input_batch[batch_idx, seq_idx] = input_grid
                         
-                        # Copy to the batch
-                        batch[batch_idx, seq_idx] = grid
+                        # Load target grid (probabilities or binary)
+                        if self.use_probabilities and target_batch is not None:
+                            target_grid = target_grids[tp, current_z]
+                            target_batch[batch_idx, seq_idx] = target_grid
                         
                         # Move to next z-plane
                         seq_idx += 1
@@ -252,11 +271,15 @@ class ProbabilityGridLoader:
                     current_z = 0
         
         if MEMORY_DIAGNOSTICS:
-            batch_size_mb = batch.nbytes / 1e6
-            print(f"ProbabilityGridLoader: Batch size: {batch_size_mb:.2f} MB")
+            input_size_mb = input_batch.nbytes / 1e6
+            target_size_mb = target_batch.nbytes / 1e6 if target_batch is not None else 0
+            print(f"ProbabilityGridLoader: Input batch: {input_size_mb:.2f} MB, Target batch: {target_size_mb:.2f} MB")
             print(f"ProbabilityGridLoader call took {time.time() - start_time:.2f}s for batch of {batch_size}")
         
-        return batch
+        if self.use_probabilities and target_batch is not None:
+            return input_batch, target_batch, np.array(self.current_batch_z_starts, dtype=np.int64)
+        else:
+            return input_batch, np.array(self.current_batch_z_starts, dtype=np.int64)
 
 
 @pipeline_def
@@ -266,25 +289,41 @@ def create_probability_brain_data_pipeline(grid_loader, device="gpu"):
     indices = fn.random.uniform(range=(0, len(grid_loader)), dtype=types.INT64)
     
     # Load the preaugmented grid data directly using external source
-    sequences = fn.external_source(
-        source=grid_loader,
-        num_outputs=1,
-        device="cpu",
-        batch=False,
-        parallel=True
-    )
-    
-    # Make sure we're getting a single tensor, not a list
-    sequences = sequences[0] if isinstance(sequences, list) else sequences
+    if grid_loader.use_probabilities:
+        outputs = fn.external_source(
+            source=grid_loader,
+            num_outputs=3,  # input_batch, target_batch, z_starts
+            device="cpu",
+            batch=True,
+            parallel=True
+        )
+        # Unpack outputs: input_sequences, target_sequences, z_starts
+        input_sequences = outputs[0]
+        target_sequences = outputs[1]
+        z_starts = outputs[2]
+    else:
+        outputs = fn.external_source(
+            source=grid_loader,
+            num_outputs=2,  # input_batch, z_starts
+            device="cpu",
+            batch=True,
+            parallel=True
+        )
+        # Unpack outputs: input_sequences, z_starts
+        input_sequences = outputs[0]
+        target_sequences = input_sequences  # Use same for binary training
+        z_starts = outputs[1]
     
     # Transfer to GPU and cast appropriately for model processing
     if device == "gpu":
-        sequences = sequences.gpu()
-        # Cast to float16 for memory efficiency during further processing
-        # Both probability and binary data can use float16
-        sequences = fn.cast(sequences, dtype=types.FLOAT16)
+        input_sequences = input_sequences.gpu()
+        target_sequences = target_sequences.gpu()
+        # Cast input to float16 for model (binary data)
+        input_sequences = fn.cast(input_sequences, dtype=types.FLOAT16)
+        # Cast targets appropriately (float16 for probabilities, float16 for binary)
+        target_sequences = fn.cast(target_sequences, dtype=types.FLOAT16)
     
-    return sequences
+    return input_sequences, target_sequences, z_starts
 
 
 class ProbabilityDALIBrainDataLoader(FastDALIBrainDataLoader):
@@ -375,7 +414,7 @@ class ProbabilityDALIBrainDataLoader(FastDALIBrainDataLoader):
             self.iterators.append(
                 DALIGenericIterator(
                     [pipe],
-                    ["sequences"],
+                    ["input_sequences", "target_sequences", "z_starts"] if self.use_probabilities else ["input_sequences", "z_starts"],
                     # Use PARTIAL for all pipelines to avoid dropping data
                     last_batch_policy=LastBatchPolicy.PARTIAL,
                     prepare_first_batch=True,
@@ -407,6 +446,199 @@ class ProbabilityDALIBrainDataLoader(FastDALIBrainDataLoader):
         
         # Print memory stats after initialization
         print_memory_stats("After Probability DALI loader init:")
+
+    def __next__(self):
+        """Get the next batch, handling separate input and target sequences for probability mode."""
+        if MEMORY_DIAGNOSTICS:
+            print_memory_stats("Before probability batch fetch:")
+            start_time = time.time()
+        
+        # If we already have a full batch accumulated, return it
+        if self.accumulated_batch is not None and self.accumulated_count >= self.batch_size:
+            if self.use_probabilities:
+                # Return separate input and target batches
+                input_result = self.accumulated_batch[0][:self.batch_size]
+                target_result = self.accumulated_batch[1][:self.batch_size]
+                result = (input_result, target_result)
+                
+                # Keep any remaining samples for the next batch
+                if self.accumulated_count > self.batch_size:
+                    self.accumulated_batch = (
+                        self.accumulated_batch[0][self.batch_size:],
+                        self.accumulated_batch[1][self.batch_size:]
+                    )
+                    self.accumulated_count -= self.batch_size
+                else:
+                    self.accumulated_batch = None
+                    self.accumulated_count = 0
+            else:
+                # Binary mode: return single tensor like parent class
+                result = self.accumulated_batch[:self.batch_size]
+                if self.accumulated_count > self.batch_size:
+                    self.accumulated_batch = self.accumulated_batch[self.batch_size:]
+                    self.accumulated_count -= self.batch_size
+                else:
+                    self.accumulated_batch = None
+                    self.accumulated_count = 0
+                
+            if MEMORY_DIAGNOSTICS:
+                if self.use_probabilities:
+                    print(f"Returning probability batch: input={result[0].shape}, target={result[1].shape}")
+                else:
+                    print(f"Returning binary batch: {result.shape}")
+                print_memory_stats("After returning accumulated batch:")
+            
+            # Update z-start information for the current batch
+            self._update_z_starts_for_current_batch()
+                
+            return result
+        
+        # Otherwise, accumulate more data
+        try:
+            # Get next batch from current iterator
+            if self.current_iter is None:
+                self.current_iter = iter(self.iterators[self.current_iterator])
+            
+            batch = next(self.current_iter)
+            
+            if self.use_probabilities:
+                # Extract separate input and target data
+                input_data = batch[0]["input_sequences"]
+                target_data = batch[0]["target_sequences"]
+                
+                if MEMORY_DIAGNOSTICS:
+                    print(f"Got probability batch from DALI: input={input_data.shape}, target={target_data.shape}")
+                
+                # Keep data in float16 to reduce memory usage
+                if input_data.dtype != torch.float16:
+                    input_data = input_data.to(torch.float16)
+                if target_data.dtype != torch.float16:
+                    target_data = target_data.to(torch.float16)
+                
+                # Accumulate the batch
+                if self.accumulated_batch is None:
+                    self.accumulated_batch = (input_data, target_data)
+                    self.accumulated_count = input_data.size(0)
+                else:
+                    self.accumulated_batch = (
+                        torch.cat([self.accumulated_batch[0], input_data], dim=0),
+                        torch.cat([self.accumulated_batch[1], target_data], dim=0)
+                    )
+                    self.accumulated_count += input_data.size(0)
+            else:
+                # Binary mode: use only input sequences
+                data = batch[0]["input_sequences"]
+                
+                if MEMORY_DIAGNOSTICS:
+                    print(f"Got binary batch from DALI: {data.shape}")
+                
+                if data.dtype != torch.float16:
+                    data = data.to(torch.float16)
+                
+                # Accumulate the batch
+                if self.accumulated_batch is None:
+                    self.accumulated_batch = data
+                    self.accumulated_count = data.size(0)
+                else:
+                    self.accumulated_batch = torch.cat([self.accumulated_batch, data], dim=0)
+                    self.accumulated_count += data.size(0)
+            
+            # If we have enough data, return a batch
+            if self.accumulated_count >= self.batch_size:
+                if self.use_probabilities:
+                    # Return separate input and target batches
+                    input_result = self.accumulated_batch[0][:self.batch_size]
+                    target_result = self.accumulated_batch[1][:self.batch_size]
+                    result = (input_result, target_result)
+                    
+                    # Keep any remaining samples
+                    if self.accumulated_count > self.batch_size:
+                        self.accumulated_batch = (
+                            self.accumulated_batch[0][self.batch_size:],
+                            self.accumulated_batch[1][self.batch_size:]
+                        )
+                        self.accumulated_count -= self.batch_size
+                    else:
+                        self.accumulated_batch = None
+                        self.accumulated_count = 0
+                else:
+                    # Binary mode: return single tensor
+                    result = self.accumulated_batch[:self.batch_size]
+                    if self.accumulated_count > self.batch_size:
+                        self.accumulated_batch = self.accumulated_batch[self.batch_size:]
+                        self.accumulated_count -= self.batch_size
+                    else:
+                        self.accumulated_batch = None
+                        self.accumulated_count = 0
+                    
+                if MEMORY_DIAGNOSTICS:
+                    if self.use_probabilities:
+                        print(f"Returning probability batch: input={result[0].shape}, target={result[1].shape}")
+                    else:
+                        print(f"Returning binary batch: {result.shape}")
+                    print(f"Batch fetch took {time.time() - start_time:.2f}s")
+                    print_memory_stats("After returning batch:")
+                
+                # Update z-start information for the current batch
+                self._update_z_starts_for_current_batch()
+                
+                return result
+            
+            # Otherwise, try to get more data from the next iterator
+            self.current_iterator = (self.current_iterator + 1) % len(self.iterators)
+            self.current_iter = iter(self.iterators[self.current_iterator])
+            return self.__next__()
+            
+        except StopIteration:
+            # Try the next iterator if available
+            self.current_iterator = (self.current_iterator + 1) % len(self.iterators)
+            
+            # If we've gone through all iterators and still don't have a full batch
+            if self.current_iterator == 0:
+                if self.accumulated_batch is not None and self.accumulated_count > 0:
+                    # Return a partial batch if we have any data
+                    if self.use_probabilities:
+                        result = self.accumulated_batch  # Tuple of (input, target)
+                    else:
+                        result = self.accumulated_batch  # Single tensor
+                    
+                    self.accumulated_batch = None
+                    self.accumulated_count = 0
+                    
+                    if MEMORY_DIAGNOSTICS:
+                        if self.use_probabilities:
+                            print(f"Returning partial probability batch: input={result[0].shape}, target={result[1].shape}")
+                        else:
+                            print(f"Returning partial binary batch: {result.shape}")
+                        print(f"Batch fetch took {time.time() - start_time:.2f}s")
+                        print_memory_stats("After returning partial batch:")
+                    
+                    # Update z-start information for the current batch
+                    self._update_z_starts_for_current_batch()
+                    
+                    return result
+                else:
+                    # Reset for next epoch and raise StopIteration
+                    self.reset()
+                    raise StopIteration
+            
+            # Try the next iterator
+            self.current_iter = iter(self.iterators[self.current_iterator])
+            return self.__next__()
+
+    def reset(self):
+        """Reset all iterators, handling tuple accumulated batch for probability mode."""
+        for iterator in self.iterators:
+            iterator.reset()
+        self.accumulated_batch = None
+        self.accumulated_count = 0
+        self.current_batch_z_starts = []
+        
+        if MEMORY_DIAGNOSTICS:
+            # Force garbage collection to free up memory
+            gc.collect()
+            torch.cuda.empty_cache()
+            print_memory_stats("After probability reset:")
 
 
 class SubjectFilteredProbabilityDALIBrainDataLoader(ProbabilityDALIBrainDataLoader):

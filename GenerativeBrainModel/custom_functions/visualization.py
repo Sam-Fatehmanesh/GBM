@@ -390,22 +390,39 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
     data_loader.reset()
     batch = next(iter(data_loader))
     
+    # Handle both probability mode (tuple) and binary mode (single tensor)
+    if isinstance(batch, tuple):
+        # Probability mode: batch is (input_data, target_data)
+        input_data, target_data = batch
+        # Use input_data for model input (always binary)
+        batch_for_model = input_data
+        # Use input_data for visualization (binary inputs)
+        batch_viz = input_data
+        is_probability_mode = True
+        tqdm.write("Using probability data loader - feeding binary inputs to model")
+    else:
+        # Binary mode: batch is single tensor
+        batch_for_model = batch
+        batch_viz = batch
+        is_probability_mode = False
+        tqdm.write("Using binary data loader")
+    
     # Ensure batch is on CUDA
-    if batch.device.type != 'cuda':
-        batch = batch.cuda()
+    if batch_for_model.device.type != 'cuda':
+        batch_for_model = batch_for_model.cuda()
+    if batch_viz.device.type != 'cuda':
+        batch_viz = batch_viz.cuda()
     
     # Convert uint8 to float32 for visualization if needed
-    if batch.dtype == torch.uint8:
-        batch_viz = batch.float()
-    else:
-        batch_viz = batch
+    if batch_viz.dtype == torch.uint8:
+        batch_viz = batch_viz.float()
     
-    # Generate predictions
+    # Generate predictions using binary input data
     model.eval()
     with torch.no_grad():
         with autocast():
-            # Get probability predictions from the model
-            predictions = model.get_predictions(batch)
+            # Get probability predictions from the model using binary inputs
+            predictions = model.get_predictions(batch_for_model)
             
             # Generate sampled binary predictions from the predicted probability distributions
             sampled_predictions = (predictions > 0.5).float()
@@ -414,7 +431,7 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
     if print_batch_metrics:
         with torch.no_grad():
             preds = (sampled_predictions > 0.5).bool()
-            targets = (batch[:, 1:] > 0.5).bool()
+            targets = (batch_for_model[:, 1:] > 0.5).bool()
             
             # Calculate TP, FP, FN for this batch
             tp = (preds & targets).sum().item()
@@ -430,17 +447,14 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
     
     # Convert predictions to numpy for visualization
     # We'll choose multiple sequences from the batch for visualization (up to 100)
-    num_sequences = min(100, batch.size(0))
-    rand_indices = torch.randperm(batch.size(0))[:num_sequences]
+    num_sequences = min(100, batch_viz.size(0))
+    rand_indices = torch.randperm(batch_viz.size(0))[:num_sequences]
     
-    # Detect if we're using probability data by checking if the batch contains continuous values
-    # between 0 and 1 (rather than just binary 0/1 values)
+    # For visualization, always use binary data (inputs are always binary in both modes)
     batch_np = batch_viz[rand_indices].cpu().numpy()
-    unique_values = np.unique(batch_np)
-    is_probability_data = len(unique_values) > 10 and np.any((unique_values > 0) & (unique_values < 1))
     
-    if is_probability_data:
-        tqdm.write("Detected probability data - left panels will show binary spikes (thresholded at 0.5)")
+    # Always threshold left panels for clarity (inputs should be binary anyway)
+    tqdm.write("Creating video with binary inputs and probability predictions")
     
     # Create color-coded comparison visualization
     create_color_coded_comparison_video(
@@ -450,7 +464,7 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
         output_path=output_path,
         num_frames=num_frames,
         fps=1,
-        threshold_left_panels=is_probability_data
+        threshold_left_panels=True  # Always threshold for consistency
     )
 
 

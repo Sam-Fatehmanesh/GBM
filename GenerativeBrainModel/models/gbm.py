@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from GenerativeBrainModel.models.mambacore import StackedMamba
 from GenerativeBrainModel.models.simple_autoencoder import SimpleAutoencoder
-
+import pdb
 class GBM(nn.Module):
     def __init__(self, mamba_layers=1, mamba_dim=1024, mamba_state_multiplier=1, pretrained_ae_path="trained_simpleAE/checkpoints/best_model.pt"):
         """Generative Brain Model combining pretrained autoencoder with Mamba for sequential prediction.
@@ -99,9 +99,26 @@ class GBM(nn.Module):
         Returns:
             loss: Scalar loss value
         """
+        # Calculate the ratio of negative to positive targets for balanced weighting
+        target_clamped = torch.clamp(target, min=0.0, max=1.0)
+        num_positives = target_clamped.sum()
+        num_negatives = target_clamped.numel() - num_positives
         
-        return F.binary_cross_entropy_with_logits(pred, torch.clamp(target, min=0.0, max=1.0), reduction='mean')
-            
+        # Calculate positive weight as ratio of negatives to positives
+        # If equal numbers, weight will be 1. If 100 negatives per positive, weight will be 100
+        if num_positives > 0:
+            pos_weight_value = 5
+        else:
+            pos_weight_value = 1.0
+        
+        # Create position-specific weight tensor
+        pos_weight = torch.ones(pred.shape[1], pred.shape[2], pred.shape[3]).to(pred.device) * pos_weight_value
+        
+        # Set the z-depth indicator region [:,:64,-1] to 100x the calculated positive weight
+        pos_weight[:, :64, -1] = pos_weight_value * 10
+        
+        return F.binary_cross_entropy_with_logits(pred, target_clamped, reduction='mean', pos_weight=pos_weight)
+   
     def get_predictions(self, x, temperature=1.0):
         """Forward pass returning the sigmoid of logits for actual probabilities.
         Useful for inference when probabilities are needed rather than logits.
@@ -138,25 +155,45 @@ class GBM(nn.Module):
         clamped_probs = torch.clamp(x, min=0.0, max=1.0)
         return torch.bernoulli(clamped_probs)
 
-    def generate_autoregressive_brain(self, init_x, num_steps=30):
+    def generate_autoregressive_brain(self, init_x, num_steps=30, measure_z_depth=False):
         """Generate a brain sequence from an initial grid sequence using autoregressive sampling.
         
         Args:
             init_x: Tensor of shape (batch_size, seq_len, 256, 128) containing sequence of z plane spike probabilities
             num_steps: Number of steps to generate
         Returns:
-            samples: Tensor of shape (batch_size, seq_len, 256, 128) containing
-                     generated samples
+            samples: Tensor of shape (batch_size, seq_len, 256, 128) containing generated samples
+            probabilities: Tensor of shape (batch_size, num_steps, 256, 128) containing predicted probabilities
         """
+
+        # if measure_z_depth:
+        #     # First look at init_x and check where the first 1.0 valued pixel is for the most right hand side of the grid for that batch, 
+        #     # there may be multiple 1.0 values on the right hand side of the grid for that batch, so we need to find the first one
+        #     # we can do this by finding the first 1.0 valued pixel in the last column of the grid for that batch
+        #     right_most_column = init_x[:, :, :, -1]
+        #     init_x_seq_len = init_x.shape[1]
+        #     batch_z_start_index  = torch.argmax(right_most_column, dim=3)
+            
+
+        #     # Now it checks for the what is the next z frame for which these indicies are 1.0 valued and checks for each sample in the batch for how many steps until it repeated
+
+        #     for i in range(1,init_x_seq_len):
+        #         cycled_seq_bool = torch.argmax(right_most_column[:, i, :, -1]) == batch_z_start_index
+
+
         x = init_x
+        probabilities = []
         for i in range(num_steps):
-            # Get logits for the next frame
-            logits = self.forward(x)[:, -1, :, :]
-            # Convert logits to probabilities with sigmoid and ensure valid range
-            probs = torch.clamp(torch.sigmoid(logits), min=0.0, max=1.0)
+            probs = self.get_predictions(x, temperature=0.0)[:, -1, :, :]
+            # Store probabilities
+            probabilities.append(probs)
+            # z depth prediciton made to be confident, sets top left to 64 down to be thresholded
+            #pdb.set_trace()
+            #probs[:,:,:,:64] = (probs[:,:,:,:64] > 0.5).float()
             # Sample binary values
-            prediction = torch.bernoulli(probs).unsqueeze(1)
+            prediction = self.sample_binary_predictions(probs).unsqueeze(1)
             # Concatenate with existing sequence
             x = torch.cat((x, prediction), dim=1)
-        return x
-          
+        # Stack probabilities into tensor
+        probabilities = torch.stack(probabilities, dim=1)
+        return x, probabilities

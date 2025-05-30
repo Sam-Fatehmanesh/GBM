@@ -120,3 +120,6 @@ __MACOSX
 *.pkl.lzma
 *.pkl.tar
 *.pkl.tar.gz
+
+
+old_scripts

@@ -32,9 +32,10 @@ class TwoPhaseTrainer:
         exp_root: str,
         pretrain_params: Dict[str, Any],
         finetune_params: Dict[str, Any],
-        target_subject: str,
+        target_subject: Optional[str],
         skip_pretrain: bool = False,
-        pretrain_checkpoint: Optional[str] = None
+        pretrain_checkpoint: Optional[str] = None,
+        pretrain_only_mode: bool = False
     ):
         """Initialize the two-phase trainer.
         
@@ -42,9 +43,10 @@ class TwoPhaseTrainer:
             exp_root: Root experiment directory
             pretrain_params: Parameters for pretraining phase
             finetune_params: Parameters for finetuning phase
-            target_subject: Name of target subject for finetuning
+            target_subject: Name of target subject for finetuning (None for pretrain-only mode)
             skip_pretrain: Whether to skip pretraining phase
             pretrain_checkpoint: Path to existing pretrain checkpoint
+            pretrain_only_mode: If True, only run pretraining phase on all subjects
         """
         self.exp_root = exp_root
         self.pretrain_params = pretrain_params
@@ -52,6 +54,7 @@ class TwoPhaseTrainer:
         self.target_subject = target_subject
         self.skip_pretrain = skip_pretrain
         self.pretrain_checkpoint = pretrain_checkpoint
+        self.pretrain_only_mode = pretrain_only_mode
         
         # Initialize results
         self.results = {
@@ -67,31 +70,44 @@ class TwoPhaseTrainer:
         """
         # Phase 1: Pretraining
         if not self.skip_pretrain and self.pretrain_checkpoint is None:
-            tqdm.write(f"Running pretraining phase on all subjects except '{self.target_subject}'...")
-            
-            self.results['pretrain_checkpoint'] = self._run_phase(
-                phase_name="pretrain",
-                params=self.pretrain_params,
-                subjects_exclude=[self.target_subject],
-                subjects_include=None,
-                init_checkpoint=None
-            )
+            if self.pretrain_only_mode:
+                tqdm.write(f"Running pretraining phase on ALL subjects (pretrain-only mode)...")
+                self.results['pretrain_checkpoint'] = self._run_phase(
+                    phase_name="pretrain",
+                    params=self.pretrain_params,
+                    subjects_exclude=None,  # Don't exclude any subjects
+                    subjects_include=None,
+                    init_checkpoint=None
+                )
+            else:
+                tqdm.write(f"Running pretraining phase on all subjects except '{self.target_subject}'...")
+                self.results['pretrain_checkpoint'] = self._run_phase(
+                    phase_name="pretrain",
+                    params=self.pretrain_params,
+                    subjects_exclude=[self.target_subject],
+                    subjects_include=None,
+                    init_checkpoint=None
+                )
         elif self.pretrain_checkpoint:
             tqdm.write(f"Skipping pretraining, using provided checkpoint: {self.pretrain_checkpoint}")
             self.results['pretrain_checkpoint'] = self.pretrain_checkpoint
         else:
             tqdm.write(f"Skipping pretraining phase as requested.")
             
-        # Phase 2: Finetuning
-        tqdm.write(f"Running finetuning phase on target subject '{self.target_subject}'...")
-        
-        self.results['finetune_checkpoint'] = self._run_phase(
-            phase_name="finetune",
-            params=self.finetune_params,
-            subjects_include=[self.target_subject],
-            subjects_exclude=None,
-            init_checkpoint=self.results['pretrain_checkpoint']
-        )
+        # Phase 2: Finetuning (skip if in pretrain-only mode)
+        if not self.pretrain_only_mode:
+            tqdm.write(f"Running finetuning phase on target subject '{self.target_subject}'...")
+            
+            self.results['finetune_checkpoint'] = self._run_phase(
+                phase_name="finetune",
+                params=self.finetune_params,
+                subjects_include=[self.target_subject],
+                subjects_exclude=None,
+                init_checkpoint=self.results['pretrain_checkpoint']
+            )
+        else:
+            tqdm.write(f"Skipping finetuning phase (pretrain-only mode)")
+            self.results['finetune_checkpoint'] = None
         
         return self.results
     
@@ -166,8 +182,8 @@ class TwoPhaseTrainer:
             phase_dir, phase_name, params
         )
         
-        # Save test data and predictions if this is the finetuning phase
-        if phase_name == "finetune":
+        # Save test data and predictions if this is the finetuning phase OR pretrain-only mode
+        if phase_name == "finetune" or (phase_name == "pretrain" and self.pretrain_only_mode):
             tqdm.write("Saving test data and predictions for analysis...")
             save_data_dir = os.path.join(phase_dir, 'test_data')
             os.makedirs(save_data_dir, exist_ok=True)

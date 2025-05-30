@@ -70,8 +70,11 @@ class SubjectFilteredFastDALIBrainDataLoader(FastDALIBrainDataLoader):
         # Filter subjects based on include/exclude lists
         if include_subjects is not None:
             filtered_subjects = [s for s in all_subjects if s in include_subjects]
-        else:
+        elif exclude_subjects is not None:
             filtered_subjects = [s for s in all_subjects if s not in exclude_subjects]
+        else:
+            # If both include_subjects and exclude_subjects are None, include all subjects
+            filtered_subjects = all_subjects
         
         # If no subjects remain after filtering, raise an error
         if not filtered_subjects:

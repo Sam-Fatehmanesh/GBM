@@ -76,14 +76,26 @@ def track_metrics_during_validation(model, data_loader, device):
                 # Get batch with automatic GPU transfer
                 batch = next(test_iter)
                 
-                # Ensure batch is on GPU
-                if batch.device.type != 'cuda':
-                    batch = batch.cuda(non_blocking=True)
+                # Handle both probability mode (tuple) and binary mode (single tensor)
+                if isinstance(batch, tuple):
+                    # Probability mode: batch is (input_data, target_data)
+                    input_data, target_data = batch
+                    # Use input_data for model input (always binary)
+                    batch_for_model = input_data
+                    # Ensure input is on GPU
+                    if batch_for_model.device.type != 'cuda':
+                        batch_for_model = batch_for_model.cuda(non_blocking=True)
+                else:
+                    # Binary mode: batch is single tensor
+                    batch_for_model = batch
+                    # Ensure batch is on GPU
+                    if batch_for_model.device.type != 'cuda':
+                        batch_for_model = batch_for_model.cuda(non_blocking=True)
                 
-                # Get logits from model (no sigmoid)
+                # Get logits from model (no sigmoid) using binary inputs
                 with autocast():
-                    predictions = model(batch)
-                    batch_loss = model.compute_loss(predictions, batch[:, 1:])
+                    predictions = model(batch_for_model)
+                    batch_loss = model.compute_loss(predictions, batch_for_model[:, 1:])
                 
                 total_loss += batch_loss.item()
                 batch_count += 1
@@ -96,8 +108,8 @@ def track_metrics_during_validation(model, data_loader, device):
                 preds = (probs > 0.5)
                 del probs
                 # Keep targets as bool as well - use 0.5 threshold for consistency with predictions
-                targets = (batch[:, 1:] > 0.5).bool()
-                del batch
+                targets = (batch_for_model[:, 1:] > 0.5).bool()
+                del batch, batch_for_model
                 torch.cuda.empty_cache()
                 
                 # Use boolean operations for memory efficiency
@@ -145,7 +157,7 @@ def calculate_batch_metrics(model, batch, device):
     
     Args:
         model: The model to evaluate
-        batch: Single batch of data
+        batch: Single batch of data (tensor or tuple)
         device: Device to run evaluation on
         
     Returns:
@@ -153,19 +165,29 @@ def calculate_batch_metrics(model, batch, device):
     """
     model.eval()
     
+    # Handle both probability mode (tuple) and binary mode (single tensor)
+    if isinstance(batch, tuple):
+        # Probability mode: batch is (input_data, target_data)
+        input_data, target_data = batch
+        # Use input_data for model input (always binary)
+        batch_for_model = input_data
+    else:
+        # Binary mode: batch is single tensor
+        batch_for_model = batch
+    
     # Ensure batch is on device
-    if batch.device != device:
-        batch = batch.to(device)
+    if batch_for_model.device != device:
+        batch_for_model = batch_for_model.to(device)
     
     with torch.no_grad():
-        # Get predictions
-        predictions = model(batch)
-        loss = model.compute_loss(predictions, batch[:, 1:])
+        # Get predictions using binary inputs
+        predictions = model(batch_for_model)
+        loss = model.compute_loss(predictions, batch_for_model[:, 1:])
         
         # Convert to binary predictions
         probs = torch.sigmoid(predictions)
         preds = (probs > 0.5).bool()
-        targets = (batch[:, 1:] > 0.5).bool()
+        targets = (batch_for_model[:, 1:] > 0.5).bool()
         
         # Calculate metrics
         metrics = calculate_binary_metrics(preds, targets)

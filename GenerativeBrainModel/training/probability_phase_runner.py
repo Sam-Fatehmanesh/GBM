@@ -173,15 +173,33 @@ class ProbabilityTwoPhaseTrainer(TwoPhaseTrainer):
                 try:
                     # Get batch
                     batch = next(train_iter)
-                    if batch.device.type != 'cuda':
-                        batch = batch.cuda(non_blocking=True)
+                    
+                    # Extract input and target data based on training mode
+                    if self.use_probabilities:
+                        # Probability mode: batch is tuple of (input_data, target_data)
+                        input_data, target_data = batch
+                        if input_data.device.type != 'cuda':
+                            input_data = input_data.cuda(non_blocking=True)
+                        if target_data.device.type != 'cuda':
+                            target_data = target_data.cuda(non_blocking=True)
+                        # Apply temporal shift for next-frame prediction
+                        input_sequences = input_data  # Input: frames 0 to T-1
+                        target_sequences = target_data[:, 1:]  # Target: frames 1 to T
+                    else:
+                        # Binary mode: batch is single tensor
+                        if batch.device.type != 'cuda':
+                            batch = batch.cuda(non_blocking=True)
+                        input_data = batch
+                        target_data = batch[:, 1:]
+                        input_sequences = input_data
+                        target_sequences = target_data
                     
                     # Forward pass
                     optimizer.zero_grad()
                     
                     with autocast():
-                        predictions = model(batch)
-                        loss = model.compute_loss(predictions, batch[:, 1:])
+                        predictions = model(input_sequences)
+                        loss = model.compute_loss(predictions, target_sequences)
                     
                     # Backward pass
                     scaler.scale(loss).backward()
