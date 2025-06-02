@@ -170,13 +170,48 @@ async def get_regions():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error loading regions: {e}")
 
+@router.get("/regions/{region_name}/mask_json")
+async def get_region_mask_json(region_name: str):
+    """
+    Return 3D coordinates for a specific brain region mask.
+    """
+    try:
+        # Use the global mask loader if available
+        global mask_loader_global, baseline_Z_global
+        if not mask_loader_global:
+            raise HTTPException(status_code=500, detail="Mask loader not available")
+        
+        if baseline_Z_global is None:
+            raise HTTPException(status_code=500, detail="Z dimension not available")
+        
+        # Get the region mask
+        region_mask = mask_loader_global.get_mask(region_name).cpu().numpy().astype(bool)
+        Z, H, W = region_mask.shape
+        
+        # Find all voxel coordinates where the region is active
+        coords = np.argwhere(region_mask)  # returns [z, y, x] coordinates
+        coords_list = coords.tolist()
+        
+        return JSONResponse({
+            'region_name': region_name,
+            'coords': coords_list,  # [[z, y, x], ...]
+            'Z': Z,
+            'H': H, 
+            'W': W
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error loading region {region_name}: {str(e)}")
 
 @router.post("/simulate")
 async def simulate_optogenetics(request: SimulateRequest):
     """
     Submits an optogenetic simulation job (baseline modification).
     The base experiment path is taken from EXPERIMENTS_ROOT in .env.
+    Uses the global preloaded mask loader to avoid reloading masks.
     """
+    global mask_loader_global
+    
     exp_path_str = None
     try:
         exp_path_str = settings.experiments_root
@@ -189,18 +224,22 @@ async def simulate_optogenetics(request: SimulateRequest):
     if not exp_path.exists() or not exp_path.is_dir():
         raise HTTPException(status_code=400, detail=f"Configured EXPERIMENTS_ROOT is not a valid directory: {exp_path_str}")
 
+    # Check if mask loader is available
+    if mask_loader_global is None:
+        raise HTTPException(status_code=500, detail="Mask loader not preloaded. Server may still be starting up.")
+
     try:
         job_id = job_manager.submit(
             run_simulation,
             regions=request.selected_regions,
             fraction=request.activation_fraction,
             sample_idx=0,
-            num_steps=request.prediction_steps
+            num_steps=request.prediction_steps,
+            mask_loader=mask_loader_global
         )
         return {"job_id": job_id, "message": "Simulation job submitted."}
     except Exception as e:
-        print(f"Error submitting job: {e}") # Log to server console
-        raise HTTPException(status_code=500, detail=f"Failed to submit simulation job: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to submit simulation job: {e}")
 
 
 @router.get("/status/{job_id}")
@@ -414,6 +453,75 @@ async def get_baseline_mask_json():
             return JSONResponse({'coords': coords_list, 'Z': Z, 'zStart': zStart})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/results/{job_id}/predicted_sequence_json")
+async def get_predicted_sequence_json(job_id: str):
+    """
+    Return predicted brain activity coordinates for time-based animation.
+    Similar to baseline_mask_json but for predicted probabilities.
+    """
+    try:
+        job_res = job_manager.result(job_id)
+        if not job_res or not isinstance(job_res, dict):
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found or not completed")
+        
+        predictions_dir = Path(job_res['predictions_dir'])
+        baseline_dir = Path(job_res['baseline_dir'])
+        
+        # Load predicted probabilities
+        probs_file = predictions_dir / 'predicted_probabilities.npy'
+        if not probs_file.exists():
+            raise HTTPException(status_code=404, detail="predicted_probabilities.npy not found")
+        
+        # Load sequence z-start for alignment
+        seq_start_file = baseline_dir / 'sequence_z_start.npy'
+        if not seq_start_file.exists():
+            raise HTTPException(status_code=404, detail="sequence_z_start.npy not found")
+        
+        # Use global Z from startup
+        global baseline_Z_global, baseline_zStart_global
+        if baseline_Z_global is None:
+            raise HTTPException(status_code=500, detail="Z dimension not available")
+        
+        Z = baseline_Z_global
+        zStart = int(np.load(seq_start_file))
+        
+        # Load predicted probabilities (shape: num_steps, H, W)
+        probabilities = np.load(probs_file)
+        num_steps, H, W = probabilities.shape
+        
+        # Convert probabilities to boolean mask (threshold at 0.5 or use probability directly)
+        # For visualization, we'll use a threshold to show active regions
+        threshold = 0.5
+        mask = probabilities > threshold
+        
+        # Convert to coordinate list like baseline data
+        coords = []
+        for t in range(num_steps):
+            active_pixels = np.argwhere(mask[t])  # returns [y, x] coordinates
+            for y, x in active_pixels:
+                coords.append([t, int(y), int(x)])  # [slice_idx, y, x] format
+        
+        return JSONResponse({
+            'coords': coords, 
+            'Z': Z, 
+            'zStart': zStart
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/results/{job_id}/heatmap_top12.png")
+async def get_heatmap_top12(job_id: str):
+    """Fetch the top 12 regions heatmap PNG for a given job."""
+    job_res = job_manager.result(job_id)
+    if not job_res or not isinstance(job_res, dict):
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found or not completed")
+    analysis_dir = Path(job_res['predictions_dir']) / 'analysis'
+    file_path = analysis_dir / 'heatmap_top12.png'
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="heatmap_top12.png not found")
+    return FileResponse(str(file_path), media_type='image/png', filename='heatmap_top12.png')
 
 app.include_router(router)
 

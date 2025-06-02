@@ -17,7 +17,8 @@ def analyze_region_differences(
     Loads activation_mask and predicted_probabilities, aggregates by region, and saves:
       - summary.json
       - summary.csv
-      - heatmap.png
+      - heatmap.png (all regions)
+      - heatmap_top12.png (top 12 regions by change magnitude)
 
     Returns the output directory path.
     """
@@ -68,11 +69,14 @@ def analyze_region_differences(
     # Compute per-volume metrics for each region
     summary = {}
     ratios_matrix = []
+    region_magnitudes = []  # For finding top 12 regions
+    
     for region in regions_to_use:
         region_mask3d = mask_loader.get_mask(region).cpu().numpy().astype(bool)
         baseline_count = int(np.sum(activation_mask & region_mask3d))
         region_ratios = []
         region_metrics = []
+        
         for vol_idx in range(volumes_count):
             start = vol_idx * Z
             end = min(start + Z, num_steps)
@@ -94,8 +98,13 @@ def analyze_region_differences(
                 'predicted_sum': pred_sum,
                 'ratio': ratio
             })
+        
         summary[region] = region_metrics
         ratios_matrix.append(region_ratios)
+        
+        # Calculate magnitude of change for this region (max absolute change across volumes)
+        magnitude = max(abs(r) for r in region_ratios) if region_ratios else 0.0
+        region_magnitudes.append((region, magnitude))
 
     # Save summary JSON (per-volume metrics)
     json_path = os.path.join(output_dir, 'summary.json')
@@ -111,9 +120,11 @@ def analyze_region_differences(
             for m in summary[region]:
                 writer.writerow([region, m['volume_idx'], m['baseline_count'], m['predicted_sum'], m['ratio']])
 
-    # Generate heatmap of per-volume ratios (regions x volumes)
+    # Generate full heatmap of per-volume ratios (all regions x volumes)
     data_matrix = np.array(ratios_matrix)
     n_regions, n_volumes = data_matrix.shape
+    
+    # Full heatmap
     fig, ax = plt.subplots(figsize=(max(12, n_volumes * 0.5), max(8, n_regions * 0.3)))
     im = ax.imshow(data_matrix, aspect='auto', cmap='viridis', vmin=0, vmax=np.nanmax(data_matrix))
     # Set ticks for volumes
@@ -122,7 +133,7 @@ def analyze_region_differences(
     # Set ticks for regions
     ax.set_yticks(np.arange(n_regions))
     ax.set_yticklabels(regions_to_use)
-    ax.set_title('Predicted Activation Ratio per Region and Volume')
+    ax.set_title('Predicted Activation Ratio per Region and Volume (All Regions)')
     # Add minor gridlines between cells
     ax.set_xticks(np.arange(n_volumes + 1) - 0.5, minor=True)
     ax.set_yticks(np.arange(n_regions + 1) - 0.5, minor=True)
@@ -134,5 +145,39 @@ def analyze_region_differences(
     heatmap_path = os.path.join(output_dir, 'heatmap.png')
     plt.savefig(heatmap_path)
     plt.close(fig)
+
+    # Generate top 12 regions heatmap
+    # Sort regions by magnitude and take top 12
+    region_magnitudes.sort(key=lambda x: x[1], reverse=True)
+    top_12_regions = [region for region, magnitude in region_magnitudes[:12]]
+    
+    if len(top_12_regions) > 0:
+        # Get indices of top 12 regions in the original list
+        top_12_indices = [regions_to_use.index(region) for region in top_12_regions if region in regions_to_use]
+        
+        # Extract data for top 12 regions
+        top_12_data = data_matrix[top_12_indices, :]
+        
+        # Generate top 12 heatmap
+        fig, ax = plt.subplots(figsize=(max(12, n_volumes * 0.5), max(6, len(top_12_regions) * 0.4)))
+        im = ax.imshow(top_12_data, aspect='auto', cmap='viridis', vmin=0, vmax=np.nanmax(data_matrix))
+        # Set ticks for volumes
+        ax.set_xticks(np.arange(n_volumes))
+        ax.set_xticklabels([f'V{i+1}' for i in range(n_volumes)], rotation=90)
+        # Set ticks for top 12 regions
+        ax.set_yticks(np.arange(len(top_12_regions)))
+        ax.set_yticklabels(top_12_regions)
+        ax.set_title('Predicted Activation Ratio per Region and Volume (Top 12 Regions by Change Magnitude)')
+        # Add minor gridlines between cells
+        ax.set_xticks(np.arange(n_volumes + 1) - 0.5, minor=True)
+        ax.set_yticks(np.arange(len(top_12_regions) + 1) - 0.5, minor=True)
+        ax.grid(which='minor', color='white', linestyle='-', linewidth=0.5)
+        ax.grid(False)
+        cbar = fig.colorbar(im, ax=ax, orientation='vertical')
+        cbar.set_label('Predicted Sum / Baseline Count')
+        plt.tight_layout()
+        heatmap_top12_path = os.path.join(output_dir, 'heatmap_top12.png')
+        plt.savefig(heatmap_top12_path)
+        plt.close(fig)
 
     return output_dir 

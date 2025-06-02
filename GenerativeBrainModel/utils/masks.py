@@ -101,6 +101,7 @@ class ZebrafishMaskLoader:
             
             # Downsample if needed
             if mask_tensor.shape != self.target_shape:
+                
                 mask_tensor = self._downsample_mask(mask_tensor)
             
             # Convert to target dtype and move to device
@@ -127,6 +128,10 @@ class ZebrafishMaskLoader:
         Returns:
             Downsampled mask tensor of target shape
         """
+
+        # Gets rid of the first 20 last 20 along x axis and gets rid of the first and last 30 along y axis
+        mask_tensor = mask_tensor[:, 100:-100, 20:-20]
+        
         # Add batch dimension for interpolation: (1, 1, Z, Y, X)
         mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
         

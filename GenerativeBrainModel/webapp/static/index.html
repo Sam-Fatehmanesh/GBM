@@ -2,52 +2,1023 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Optogenetic Brain Simulation</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Neural Optogenetic Simulation Platform</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    #regions { width: 300px; height: 200px; }
-    table { border-collapse: collapse; margin-top: 20px; }
-    th, td { border: 1px solid #ccc; padding: 8px; }
-    #heatmap { max-width: 800px; margin-top: 20px; }
-    #results { margin-top: 20px; }
-    #viewer { width: 800px; height: 600px; border: 1px solid #ccc; margin-top:20px; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #000000;
+      color: #ffffff;
+      overflow: hidden;
+      height: 100vh;
+    }
+    
+    /* Fullscreen 3D Background */
+    #viewer {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: 1;
+      background: #000000;
+    }
+    
+    /* Glass morphism overlay */
+    .glass-panel {
+      background: rgba(255, 255, 255, 0.05);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 16px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    }
+    
+    /* Left Control Panel */
+    .control-panel {
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      width: 350px;
+      max-height: calc(100vh - 40px);
+      z-index: 100;
+      padding: 24px;
+      overflow-y: auto;
+      transition: all 0.3s ease;
+    }
+    
+    .control-panel::-webkit-scrollbar {
+      width: 6px;
+    }
+    
+    .control-panel::-webkit-scrollbar-track {
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 3px;
+    }
+    
+    .control-panel::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.3);
+      border-radius: 3px;
+    }
+    
+    .panel-header {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+    
+    .panel-title {
+      font-size: 24px;
+      font-weight: 600;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 8px;
+    }
+    
+    .panel-subtitle {
+      font-size: 14px;
+      color: rgba(255, 255, 255, 0.7);
+      font-weight: 300;
+    }
+    
+    .form-group {
+      margin-bottom: 24px;
+    }
+    
+    .form-label {
+      display: block;
+      font-size: 14px;
+      font-weight: 500;
+      color: rgba(255, 255, 255, 0.9);
+      margin-bottom: 8px;
+    }
+    
+    .form-input {
+      width: 100%;
+      padding: 12px 16px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+      color: #ffffff;
+      font-size: 14px;
+      transition: all 0.3s ease;
+    }
+    
+    .form-input:focus {
+      outline: none;
+      border-color: #667eea;
+      background: rgba(255, 255, 255, 0.15);
+      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+    }
+    
+    /* Region Checkboxes */
+    .regions-container {
+      max-height: 200px;
+      overflow-y: auto;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+    }
+    
+    .regions-container::-webkit-scrollbar {
+      width: 6px;
+    }
+    
+    .regions-container::-webkit-scrollbar-track {
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 3px;
+    }
+    
+    .regions-container::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.3);
+      border-radius: 3px;
+    }
+    
+    .region-checkbox {
+      display: flex;
+      align-items: center;
+      margin-bottom: 8px;
+      cursor: pointer;
+    }
+    
+    .region-checkbox input[type="checkbox"] {
+      margin-right: 8px;
+      transform: scale(1.2);
+    }
+    
+    .region-checkbox label {
+      font-size: 13px;
+      color: rgba(255, 255, 255, 0.9);
+      cursor: pointer;
+      user-select: none;
+    }
+    
+    .simulate-btn {
+      width: 100%;
+      padding: 16px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border: none;
+      border-radius: 12px;
+      color: #ffffff;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    
+    .simulate-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
+    }
+    
+    .simulate-btn:active {
+      transform: translateY(0);
+    }
+    
+    .status-display {
+      margin-top: 16px;
+      padding: 12px 16px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 8px;
+      font-size: 14px;
+      text-align: center;
+      min-height: 20px;
+      color: rgba(255, 255, 255, 0.8);
+    }
+    
+    /* Animation Controls */
+    .animation-controls {
+      margin-top: 24px;
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 12px;
+    }
+    
+    .animation-title {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 12px;
+      color: #ffffff;
+    }
+    
+    .animation-checkbox {
+      display: flex;
+      align-items: center;
+      margin-bottom: 8px;
+      cursor: pointer;
+    }
+    
+    .animation-checkbox input[type="checkbox"] {
+      margin-right: 8px;
+      transform: scale(1.2);
+    }
+    
+    .animation-checkbox label {
+      font-size: 14px;
+      color: rgba(255, 255, 255, 0.9);
+      cursor: pointer;
+      user-select: none;
+    }
+    
+    /* Time Controls */
+    .time-controls {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    
+    .time-controls-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    
+    .time-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: rgba(255, 255, 255, 0.9);
+    }
+    
+    .pause-btn {
+      padding: 6px 12px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 6px;
+      color: #ffffff;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    
+    .pause-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    
+    .time-progress {
+      width: 100%;
+      margin-bottom: 8px;
+    }
+    
+    .time-slider {
+      width: 100%;
+      height: 6px;
+      border-radius: 3px;
+      background: rgba(255, 255, 255, 0.2);
+      outline: none;
+      -webkit-appearance: none;
+      appearance: none;
+    }
+    
+    .time-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #667eea;
+      cursor: pointer;
+      border: 2px solid #ffffff;
+    }
+    
+    .time-slider::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #667eea;
+      cursor: pointer;
+      border: 2px solid #ffffff;
+    }
+    
+    .time-info {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.7);
+    }
+    
+    /* Spatial Filtering */
+    .spatial-controls {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    
+    .spatial-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: rgba(255, 255, 255, 0.9);
+      margin-bottom: 12px;
+    }
+    
+    .axis-control {
+      margin-bottom: 16px;
+    }
+    
+    .axis-label {
+      font-size: 13px;
+      color: rgba(255, 255, 255, 0.8);
+      margin-bottom: 8px;
+      display: block;
+    }
+    
+    .range-inputs {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    
+    .range-input {
+      flex: 1;
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 6px;
+      color: #ffffff;
+      font-size: 12px;
+      text-align: center;
+    }
+    
+    .range-input:focus {
+      outline: none;
+      border-color: #667eea;
+      background: rgba(255, 255, 255, 0.15);
+    }
+    
+    .range-separator {
+      color: rgba(255, 255, 255, 0.5);
+      font-size: 12px;
+    }
+    
+    /* Top Results Panel */
+    .results-panel {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      width: 400px;
+      z-index: 100;
+      padding: 24px;
+      transition: all 0.3s ease;
+      display: none;
+    }
+    
+    .results-panel.visible {
+      display: block;
+    }
+    
+    .results-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+    }
+    
+    .header-buttons {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    
+    .results-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: #ffffff;
+    }
+    
+    .expand-btn {
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 6px;
+      color: #ffffff;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    
+    .expand-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    
+    .fullscreen-btn {
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 6px;
+      color: #ffffff;
+      font-size: 16px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      line-height: 1;
+    }
+    
+    .fullscreen-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    
+    .download-links {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    
+    .download-link {
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 6px;
+      color: #ffffff;
+      text-decoration: none;
+      font-size: 12px;
+      transition: all 0.3s ease;
+    }
+    
+    .download-link:hover {
+      background: rgba(255, 255, 255, 0.2);
+      color: #ffffff;
+    }
+    
+    .heatmap-container {
+      width: 100%;
+      border-radius: 12px;
+      overflow: hidden;
+      background: rgba(255, 255, 255, 0.05);
+      display: none;
+    }
+    
+    .heatmap-container.visible {
+      display: block;
+    }
+    
+    .heatmap-container img {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+    
+    .heatmap-controls {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+      justify-content: center;
+    }
+    
+    .heatmap-toggle-btn {
+      padding: 8px 16px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 6px;
+      color: #ffffff;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    
+    .heatmap-toggle-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    
+    .heatmap-toggle-btn.active {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border-color: #667eea;
+    }
+    
+    /* Loading animation */
+    .loading-indicator {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 2px solid rgba(255, 255, 255, 0.3);
+      border-radius: 50%;
+      border-top-color: #667eea;
+      animation: spin 1s ease-in-out infinite;
+      margin-right: 8px;
+    }
+    
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    
+    /* Expanded modal for heatmap */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(0, 0, 0, 0.8);
+      backdrop-filter: blur(10px);
+      z-index: 1000;
+      display: none;
+      justify-content: center;
+      align-items: center;
+    }
+    
+    .modal-content {
+      max-width: 90vw;
+      max-height: 90vh;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 16px;
+      padding: 24px;
+      position: relative;
+    }
+    
+    .modal-close {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      background: rgba(255, 255, 255, 0.2);
+      border: none;
+      border-radius: 50%;
+      width: 40px;
+      height: 40px;
+      color: #ffffff;
+      font-size: 20px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    
+    .modal-close:hover {
+      background: rgba(255, 255, 255, 0.3);
+    }
+    
+    .modal-content img {
+      max-width: 100%;
+      max-height: 100%;
+      border-radius: 12px;
+    }
+    
+    /* Responsive design */
+    @media (max-width: 768px) {
+      .control-panel {
+        width: calc(100vw - 40px);
+      }
+      
+      .results-panel {
+        width: calc(100vw - 40px);
+        top: auto;
+        bottom: 20px;
+      }
+    }
+    
+    /* Bottom Control Panel */
+    .bottom-control-panel {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: calc(100vw - 800px); /* Leave space for left panel and Y slider */
+      min-width: 400px;
+      z-index: 100;
+      padding: 16px 24px;
+    }
+    
+    .bottom-section {
+      margin-bottom: 16px;
+    }
+    
+    .bottom-section:last-child {
+      margin-bottom: 0;
+    }
+    
+    .section-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: rgba(255, 255, 255, 0.9);
+      margin-bottom: 8px;
+      text-align: center;
+    }
+    
+    /* Time Control (Bottom) */
+    .time-control-bottom {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    
+    .time-slider-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    
+    .time-slider {
+      width: 100%;
+      height: 8px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.2);
+      outline: none;
+      -webkit-appearance: none;
+      appearance: none;
+    }
+    
+    .time-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #667eea;
+      cursor: pointer;
+      border: 3px solid #ffffff;
+    }
+    
+    .time-slider::-moz-range-thumb {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #667eea;
+      cursor: pointer;
+      border: 3px solid #ffffff;
+    }
+    
+    .time-info {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.7);
+    }
+    
+    .pause-btn {
+      padding: 8px 16px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+      color: #ffffff;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      white-space: nowrap;
+    }
+    
+    .pause-btn:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    
+    /* X-Axis Control (Bottom) */
+    .x-axis-control {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    
+    .dual-range-container {
+      flex: 1;
+      position: relative;
+      height: 20px;
+      display: flex;
+      align-items: center;
+    }
+    
+    .dual-range-track {
+      position: absolute;
+      width: 100%;
+      height: 6px;
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 3px;
+      top: 50%;
+      transform: translateY(-50%);
+    }
+    
+    .dual-range-fill {
+      position: absolute;
+      height: 6px;
+      background: #667eea; /* Blueish violet */
+      border-radius: 3px;
+      top: 50%;
+      transform: translateY(-50%);
+    }
+    
+    .x-range-slider {
+      position: absolute;
+      width: 100%;
+      height: 6px;
+      border-radius: 3px;
+      background: transparent;
+      outline: none;
+      -webkit-appearance: none;
+      appearance: none;
+      pointer-events: none;
+    }
+    
+    .x-range-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #667eea; /* Blueish violet */
+      cursor: pointer;
+      border: 2px solid #ffffff;
+      pointer-events: all;
+      position: relative;
+      z-index: 2;
+    }
+    
+    .x-range-slider::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #667eea; /* Blueish violet */
+      cursor: pointer;
+      border: 2px solid #ffffff;
+      pointer-events: all;
+    }
+    
+    .range-value {
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.8);
+      min-width: 40px;
+      text-align: center;
+    }
+    
+    /* Vertical Y-Axis Slider */
+    .y-axis-control {
+      position: fixed;
+      left: 390px; /* Right next to the left panel */
+      top: 50%;
+      transform: translateY(-50%);
+      height: 60vh;
+      width: 120px; /* Increased width for better label positioning */
+      z-index: 100;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    
+    .y-axis-title {
+      font-size: 12px;
+      font-weight: 500;
+      color: rgba(255, 255, 255, 0.9);
+      margin-bottom: 16px; /* Increased margin to prevent overlap */
+      text-align: center;
+      width: 100%;
+    }
+    
+    .y-dual-range-container {
+      flex: 1;
+      position: relative;
+      width: 30px;
+      height: 70%;
+      display: flex;
+      justify-content: center;
+      align-items: stretch;
+      margin: 0 auto; /* Center the container */
+    }
+    
+    .y-dual-range-track {
+      position: absolute;
+      height: 100%;
+      width: 6px;
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 3px;
+      left: 50%;
+      transform: translateX(-50%);
+    }
+    
+    .y-dual-range-fill {
+      position: absolute;
+      width: 6px;
+      background: #667eea; /* Blueish violet */
+      border-radius: 3px;
+      left: 50%;
+      transform: translateX(-50%);
+    }
+    
+    .y-range-handle {
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      background: #667eea;
+      border: 3px solid #ffffff;
+      border-radius: 50%;
+      cursor: pointer;
+      left: 50%;
+      transform: translateX(-50%);
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+      transition: all 0.2s ease;
+      z-index: 10;
+    }
+    
+    .y-range-handle:hover {
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.5);
+      transform: translateX(-50%) scale(1.1);
+    }
+    
+    .y-range-handle.dragging {
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.7);
+      transform: translateX(-50%) scale(1.2);
+    }
+    
+    .y-range-values {
+      position: absolute;
+      right: -40px; /* Moved further right to avoid overlap */
+      top: 0;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      width: 35px;
+    }
+    
+    .y-range-value {
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.8);
+      text-align: center;
+      background: rgba(0, 0, 0, 0.5); /* Dark background for better readability */
+      padding: 2px 4px;
+      border-radius: 4px;
+      min-height: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
   </style>
 </head>
 <body>
-  <h1>Optogenetic Brain Simulation</h1>
-  <div>
-    <label for="regions">Select Regions (Ctrl+Click for multiple):</label><br/>
-    <div id="loading-masks">Loading regions...</div>
-    <select id="regions" multiple style="display:none;"></select>
-  </div>
-  <div>
-    <label for="fraction">Activation Fraction:</label>
-    <input type="number" id="fraction" value="0.1" min="0" max="1" step="0.01"/>
-  </div>
-  <div>
-    <label for="steps">Prediction Steps:</label>
-    <input type="number" id="steps" value="10" min="1" step="1"/>
-  </div>
-  <button id="simulateBtn">Simulate</button>
-  <div id="status" style="margin-top: 10px;"></div>
-
-  <div id="results" style="display:none;">
-    <h2>Results</h2>
-    <div>
-      <img id="heatmap" src="" alt="Heatmap" />
-    </div>
-    <div style="margin-top:10px;">
-      <a id="download-summary-json" href="#" download>Download Summary JSON</a> |
-      <a id="download-summary-csv" href="#" download>Download Summary CSV</a> |
-      <a id="download-probabilities" href="#" download>Download Predicted Probabilities (npy)</a>
-    </div>
-  </div>
-
+  <!-- Fullscreen 3D Background -->
   <div id="viewer"></div>
+  
+  <!-- Left Control Panel -->
+  <div class="control-panel glass-panel">
+    <div class="panel-header">
+      <h1 class="panel-title">Virtual ZBrain Experimentation Platform</h1>
+    </div>
+    
+    <div class="form-group">
+      <label class="form-label">Brain Regions</label>
+      <div id="loading-masks" class="status-display">
+        <span class="loading-indicator"></span>
+        Loading regions...
+      </div>
+      <div id="regions-container" class="regions-container" style="display:none;">
+        <!-- Checkboxes will be populated here -->
+      </div>
+    </div>
+    
+    <div class="form-group">
+      <label class="form-label" for="fraction">Activation Fraction</label>
+      <input type="number" id="fraction" class="form-input" value="0.1" min="0" max="1" step="0.01" placeholder="0.0 - 1.0"/>
+    </div>
+    
+    <div class="form-group">
+      <label class="form-label" for="steps">Prediction Steps</label>
+      <input type="number" id="steps" class="form-input" value="10" min="1" step="1" placeholder="Number of steps"/>
+    </div>
+    
+    <button id="simulateBtn" class="simulate-btn">Run Simulation</button>
+    
+    <div id="status" class="status-display"></div>
+    
+    <!-- Animation Controls -->
+    <div class="animation-controls">
+      <div class="animation-title">Animation Display</div>
+      <div class="animation-checkbox">
+        <input type="checkbox" id="show-baseline" checked>
+        <label for="show-baseline">Show Baseline Activity</label>
+      </div>
+      <div class="animation-checkbox">
+        <input type="checkbox" id="show-predictions">
+        <label for="show-predictions">Show Predictions</label>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Top Results Panel -->
+  <div id="results" class="results-panel glass-panel">
+    <div class="results-header">
+      <h2 class="results-title">Simulation Results</h2>
+      <div class="header-buttons">
+        <button class="expand-btn" onclick="toggleHeatmap()">Show Heatmap</button>
+        <button class="fullscreen-btn" onclick="openFullscreen()" style="display: none;">⛶</button>
+      </div>
+    </div>
+    
+    <div class="download-links">
+      <a id="download-summary-json" href="#" class="download-link" download>JSON</a>
+      <a id="download-summary-csv" href="#" class="download-link" download>CSV</a>
+      <a id="download-probabilities" href="#" class="download-link" download>NPY</a>
+    </div>
+    
+    <div id="heatmap-container" class="heatmap-container">
+      <div class="heatmap-controls">
+        <button id="heatmap-all-btn" class="heatmap-toggle-btn active" onclick="showAllRegions()">All Regions</button>
+        <button id="heatmap-top12-btn" class="heatmap-toggle-btn" onclick="showTop12()">Top 12 Regions</button>
+      </div>
+      <img id="heatmap-all" src="" alt="All Regions Heatmap" style="display: block;" />
+      <img id="heatmap-top12" src="" alt="Top 12 Regions Heatmap" style="display: none;" />
+    </div>
+  </div>
+  
+  <!-- Expanded Heatmap Modal -->
+  <div id="heatmap-modal" class="modal-overlay" onclick="closeModal(event)">
+    <div class="modal-content">
+      <button class="modal-close" onclick="closeModal()">&times;</button>
+      <img id="heatmap-expanded" src="" alt="Expanded Heatmap" />
+    </div>
+  </div>
+  
+  <!-- Bottom Control Panel -->
+  <div class="bottom-control-panel glass-panel">
+    <!-- Time Control -->
+    <div class="bottom-section">
+      <div class="section-title">Time Control</div>
+      <div class="time-control-bottom">
+        <button id="pause-btn" class="pause-btn">Pause</button>
+        <div class="time-slider-container">
+          <input type="range" id="time-slider" class="time-slider" min="0" max="100" value="0">
+          <div class="time-info">
+            <span id="current-time">0</span>
+            <span id="total-time">--</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- X-Axis Control -->
+    <div class="bottom-section">
+      <div class="section-title">X-Axis Range</div>
+      <div class="x-axis-control">
+        <span class="range-value" id="x-min-value">Min</span>
+        <div class="dual-range-container">
+          <div class="dual-range-track"></div>
+          <div class="dual-range-fill" id="x-range-fill"></div>
+          <input type="range" id="x-min-slider" class="x-range-slider" min="0" max="100" value="0">
+          <input type="range" id="x-max-slider" class="x-range-slider" min="0" max="100" value="100">
+        </div>
+        <span class="range-value" id="x-max-value">Max</span>
+      </div>
+    </div>
+  </div>
+  
+  <!-- Vertical Y-Axis Control -->
+  <div class="y-axis-control glass-panel">
+    <div class="y-axis-title">Y-Axis Range</div>
+    <div class="y-dual-range-container">
+      <div class="y-dual-range-track"></div>
+      <div class="y-dual-range-fill" id="y-range-fill"></div>
+      <div class="y-range-handle" id="y-min-handle" data-type="min" style="bottom: 0%;"></div>
+      <div class="y-range-handle" id="y-max-handle" data-type="max" style="bottom: 100%;"></div>
+    </div>
+    <div class="y-range-values">
+      <div class="y-range-value" id="y-max-value">Max</div>
+      <div class="y-range-value" id="y-min-value">Min</div>
+    </div>
+  </div>
 
-  <script src="/static/main.js"></script>
-  <!-- Three.js for 3D viewer -->
+  <!-- Scripts -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="/static/main.js"></script>
+  
+  <script>
+    let heatmapVisible = false;
+    
+    function toggleHeatmap() {
+      const container = document.getElementById('heatmap-container');
+      const btn = document.querySelector('.expand-btn');
+      const fullscreenBtn = document.querySelector('.fullscreen-btn');
+      
+      heatmapVisible = !heatmapVisible;
+      
+      if (heatmapVisible) {
+        container.classList.add('visible');
+        btn.textContent = 'Hide Heatmap';
+        fullscreenBtn.style.display = 'block';
+      } else {
+        container.classList.remove('visible');
+        btn.textContent = 'Show Heatmap';
+        fullscreenBtn.style.display = 'none';
+      }
+    }
+    
+    function closeModal(event) {
+      const modal = document.getElementById('heatmap-modal');
+      if (!event || event.target === modal || event.target.classList.contains('modal-close')) {
+        modal.style.display = 'none';
+      }
+    }
+    
+    // Close modal with Escape key
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') {
+        closeModal();
+      }
+    });
+  </script>
 </body>
 </html> 

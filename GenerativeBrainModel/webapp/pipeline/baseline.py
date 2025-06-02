@@ -11,11 +11,15 @@ def modified_baseline_sequence(
     regions: list,
     fraction: float,
     sample_idx: int = 0,
-    output_dir: str = None
+    output_dir: str = None,
+    mask_loader=None
 ) -> str:
     """
     Load the first baseline sequence from test_data_and_predictions.h5, apply optogenetic activation
     to the last full brain volume for the specified regions and fraction, and save results.
+
+    Args:
+        mask_loader: Optional pre-loaded mask loader to avoid reloading masks
 
     Returns the output directory path containing 'baseline_sequence.npy' and 'activation_mask.npy'.
     """
@@ -80,8 +84,10 @@ def modified_baseline_sequence(
     seq = data[sample_idx].astype(np.uint8).copy()  # shape (seq_len, H, W)
     seq_len, H, W = seq.shape
 
-    # Instantiate mask loader with dynamic Z and sequence spatial dims
-    mask_loader = load_zebrafish_masks(target_shape=(Z, H, W))
+    # Use provided mask loader or create new one if not provided
+    if mask_loader is None:
+        # Fallback: instantiate mask loader with dynamic Z and sequence spatial dims
+        mask_loader = load_zebrafish_masks(target_shape=(Z, H, W))
 
     # Sample activations per region mask
     activation = np.zeros((Z, H, W), dtype=bool)

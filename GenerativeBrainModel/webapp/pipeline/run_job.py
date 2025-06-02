@@ -8,10 +8,14 @@ def run_simulation(
     regions: list,
     fraction: float,
     sample_idx: int = 0,
-    num_steps: int = None
+    num_steps: int = None,
+    mask_loader=None
 ) -> dict:
     """
     Complete pipeline: apply optogenetic activation to baseline, then run GBM inference.
+
+    Args:
+        mask_loader: Optional pre-loaded mask loader to avoid reloading masks
 
     Returns a dict with keys:
       - baseline_dir: path to modified baseline directory
@@ -26,7 +30,8 @@ def run_simulation(
         exp_path,
         regions,
         fraction,
-        sample_idx
+        sample_idx,
+        mask_loader=mask_loader
     )
 
     # Stage 2: generate predictions
