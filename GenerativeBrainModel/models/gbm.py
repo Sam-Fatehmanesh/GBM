@@ -165,7 +165,7 @@ class GBM(nn.Module):
         out = z + clamped_probs - clamped_probs.detach()
         return out
 
-    def generate_autoregressive_brain(self, init_x, num_steps=30, measure_z_depth=False):
+    def generate_autoregressive_brain(self, init_x, num_steps=30):
         """Generate a brain sequence from an initial grid sequence using autoregressive sampling.
         
         Args:
@@ -176,25 +176,11 @@ class GBM(nn.Module):
             probabilities: Tensor of shape (batch_size, num_steps, 256, 128) containing predicted probabilities
         """
 
-        # if measure_z_depth:
-        #     # First look at init_x and check where the first 1.0 valued pixel is for the most right hand side of the grid for that batch, 
-        #     # there may be multiple 1.0 values on the right hand side of the grid for that batch, so we need to find the first one
-        #     # we can do this by finding the first 1.0 valued pixel in the last column of the grid for that batch
-        #     right_most_column = init_x[:, :, :, -1]
-        #     init_x_seq_len = init_x.shape[1]
-        #     batch_z_start_index  = torch.argmax(right_most_column, dim=3)
-            
-
-        #     # Now it checks for the what is the next z frame for which these indicies are 1.0 valued and checks for each sample in the batch for how many steps until it repeated
-
-        #     for i in range(1,init_x_seq_len):
-        #         cycled_seq_bool = torch.argmax(right_most_column[:, i, :, -1]) == batch_z_start_index
-
 
         x = init_x
         probabilities = []
         for i in range(num_steps):
-            probs = self.get_predictions(x, temperature=0.0)[:, -1, :, :]
+            probs = self.get_predictions(x, temperature=1.0)[:, -1, :, :]
             # Store probabilities
             probabilities.append(probs)
             # z depth prediciton made to be confident, sets top left to 64 down to be thresholded
