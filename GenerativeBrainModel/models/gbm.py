@@ -159,7 +159,11 @@ class GBM(nn.Module):
         # Ensure input values are probabilities in range [0,1]
         # This prevents CUDA assertion failures with torch.bernoulli
         clamped_probs = torch.clamp(x, min=0.0, max=1.0)
-        return torch.bernoulli(clamped_probs)
+        # Sample z ∼ Bernoulli(p)
+        z = torch.bernoulli(clamped_probs)
+        # Straight-through: in forward, z; in backward, gradient = ∂(p)/∂p = 1
+        out = z + clamped_probs - clamped_probs.detach()
+        return out
 
     def generate_autoregressive_brain(self, init_x, num_steps=30, measure_z_depth=False):
         """Generate a brain sequence from an initial grid sequence using autoregressive sampling.
