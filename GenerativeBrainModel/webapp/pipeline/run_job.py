@@ -1,5 +1,6 @@
 from GenerativeBrainModel.webapp.pipeline.baseline import modified_baseline_sequence
 from GenerativeBrainModel.webapp.pipeline.inference import generate_predictions
+from GenerativeBrainModel.webapp.pipeline.analysis import analyze_region_differences
 from GenerativeBrainModel.webapp.config import settings
 
 
@@ -15,6 +16,7 @@ def run_simulation(
     Returns a dict with keys:
       - baseline_dir: path to modified baseline directory
       - predictions_dir: path to generated predictions directory
+      - analysis_dir: path to analysis directory
     """
     # Use configured experiments_root
     exp_path = settings.experiments_root
@@ -33,7 +35,11 @@ def run_simulation(
         num_steps=num_steps
     )
 
+    # Stage 3: run analysis on all regions
+    analysis_dir = analyze_region_differences(baseline_dir, predictions_dir)
+
     return {
         'baseline_dir': baseline_dir,
-        'predictions_dir': predictions_dir
+        'predictions_dir': predictions_dir,
+        'analysis_dir': analysis_dir
     } 

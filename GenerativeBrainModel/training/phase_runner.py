@@ -22,6 +22,7 @@ from GenerativeBrainModel.evaluation.data_saver import save_test_data_and_predic
 from GenerativeBrainModel.custom_functions.visualization import create_prediction_video
 from GenerativeBrainModel.utils.file_utils import create_experiment_dir, save_losses_to_csv
 from GenerativeBrainModel.utils.data_utils import get_max_z_planes
+from GenerativeBrainModel.datasets.probability_data_loader import SubjectFilteredProbabilityDALIBrainDataLoader
 
 
 class TwoPhaseTrainer:
@@ -185,10 +186,11 @@ class TwoPhaseTrainer:
         # Save test data and predictions if this is the finetuning phase OR pretrain-only mode
         if phase_name == "finetune" or (phase_name == "pretrain" and self.pretrain_only_mode):
             tqdm.write("Saving test data and predictions for analysis...")
+            # Directory for test data HDF5
             save_data_dir = os.path.join(phase_dir, 'test_data')
             os.makedirs(save_data_dir, exist_ok=True)
-            save_test_data_and_predictions(model, test_loader, save_data_dir, 
-                                          num_samples=100, params=params)
+            # Use the original binary data loader to capture sequence z starts
+            save_test_data_and_predictions(model, test_loader, save_data_dir, num_samples=100, params=params)
         
         return best_checkpoint_path
     

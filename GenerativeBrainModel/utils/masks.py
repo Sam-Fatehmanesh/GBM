@@ -271,6 +271,7 @@ class ZebrafishMaskLoader:
 
 
 # Convenience function to create a mask loader
+_mask_loader_cache = {}
 def load_zebrafish_masks(
     masks_dir: str = "masks",
     target_shape: Tuple[int, int, int] = (30, 256, 128),
@@ -287,7 +288,11 @@ def load_zebrafish_masks(
     Returns:
         ZebrafishMaskLoader instance
     """
-    return ZebrafishMaskLoader(masks_dir, target_shape, device)
+    # Cache mask loaders by parameters to avoid reloading
+    key = (masks_dir, tuple(target_shape), str(device))
+    if key not in _mask_loader_cache:
+        _mask_loader_cache[key] = ZebrafishMaskLoader(masks_dir, target_shape, device)
+    return _mask_loader_cache[key]
 
 
 if __name__ == "__main__":

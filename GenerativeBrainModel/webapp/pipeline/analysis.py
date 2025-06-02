@@ -32,14 +32,22 @@ def analyze_region_differences(
         raise FileNotFoundError(f"Activation mask not found: {activation_path}")
     activation_mask = np.load(activation_path).astype(bool)
 
+    # Load sequence start offset to align slices to global z planes
+    seq_start_path = os.path.join(baseline_dir, 'sequence_z_start.npy')
+    if not os.path.exists(seq_start_path):
+        raise FileNotFoundError(f"Sequence z-start file not found: {seq_start_path}")
+    z_start = int(np.load(seq_start_path))
+
     # Load predicted probabilities (num_steps, Y, X)
     probs_path = os.path.join(predictions_dir, 'predicted_probabilities.npy')
     if not os.path.exists(probs_path):
         raise FileNotFoundError(f"Predicted probabilities not found: {probs_path}")
     probabilities = np.load(probs_path).astype(float)
 
-    # Load mask loader and region masks
-    mask_loader = load_zebrafish_masks()
+    # Load mask loader and region masks using activation mask dimensions
+    # activation_mask shape: (Z, Y, X)
+    Z_mask, Y_mask, X_mask = activation_mask.shape
+    mask_loader = load_zebrafish_masks(target_shape=(Z_mask, Y_mask, X_mask))
     all_regions = mask_loader.list_masks()
     # Select regions to analyze
     if regions is None:
@@ -70,11 +78,15 @@ def analyze_region_differences(
             end = min(start + Z, num_steps)
             pred_sum = 0.0
             for t in range(start, end):
-                z = t % Z
-                mask2d = activation_mask[z] & region_mask3d[z]
+                z_local = t % Z
+                z_global = z_start + z_local
+                mask2d = activation_mask[z_global] & region_mask3d[z_global]
                 if mask2d.any():
                     pred_sum += float(np.sum(probabilities[t][mask2d]))
-            ratio = float(pred_sum / baseline_count) if baseline_count > 0 else 0.0
+            if baseline_count > 0:
+                ratio = float((pred_sum - baseline_count) / baseline_count)
+            else:
+                ratio = 0.0
             region_ratios.append(ratio)
             region_metrics.append({
                 'volume_idx': vol_idx,
