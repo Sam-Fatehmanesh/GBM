@@ -13,7 +13,7 @@ def analyze_region_differences(
     output_dir: str = None
 ) -> str:
     """
-    Compute region-wise activation ratio: predicted_sum / baseline_count for each region.
+    Compute region-wise normalized activation change: (predicted_sum - baseline_count) / baseline_count for each region.
     Loads activation_mask and predicted_probabilities, aggregates by region, and saves:
       - summary.json
       - summary.csv
@@ -126,21 +126,21 @@ def analyze_region_differences(
     
     # Full heatmap
     fig, ax = plt.subplots(figsize=(max(12, n_volumes * 0.5), max(8, n_regions * 0.3)))
-    im = ax.imshow(data_matrix, aspect='auto', cmap='viridis', vmin=0, vmax=np.nanmax(data_matrix))
+    im = ax.imshow(data_matrix, aspect='auto', cmap='bwr', vmin=np.nanmin(data_matrix), vmax=np.nanmax(data_matrix))
     # Set ticks for volumes
     ax.set_xticks(np.arange(n_volumes))
     ax.set_xticklabels([f'V{i+1}' for i in range(n_volumes)], rotation=90)
     # Set ticks for regions
     ax.set_yticks(np.arange(n_regions))
     ax.set_yticklabels(regions_to_use)
-    ax.set_title('Predicted Activation Ratio per Region and Volume (All Regions)')
+    ax.set_title('Normalized Activation Change per Region and Volume (All Regions)')
     # Add minor gridlines between cells
     ax.set_xticks(np.arange(n_volumes + 1) - 0.5, minor=True)
     ax.set_yticks(np.arange(n_regions + 1) - 0.5, minor=True)
     ax.grid(which='minor', color='white', linestyle='-', linewidth=0.5)
     ax.grid(False)
     cbar = fig.colorbar(im, ax=ax, orientation='vertical')
-    cbar.set_label('Predicted Sum / Baseline Count')
+    cbar.set_label('Normalized Activation Change ((Predicted Sum - Baseline Count) / Baseline Count)')
     plt.tight_layout()
     heatmap_path = os.path.join(output_dir, 'heatmap.png')
     plt.savefig(heatmap_path)
@@ -160,21 +160,21 @@ def analyze_region_differences(
         
         # Generate top 12 heatmap
         fig, ax = plt.subplots(figsize=(max(12, n_volumes * 0.5), max(6, len(top_12_regions) * 0.4)))
-        im = ax.imshow(top_12_data, aspect='auto', cmap='viridis', vmin=0, vmax=np.nanmax(data_matrix))
+        im = ax.imshow(top_12_data, aspect='auto', cmap='bwr', vmin=np.nanmin(data_matrix), vmax=np.nanmax(data_matrix))
         # Set ticks for volumes
         ax.set_xticks(np.arange(n_volumes))
         ax.set_xticklabels([f'V{i+1}' for i in range(n_volumes)], rotation=90)
         # Set ticks for top 12 regions
         ax.set_yticks(np.arange(len(top_12_regions)))
         ax.set_yticklabels(top_12_regions)
-        ax.set_title('Predicted Activation Ratio per Region and Volume (Top 12 Regions by Change Magnitude)')
+        ax.set_title('Normalized Activation Change per Region and Volume (Top 12 Regions by Change Magnitude)')
         # Add minor gridlines between cells
         ax.set_xticks(np.arange(n_volumes + 1) - 0.5, minor=True)
         ax.set_yticks(np.arange(len(top_12_regions) + 1) - 0.5, minor=True)
         ax.grid(which='minor', color='white', linestyle='-', linewidth=0.5)
         ax.grid(False)
         cbar = fig.colorbar(im, ax=ax, orientation='vertical')
-        cbar.set_label('Predicted Sum / Baseline Count')
+        cbar.set_label('Normalized Activation Change ((Predicted Sum - Baseline Count) / Baseline Count)')
         plt.tight_layout()
         heatmap_top12_path = os.path.join(output_dir, 'heatmap_top12.png')
         plt.savefig(heatmap_top12_path)
