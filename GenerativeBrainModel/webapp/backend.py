@@ -490,10 +490,9 @@ async def get_predicted_sequence_json(job_id: str):
         probabilities = np.load(probs_file)
         num_steps, H, W = probabilities.shape
         
-        # Convert probabilities to boolean mask (threshold at 0.5 or use probability directly)
-        # For visualization, we'll use a threshold to show active regions
-        threshold = 0.5
-        mask = probabilities > threshold
+        # Convert probabilities to binary mask via Bernoulli sampling for visualization
+        samples = np.random.binomial(1, probabilities)
+        mask = samples.astype(bool)
         
         # Convert to coordinate list like baseline data
         coords = []
