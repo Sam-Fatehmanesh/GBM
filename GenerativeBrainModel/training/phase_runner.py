@@ -264,6 +264,10 @@ class TwoPhaseTrainer:
     def _run_training_loop(self, model, optimizer, lr_scheduler, train_loader, test_loader,
                           phase_dir, phase_name, params):
         """Run the main training loop for a phase."""
+        # Scheduled sampling for finetuning: progressively replace ground truth with model predictions in latter half
+        scheduled_sampling = params.get('scheduled_sampling', False) and phase_name == 'finetune'
+        num_epochs = params.get('num_epochs', 1)
+        half_len = params['seq_len'] // 2
         # Training state
         train_losses = []
         test_losses = []
@@ -293,6 +297,12 @@ class TwoPhaseTrainer:
         
         # Main training loop
         for epoch in range(params['num_epochs']):
+            # Compute replaced_count for scheduled sampling at this epoch
+            if scheduled_sampling and num_epochs > 1:
+                scheduled_ratio = epoch / float(num_epochs - 1)
+                replaced_count = int(scheduled_ratio * half_len)
+            else:
+                replaced_count = 0
             model.train()
             epoch_loss = 0.0
             batch_count = 0
@@ -313,8 +323,24 @@ class TwoPhaseTrainer:
                     # Forward pass
                     optimizer.zero_grad()
                     
+                    # Scheduled sampling input mixing
+                    if scheduled_sampling and replaced_count > 0:
+                        # Get model predictions on ground truth without affecting gradients
+                        with torch.no_grad():
+                            with autocast():
+                                logits_gt = model(batch)
+                                probs_gt = model.sample_binary_predictions(torch.sigmoid(logits_gt))
+                        # Create mixed input: ground truth for first half, predictions for last frames
+                        input_batch = batch.clone()
+                        seq_len = params['seq_len']
+                        tail_start = seq_len - replaced_count
+                        # Vectorized replacement: use predictions for the tail portion
+                        input_batch[:, tail_start:] = probs_gt[:, tail_start-1:-1]
+                        batch_for_model = input_batch
+                    else:
+                        batch_for_model = batch
                     with autocast():
-                        predictions = model(batch)
+                        predictions = model(batch_for_model)
                         loss = model.compute_loss(predictions, batch[:, 1:])
                     
                     # Backward pass

@@ -109,7 +109,7 @@ async def preload_masks():
                 # Preload sequence_z_starts
                 if 'sequence_z_starts' not in tf:
                     raise RuntimeError(f"Missing 'sequence_z_starts' in {test_h5}")
-                baseline_zStart_global = 11#int(tf['sequence_z_starts'][0])
+                baseline_zStart_global = int(tf['sequence_z_starts'][0])
         else:
             # Fallback to default mask loader dimensions
             _, default_Y, default_X = load_zebrafish_masks().target_shape

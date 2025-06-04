@@ -57,7 +57,7 @@ def main():
     """Main function to run the two-phase training process."""
     try:
         # Parse command line arguments
-        parser = argparse.ArgumentParser(description="Train GBM with a two-phase approach: pretrain on all subjects except target, then finetune on target. If no target subject is specified, only pretrain on all subjects.")
+        parser = argparse.ArgumentParser(description="Train GBM with a two-phase approach: pretrain on all subjects except target, then finetune on target. If no target subject is specified, only pretrain on all subjects only.")
         parser.add_argument("--preaugmented-dir", type=str, default="preaugmented_training_spike_data_2018", 
                             help="Directory containing preaugmented data")
         parser.add_argument("--target-subject", type=str, default=None,
@@ -72,6 +72,8 @@ def main():
                             help="Learning rate for both phases")
         parser.add_argument("--skip-pretrain", action="store_true",
                             help="Skip the pretrain phase and go directly to finetuning (requires target subject)")
+        parser.add_argument("--scheduled-sampling", dest="scheduled_sampling", action="store_true",
+                            help="Enable scheduled sampling during finetuning, replacing more input with model predictions over epochs")
         parser.add_argument("--pretrain-checkpoint", type=str, default=None,
                             help="Path to a pretrained checkpoint to start from (skips pretrain phase)")
         parser.add_argument("--enable-memory-diagnostics", action="store_true",
@@ -104,7 +106,7 @@ def main():
             'weight_decay': 0.1,
             'warmup_ratio': 0.1,
             'min_lr': 1e-5,
-            'mamba_layers': 8,
+            'mamba_layers': 2,
             'mamba_dim': 1024,
             'mamba_state_multiplier': 8,
             'timesteps_per_sequence': 10,
@@ -123,6 +125,7 @@ def main():
         
         finetune_params = base_params.copy()
         finetune_params['num_epochs'] = args.num_epochs_finetune
+        finetune_params['scheduled_sampling'] = args.scheduled_sampling
         
         # Create timestamped experiment root directory
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
