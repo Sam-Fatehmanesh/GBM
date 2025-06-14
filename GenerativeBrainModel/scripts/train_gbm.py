@@ -66,7 +66,7 @@ def main():
                             help="Number of epochs for pretraining phase")
         parser.add_argument("--num-epochs-finetune", type=int, default=1, 
                             help="Number of epochs for finetuning phase (ignored if no target subject)")
-        parser.add_argument("--batch-size", type=int, default=128,
+        parser.add_argument("--batch-size", type=int, default=64,
                             help="Batch size for both phases")
         parser.add_argument("--learning-rate", type=float, default=6e-4,
                             help="Learning rate for both phases")

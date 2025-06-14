@@ -109,7 +109,7 @@ async def preload_masks():
                 # Preload sequence_z_starts
                 if 'sequence_z_starts' not in tf:
                     raise RuntimeError(f"Missing 'sequence_z_starts' in {test_h5}")
-                baseline_zStart_global = int(tf['sequence_z_starts'][0])
+                baseline_zStart_global = 11#int(tf['sequence_z_starts'][0])
         else:
             # Fallback to default mask loader dimensions
             _, default_Y, default_X = load_zebrafish_masks().target_shape
@@ -441,7 +441,7 @@ async def get_baseline_mask_json():
         global baseline_zStart_global, baseline_Z_global
         if baseline_zStart_global is None or baseline_Z_global is None:
             raise HTTPException(status_code=500, detail="Baseline sequence metadata not preloaded at startup")
-        zStart = baseline_zStart_global
+        zStart = 11# baseline_zStart_global
         Z = baseline_Z_global
         # Load baseline test sequence (flattened slices) from HDF5
         with h5py.File(test_h5, 'r') as f:
@@ -484,7 +484,7 @@ async def get_predicted_sequence_json(job_id: str):
             raise HTTPException(status_code=500, detail="Z dimension not available")
         
         Z = baseline_Z_global
-        zStart = int(np.load(seq_start_file))
+        zStart = 11#int(np.load(seq_start_file))
         
         # Load predicted probabilities (shape: num_steps, H, W)
         probabilities = np.load(probs_file)

@@ -117,7 +117,7 @@ class PredictionRunner:
         """Infer model configuration from state dict."""
         # Default GBM parameters
         config = {
-            'mamba_layers': 8,  # Default values that work with most models
+            'mamba_layers': 2,  # Default values that work with most models
             'mamba_dim': 1024,
             'mamba_state_multiplier': 8,
             'pretrained_ae_path': "trained_simpleAE/checkpoints/best_model.pt"
