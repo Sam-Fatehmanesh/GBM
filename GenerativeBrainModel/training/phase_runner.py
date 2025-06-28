@@ -280,11 +280,17 @@ class TwoPhaseTrainer:
         validation_f1_scores = []
         validation_recall_scores = []
         validation_precision_scores = []
+        # New: spike count tracking for validation
+        validation_pred_spikes = []  # total predicted positives
+        validation_true_spikes = []  # total ground-truth positives
         
         # Test metrics (end of epoch)
         test_f1_scores = []
         test_recall_scores = []
         test_precision_scores = []
+        # New: spike count tracking for test (per epoch)
+        test_pred_spikes = []
+        test_true_spikes = []
         
         # Training setup
         scaler = GradScaler()
@@ -376,6 +382,9 @@ class TwoPhaseTrainer:
                         validation_f1_scores.append(val_metrics['f1'])
                         validation_recall_scores.append(val_metrics['recall'])
                         validation_precision_scores.append(val_metrics['precision'])
+                        # Spike counts (use Bernoulli-sampled predictions)
+                        validation_pred_spikes.append(val_metrics['pred_spikes_bernoulli'])
+                        validation_true_spikes.append(val_metrics['true_spikes'])
                         
                         tqdm.write(f"Validation at step {global_step}: Loss={val_metrics['loss']:.6f}, "
                                   f"F1={val_metrics['f1']:.6f}, Recall={val_metrics['recall']:.6f}, "
@@ -418,6 +427,9 @@ class TwoPhaseTrainer:
             test_f1_scores.append(test_metrics['f1'])
             test_recall_scores.append(test_metrics['recall'])
             test_precision_scores.append(test_metrics['precision'])
+            # Spike counts for test (use Bernoulli-sampled predictions)
+            test_pred_spikes.append(test_metrics['pred_spikes_bernoulli'])
+            test_true_spikes.append(test_metrics['true_spikes'])
             
             tqdm.write(f"{phase_name.capitalize()} Epoch {epoch+1}: Train Loss = {avg_train_loss:.6f}, "
                       f"Test Loss = {test_metrics['loss']:.6f}, Test F1 = {test_metrics['f1']:.6f}")
@@ -431,7 +443,9 @@ class TwoPhaseTrainer:
                 phase_dir, phase_name, train_losses, test_losses, raw_batch_losses,
                 validation_step_indices, validation_losses, validation_f1_scores,
                 validation_recall_scores, validation_precision_scores,
+                validation_pred_spikes, validation_true_spikes,
                 test_f1_scores, test_recall_scores, test_precision_scores,
+                test_pred_spikes, test_true_spikes,
                 len(train_loader)
             )
         
@@ -472,8 +486,10 @@ class TwoPhaseTrainer:
     def _update_plots_and_save_data(self, phase_dir, phase_name, train_losses, test_losses,
                                    raw_batch_losses, validation_step_indices, validation_losses,
                                    validation_f1_scores, validation_recall_scores,
-                                   validation_precision_scores, test_f1_scores,
-                                   test_recall_scores, test_precision_scores, steps_per_epoch):
+                                   validation_precision_scores, validation_pred_spikes,
+                                   validation_true_spikes, test_f1_scores, test_recall_scores,
+                                   test_precision_scores, test_pred_spikes, test_true_spikes,
+                                   steps_per_epoch):
         """Update plots and save training data to CSV files."""
         # Create comprehensive plot
         plt.figure(figsize=(12, 12))
@@ -537,7 +553,9 @@ class TwoPhaseTrainer:
                  'test_loss': test_losses,
                  'test_f1': test_f1_scores,
                  'test_recall': test_recall_scores,
-                 'test_precision': test_precision_scores},
+                 'test_precision': test_precision_scores,
+                 'test_pred_spikes': test_pred_spikes,
+                 'test_true_spikes': test_true_spikes},
                 os.path.join(phase_dir, 'logs', 'losses.csv')
             )
         
@@ -555,6 +573,8 @@ class TwoPhaseTrainer:
                  'validation_loss': validation_losses,
                  'validation_f1': validation_f1_scores,
                  'validation_recall': validation_recall_scores,
-                 'validation_precision': validation_precision_scores},
+                 'validation_precision': validation_precision_scores,
+                 'validation_pred_spikes': validation_pred_spikes,
+                 'validation_true_spikes': validation_true_spikes},
                 os.path.join(phase_dir, 'logs', 'validation_losses.csv')
             ) 

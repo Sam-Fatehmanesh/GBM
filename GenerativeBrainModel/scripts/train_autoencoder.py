@@ -5,6 +5,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
+from torch.nn.utils import clip_grad_norm_
 import numpy as np
 from tqdm import tqdm
 import pandas as pd
@@ -13,10 +14,13 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-from GenerativeBrainModel.models.simple_autoencoder import SimpleAutoencoder
+from GenerativeBrainModel.models.autocnn import AutoCNN
 from GenerativeBrainModel.datasets.simple_spike_dataset import create_simple_dataloaders
 from GenerativeBrainModel.custom_functions.visualization import create_autoencoder_comparison_video, update_loss_plot
 from GenerativeBrainModel.utils.file_utils import create_experiment_dir, save_losses_to_csv
+from GenerativeBrainModel.models.automlp import AutoMLP
+from GenerativeBrainModel.models.autovit import AutoViT
+from GenerativeBrainModel.models.simple_autoencoder import SimpleAutoencoder
 
 # set seeds
 torch.manual_seed(42)
@@ -48,42 +52,6 @@ def collect_pca_data(train_loader, max_samples=10000):
             break
     
     return np.array(collected_data)
-
-def initialize_autoencoder_with_pca(model, data_matrix, hidden_size):
-    """Initialize autoencoder weights using PCA components."""
-    print(f"Running PCA on {data_matrix.shape[0]} samples with {data_matrix.shape[1]} features...")
-    
-    # Standardize the data
-    scaler = StandardScaler()
-    data_standardized = scaler.fit_transform(data_matrix)
-    
-    # Run PCA
-    pca = PCA(n_components=hidden_size)
-    pca.fit(data_standardized)
-    
-    print(f"PCA explained variance ratio (first 10 components): {pca.explained_variance_ratio_[:10]}")
-    print(f"Total explained variance: {pca.explained_variance_ratio_.sum():.4f}")
-    
-    # Get PCA components
-    components = pca.components_  # Shape: (hidden_size, input_size)
-    
-    # Initialize encoder and decoder weights
-    with torch.no_grad():
-        model.encoder.weight.data = torch.FloatTensor(components)
-        model.encoder.bias.data.zero_()
-        model.decoder.weight.data = torch.FloatTensor(components.T)
-        model.decoder.bias.data = torch.FloatTensor(scaler.mean_)
-    
-    print("Autoencoder weights initialized with PCA components!")
-    
-    return {
-        'pca': pca,
-        'scaler': scaler,
-        'explained_variance_ratio': pca.explained_variance_ratio_,
-        'total_explained_variance': pca.explained_variance_ratio_.sum(),
-        'n_components': hidden_size,
-        'n_samples_used': data_matrix.shape[0]
-    }
 
 class AutoencoderDatasetWrapper:
     """Simple wrapper for autoencoder video generation."""
@@ -123,12 +91,10 @@ def evaluate_test_loss(model, test_loader, device, max_batches=10):
                 break
                 
             batch = batch.to(device)
-            batch_flat = batch.view(batch.shape[0], -1)
             
-            reconstructed = model(batch_flat)
-            # Reshape reconstructed back to original shape for loss calculation
-            reconstructed_reshaped = reconstructed.view(batch.shape)
-            loss = F.binary_cross_entropy(reconstructed_reshaped, batch)
+            # Autoencoder handles dimension conversion automatically
+            reconstructed = model(batch)
+            loss = F.binary_cross_entropy(reconstructed, batch)
             test_loss += loss.item()
             batch_count += 1
     
@@ -136,20 +102,21 @@ def evaluate_test_loss(model, test_loader, device, max_batches=10):
 
 def main():
     try:
-        # Simple parameters
+        # Autoencoder parameters
         params = {
-            'batch_size': 128,
-            'num_epochs': 1,
-            'learning_rate': 1e-3,
+            'batch_size': 128, 
+            'num_epochs': 1,  
+            'learning_rate': 1e-4, 
             'hidden_size': 2048,
-            'data_dir': 'processed_spike_grids_2018_new_aug_cascade',
+            'grad_clip_norm': 1.0,  # Gradient clipping max norm
+            'data_dir': 'preaugmented_training_spike_data_2018_cascade',
             'train_ratio': 0.8,  # Use 80% for training, 20% for validation
-            'num_workers': 10
+            'num_workers': 10   
         }
         
         # Create experiment directory
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        exp_dir = create_experiment_dir('experiments/autoencoder', timestamp)
+        exp_dir = create_experiment_dir('experiments/autolinear', timestamp)
         print(f"Saving experiment results to: {exp_dir}")
         
         # Create simple dataloaders
@@ -169,41 +136,26 @@ def main():
         if len(train_loader) == 0:
             raise ValueError("No training data loaded! Check data directory and HDF5 file structure.")
         if len(test_loader) == 0:
-            raise ValueError("No test data loaded! Check data directory and HDF5 file structure.")
+            raise ValueError("No test data loaded! Check HDF5 file structure.")
         if sample_shape is None:
             raise ValueError("Could not determine sample shape! Check HDF5 data format.")
         
-        # Calculate input size
-        if len(sample_shape) == 3:
-            channels, height, width = sample_shape
-            input_size = channels * height * width
-            print(f"Input dimensions: {channels} x {height} x {width} = {input_size}")
-        elif len(sample_shape) == 2:
+        # Validate sample shape for autoencoder
+        if len(sample_shape) == 2:
             height, width = sample_shape
-            input_size = height * width
-            print(f"Input dimensions: {height} x {width} = {input_size}")
+            if height != 256 or width != 128:
+                raise ValueError(f"autoencoder expects 256x128 input, got {height}x{width}")
+            print(f"Input dimensions: {height} x {width} (suitable for autoencoder)")
         else:
-            raise ValueError(f"Unexpected sample shape: {sample_shape}")
+            raise ValueError(f"autoencoder expects 2D input, got shape: {sample_shape}")
         
-        # Create model
-        model = SimpleAutoencoder(
-            input_size=input_size,
-            hidden_size=params['hidden_size']
-        )
+        # Create autoencoder model
+        # The Autoencoder expects input_size parameter but doesn't use it (uses hardcoded 256x128)
+        model = SimpleAutoencoder(hidden_size=params['hidden_size'])
         
-        # PCA initialization (disabled)
-        print("Skipping PCA initialization...")
-        pca_results = {
-            'n_samples_used': 0,
-            'n_components': 0,
-            'total_explained_variance': 0.0,
-            'explained_variance_ratio': [],
-            'pca': None
-        }
-        
-        # Save model info and PCA results
+        # Save model info
         with open(os.path.join(exp_dir, "model_info.txt"), "w") as f:
-            f.write("Simple Autoencoder Training\n")
+            f.write("Autoencoder Training\n")
             f.write("=" * 40 + "\n\n")
             f.write(f"Model: {model}\n\n")
             
@@ -214,16 +166,13 @@ def main():
             f.write(f"\nModel Statistics:\n")
             total_params = sum(p.numel() for p in model.parameters())
             f.write(f"Total parameters: {total_params:,}\n")
-            f.write(f"Input size: {input_size}\n")
+            f.write(f"Input shape: {sample_shape}\n")
             f.write(f"Hidden size: {params['hidden_size']}\n")
-        
-            f.write(f"\nPCA Initialization:\n")
-            f.write(f"Samples used: {pca_results['n_samples_used']:,}\n")
-            f.write(f"Components: {pca_results['n_components']}\n")
-            f.write(f"Explained variance: {pca_results['total_explained_variance']:.4f}\n")
-        
-        # Skip PCA analysis since it's disabled
-        print("PCA analysis skipped")
+            
+            f.write(f"\n Architecture:\n")
+            f.write("Encoder: 1->4->16->128 channels with pooling\n")
+            f.write("Decoder: 128->16->4->1 channels with upsampling\n")
+            f.write("Final activation: Sigmoid\n")
         
         # Move to GPU
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -234,7 +183,7 @@ def main():
         optimizer = Adam(model.parameters(), lr=params['learning_rate'])
         
         # Training
-        print("Starting training...")
+        print("Starting autoencoder training...")
         train_losses = []
         test_losses = []
         raw_batch_losses = []
@@ -251,17 +200,18 @@ def main():
             
             for batch_idx, batch in enumerate(progress_bar):
                 batch = batch.to(device)
-                batch_flat = batch.view(batch.shape[0], -1)
                 
-                # Forward pass
-                reconstructed = model(batch_flat)
-                # Reshape reconstructed back to original shape for loss calculation
-                reconstructed_reshaped = reconstructed.view(batch.shape)
-                loss = F.binary_cross_entropy(reconstructed_reshaped, batch)
+                # Forward pass - Autoencoder handles dimension conversion automatically
+                reconstructed = model(batch)
+                loss = F.binary_cross_entropy(reconstructed, batch)
                 
                 # Backward pass
                 optimizer.zero_grad()
                 loss.backward()
+                
+                # Gradient clipping
+                clip_grad_norm_(model.parameters(), params['grad_clip_norm'])
+                
                 optimizer.step()
                 
                 # Track losses
@@ -305,7 +255,6 @@ def main():
                     'train_losses': train_losses,
                     'test_losses': test_losses,
                     'params': params,
-                    'pca_results': pca_results,
                     'best_test_loss': best_test_loss
                 }, os.path.join(exp_dir, 'checkpoints', 'best_model.pt'))
             
@@ -317,7 +266,7 @@ def main():
             # Save losses
             save_losses_to_csv({
                 'epoch': list(range(1, len(train_losses) + 1)),
-                 'train_loss': train_losses,
+                'train_loss': train_losses,
                 'test_loss': test_losses
             }, os.path.join(exp_dir, 'logs', 'losses.csv'))
             
@@ -335,7 +284,6 @@ def main():
             'train_losses': train_losses,
             'test_losses': test_losses,
             'params': params,
-            'pca_results': pca_results,
             'final_train_loss': avg_train_loss,
             'final_test_loss': final_test_loss
         }, os.path.join(exp_dir, 'checkpoints', 'final_model.pt'))
@@ -345,7 +293,7 @@ def main():
         video_path = os.path.join(exp_dir, 'videos', 'final_reconstruction.mp4')
         create_autoencoder_comparison_video(model, final_test_wrapper, video_path, num_frames=200)
         
-        print("Training complete!")
+        print(" autoencoder training complete!")
         print(f"Results saved to: {exp_dir}")
         
     except Exception as e:

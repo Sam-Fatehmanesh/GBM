@@ -347,7 +347,7 @@ class FastDALIBrainDataLoader:
         # Create grid loaders for each file
         self.grid_loaders = [FastGridLoader(f, seq_len, split, stride=self.stride) for f in self.grid_files]
         
-        # Create a pipeline for each file
+        # Create a pipeline for each file (do NOT build yet)
         self.pipelines = []
         for grid_loader in self.grid_loaders:
             pipe = create_fast_brain_data_pipeline(
@@ -361,11 +361,15 @@ class FastDALIBrainDataLoader:
                 enable_memory_stats=MEMORY_DIAGNOSTICS,
                 py_start_method="spawn"
             )
-            
-            # Start Python workers before building the pipeline
-            pipe.start_py_workers()
-            pipe.build()
             self.pipelines.append(pipe)
+
+        # IMPORTANT: Start Python workers on all pipelines BEFORE any build()
+        for pipe in self.pipelines:
+            pipe.start_py_workers()
+
+        # Now it is safe to build the pipelines (CUDA will be initialised after forking)
+        for pipe in self.pipelines:
+            pipe.build()
         
         # Create DALI iterators
         self.iterators = []

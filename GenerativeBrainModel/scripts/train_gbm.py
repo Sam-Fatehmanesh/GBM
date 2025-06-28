@@ -58,7 +58,7 @@ def main():
     try:
         # Parse command line arguments
         parser = argparse.ArgumentParser(description="Train GBM with a two-phase approach: pretrain on all subjects except target, then finetune on target. If no target subject is specified, only pretrain on all subjects only.")
-        parser.add_argument("--preaugmented-dir", type=str, default="preaugmented_training_spike_data_2018", 
+        parser.add_argument("--preaugmented-dir", type=str, default="processed_spike_grids_2018_new_aug_cascade", 
                             help="Directory containing preaugmented data")
         parser.add_argument("--target-subject", type=str, default=None,
                             help="Name of the target subject to hold out for finetuning. If not specified, pretrain on all subjects only.")
@@ -68,7 +68,7 @@ def main():
                             help="Number of epochs for finetuning phase (ignored if no target subject)")
         parser.add_argument("--batch-size", type=int, default=64,
                             help="Batch size for both phases")
-        parser.add_argument("--learning-rate", type=float, default=6e-4,
+        parser.add_argument("--learning-rate", type=float, default=1e-3,
                             help="Learning rate for both phases")
         parser.add_argument("--skip-pretrain", action="store_true",
                             help="Skip the pretrain phase and go directly to finetuning (requires target subject)")
@@ -107,7 +107,7 @@ def main():
             'warmup_ratio': 0.1,
             'min_lr': 1e-5,
             'mamba_layers': 2,
-            'mamba_dim': 1024,
+            'mamba_dim': 2048,
             'mamba_state_multiplier': 8,
             'timesteps_per_sequence': 10,
             'train_ratio': 0.95,
@@ -116,7 +116,7 @@ def main():
             'use_float16': False,
             'seed': seed,
             'validation_per_epoch': 8,
-            'timestep_stride': 1/3,
+            'timestep_stride': 5/8,
         }
         
         # Set phase-specific parameters

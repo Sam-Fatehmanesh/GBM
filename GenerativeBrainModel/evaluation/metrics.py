@@ -65,6 +65,9 @@ def track_metrics_during_validation(model, data_loader, device):
     total_loss = 0.0
     batch_count = 0
     total_tp, total_fp, total_fn = 0, 0, 0
+    # For Bernoulli-sampled spike counts
+    total_pred_spikes_bernoulli = 0
+    total_true_spikes = 0
     
     # Reset data loader
     data_loader.reset()
@@ -101,14 +104,21 @@ def track_metrics_during_validation(model, data_loader, device):
                 batch_count += 1
                 del batch_loss
                 
-                # Calculate metrics using sigmoid on predictions
+                # Calculate threshold-based metrics using sigmoid on predictions
                 probs = torch.sigmoid(predictions)
-                del predictions
                 # Keep predictions as bool to save memory
                 preds = (probs > 0.5)
-                del probs
+                
+                # Calculate Bernoulli-sampled spike counts
+                bernoulli_preds = torch.bernoulli(probs).to(torch.int64)
+                total_pred_spikes_bernoulli += bernoulli_preds.sum().item()
+                
+                del predictions, probs, bernoulli_preds
+                
                 # Keep targets as bool as well - use 0.5 threshold for consistency with predictions
                 targets = (batch_for_model[:, 1:] > 0.5).bool()
+                total_true_spikes += targets.to(torch.int64).sum().item()
+                
                 del batch, batch_for_model
                 torch.cuda.empty_cache()
                 
@@ -148,7 +158,9 @@ def track_metrics_during_validation(model, data_loader, device):
         'precision': precision,
         'tp': total_tp,
         'fp': total_fp,
-        'fn': total_fn
+        'fn': total_fn,
+        'pred_spikes_bernoulli': total_pred_spikes_bernoulli,
+        'true_spikes': total_true_spikes
     }
 
 

@@ -4,11 +4,12 @@ import torch.nn.functional as F
 import numpy as np
 from GenerativeBrainModel.models.mambacore import StackedMamba
 from GenerativeBrainModel.models.simple_autoencoder import SimpleAutoencoder
+from GenerativeBrainModel.models.rms import RMSNorm
 import pdb
 import os
 
 class GBM(nn.Module):
-    def __init__(self, mamba_layers=1, mamba_dim=1024, mamba_state_multiplier=1, pretrained_ae_path="trained_simpleAE/checkpoints/best_model.pt"):
+    def __init__(self, mamba_layers=1, mamba_dim=2048, mamba_state_multiplier=1, pretrained_ae_path="/home/user/GBM/experiments/autoencoder/20250627_090051/checkpoints/best_model.pt"):
         """Generative Brain Model combining pretrained autoencoder with Mamba for sequential prediction.
         
         Args:
@@ -28,6 +29,10 @@ class GBM(nn.Module):
                 # Skip loading if any error
                 pass
         
+        # Freeze autoencoder parameters to prevent updates during training
+        for param in self.autoencoder.parameters():
+            param.requires_grad = False
+        
         # Create Mamba sequence model
         self.mamba = StackedMamba(d_model=mamba_dim, num_layers=mamba_layers, state_multiplier=mamba_state_multiplier)
         
@@ -35,6 +40,7 @@ class GBM(nn.Module):
         self.latent_dim = mamba_dim
         self.grid_size = (256, 128)
         self.flat_size = int(np.prod(self.grid_size))
+
 
     def encode(self, x_flat):
         """Encode flattened grids to latent vectors.
@@ -44,7 +50,7 @@ class GBM(nn.Module):
         Returns:
             latents: Tensor of shape (batch_size, latent_dim) or (batch_size, seq_len, latent_dim)
         """
-        return self.autoencoder.encoder(x_flat)
+        return self.autoencoder.norm(self.autoencoder.encoder(x_flat))
     
     def decode(self, z):
         """Decode latent vectors to flattened grid logits.
@@ -54,7 +60,7 @@ class GBM(nn.Module):
         Returns:
             grids_flat: Tensor of shape (batch_size, 256*128) or (batch_size, seq_len, 256*128)
         """
-        return  self.autoencoder.decoder(z) 
+        return  self.autoencoder.decoder(self.autoencoder.norm(z)) 
     
     def forward(self, x):
         """Forward pass predicting next frame in sequence.
@@ -113,7 +119,7 @@ class GBM(nn.Module):
         # Calculate positive weight as ratio of negatives to positives
         # If equal numbers, weight will be 1. If 100 negatives per positive, weight will be 100
         if num_positives > 0:
-            pos_weight_value = 5
+            pos_weight_value = 1.0
         else:
             pos_weight_value = 1.0
         

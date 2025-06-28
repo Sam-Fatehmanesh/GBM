@@ -517,7 +517,10 @@ def create_autoencoder_comparison_video(model, dataset, output_path, num_frames=
         from tqdm import tqdm
         
         # Set up the figure
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        ax1 = axes[0]
+        ax2 = axes[1] 
+        ax3 = axes[2]
         
         # Set up the writer
         writer = FFMpegWriter(fps=fps)
@@ -531,34 +534,73 @@ def create_autoencoder_comparison_video(model, dataset, output_path, num_frames=
         # Create the video
         with writer.saving(fig, output_path, dpi=100):
             for i in tqdm(range(min(num_frames, len(dataset))), desc="Creating video"):
-                # Get a sample
-                sample = dataset[i].unsqueeze(0).to(device)
+                # Get a sample (shape should be [256, 128])
+                sample = dataset[i].unsqueeze(0).to(device)  # Add batch dimension: [1, 256, 128]
                 
-                # Get reconstruction
+                # Get reconstruction - let the model handle input format
                 with torch.no_grad():
-                    reconstruction = model(sample).cpu().squeeze(0)
+                    reconstruction = model(sample)  # Model handles dimension conversion
+                    reconstruction = torch.bernoulli(reconstruction)
                 
                 # Convert to numpy for plotting
-                original = sample.cpu().squeeze(0).numpy().reshape(256, 128)
-                reconstructed = reconstruction.numpy().reshape(256, 128)
+                original = sample.cpu().squeeze(0).numpy()  # Should be [256, 128]
+                reconstructed = reconstruction.cpu().squeeze(0).numpy()  # Should be [256, 128]
+                
+                # Ensure proper shape for visualization (in case they're flattened)
+                if original.ndim == 1:
+                    original = original.reshape(256, 128)
+                if reconstructed.ndim == 1:
+                    reconstructed = reconstructed.reshape(256, 128)
+                
+                # Debug: Print data statistics for first frame
+                if i == 0:
+                    print(f"Original shape: {original.shape}, min: {original.min():.4f}, max: {original.max():.4f}, mean: {original.mean():.4f}")
+                    print(f"Reconstructed shape: {reconstructed.shape}, min: {reconstructed.min():.4f}, max: {reconstructed.max():.4f}, mean: {reconstructed.mean():.4f}")
+                    print(f"Original non-zero count: {np.count_nonzero(original)}")
+                    print(f"Reconstructed non-zero count: {np.count_nonzero(reconstructed)}")
+                
+                # Auto-adjust the visualization range based on actual data
+                orig_min, orig_max = original.min(), original.max()
+                recon_min, recon_max = reconstructed.min(), reconstructed.max()
+                vmin = min(orig_min, recon_min)
+                vmax = max(orig_max, recon_max)
+                
+                # If all values are the same, add some range for visualization
+                if vmax == vmin:
+                    vmax = vmin + 1e-6
+                
+                # Create difference map
+                difference = np.abs(original - reconstructed)
                 
                 # Clear axes
                 ax1.clear()
                 ax2.clear()
+                ax3.clear()
                 
-                # Plot original and reconstruction
-                ax1.imshow(original, cmap='gray')
-                ax1.set_title('Original')
+                # Plot original, reconstruction, and difference
+                im1 = ax1.imshow(original, cmap='gray', vmin=vmin, vmax=vmax)
+                ax1.set_title(f'Original (Frame {i+1})')
                 ax1.axis('off')
                 
-                ax2.imshow(reconstructed, cmap='gray')
+                im2 = ax2.imshow(reconstructed, cmap='gray', vmin=vmin, vmax=vmax)
                 ax2.set_title('Reconstructed')
                 ax2.axis('off')
+                
+                diff_max = difference.max() if difference.max() > 0 else 1e-6
+                im3 = ax3.imshow(difference, cmap='hot', vmin=0, vmax=diff_max)
+                ax3.set_title('Difference')
+                ax3.axis('off')
+                
+                # Add statistics as text
+                mse = np.mean((original - reconstructed) ** 2)
+                mae = np.mean(np.abs(original - reconstructed))
+                fig.suptitle(f'MSE: {mse:.4f}, MAE: {mae:.4f}', fontsize=12)
                 
                 # Add to video
                 writer.grab_frame()
                 
         plt.close()
+        print(f"Video saved to: {output_path}")
         
     except Exception as e:
         print(f"Error creating video: {str(e)}")

@@ -28,6 +28,7 @@ class CNNLayer(nn.Module):
             )
 
     def forward(self, x):
+        # Shape: (batch_size, in_channels, height, width)
         residual = self.shortcut(x)
         out = self.conv_block(x)
         # Add debug print statements
