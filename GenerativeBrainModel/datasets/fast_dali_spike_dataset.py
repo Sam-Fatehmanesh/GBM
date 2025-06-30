@@ -362,7 +362,7 @@ class FastDALIBrainDataLoader:
                 py_start_method="spawn"
             )
             self.pipelines.append(pipe)
-
+            
         # IMPORTANT: Start Python workers on all pipelines BEFORE any build()
         for pipe in self.pipelines:
             pipe.start_py_workers()
