@@ -407,7 +407,7 @@ class TwoPhaseTrainer:
                         quarter = (batch_idx + 1) // quarter_epoch_size
                         video_path = os.path.join(phase_dir, 'videos', 
                                                 f'predictions_epoch_{epoch+1:03d}_quarter_{quarter}.mp4')
-                        create_prediction_video(model, test_loader, video_path, num_frames=330)
+                        create_prediction_video(model, test_loader, video_path, num_frames=330, sample_bernoulli=False)
                     
                     # Memory cleanup
                     if batch_idx % 50 == 0:
@@ -436,7 +436,7 @@ class TwoPhaseTrainer:
             
             # Create epoch video
             video_path = os.path.join(phase_dir, 'videos', f'predictions_epoch_{epoch+1:03d}_final.mp4')
-            create_prediction_video(model, test_loader, video_path, num_frames=330)
+            create_prediction_video(model, test_loader, video_path, num_frames=330, two_panel=True)
             
             # Update plots and save data
             self._update_plots_and_save_data(
@@ -456,9 +456,7 @@ class TwoPhaseTrainer:
                            validation_step_indices, raw_batch_losses, params,
                            avg_train_loss, phase_name, final_model_path)
         
-        # Create final prediction video
-        video_path = os.path.join(phase_dir, 'videos', 'final_predictions.mp4')
-        create_prediction_video(model, test_loader, video_path, num_frames=330)
+        # Skip creation of final_predictions.mp4 to reduce redundancy
         
         tqdm.write(f"{phase_name.capitalize()} training complete!")
         

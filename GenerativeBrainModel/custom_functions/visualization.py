@@ -18,9 +18,10 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
         sampled_predictions: numpy array of shape (batch_size, seq_len-1, 256, 128) with sampled binary predictions
     """
     try:
-        # Set up video parameters
-        width = 256
-        height = 128
+        # Derive spatial dimensions from data to avoid aspect distortion
+        # actual shape: (batch, seq_len, H, W)
+        height = actual.shape[2]
+        width = actual.shape[3]
         scale = 2
         scaled_width = width * scale
         scaled_height = height * scale
@@ -131,11 +132,11 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
                     sample_rgb = cv2.cvtColor(sample_img, cv2.COLOR_GRAY2BGR)
                 
                     # Add text labels
-                cv2.putText(curr_rgb, 'Current', (10, 30),
+                cv2.putText(curr_rgb, 'Previous Spikes', (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 cv2.putText(pred_rgb, 'Predicted Spike Probabilities', (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                cv2.putText(next_rgb, 'Actual Next', (10, 30),
+                cv2.putText(next_rgb, 'True Spikes', (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 if has_samples:
                     cv2.putText(sample_rgb, 'Predicted Spike Samples', (10, 30),
@@ -185,9 +186,10 @@ def create_color_coded_comparison_video(actual, predicted, sampled_predictions, 
         threshold_left_panels: If True, threshold left panels at 0.5 for binary display (for probability data)
     """
     try:
-        # Set up video parameters
-        width = 128
-        height = 256
+        # Derive spatial dimensions from data to avoid aspect distortion
+        # actual shape: (batch, seq_len, H, W)
+        height = actual.shape[2]
+        width = actual.shape[3]
         scale = 2
         scaled_width = width * scale
         scaled_height = height * scale
@@ -319,14 +321,14 @@ def create_color_coded_comparison_video(actual, predicted, sampled_predictions, 
                     
                     # Add text labels based on whether we're thresholding left panels
                     if threshold_left_panels:
-                        cv2.putText(curr_rgb, 'Current Spikes (Binary)', (10, 30),
+                        cv2.putText(curr_rgb, 'Previous Spikes', (10, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                        cv2.putText(next_rgb, 'Actual Next Spikes (Binary)', (10, 30),
+                        cv2.putText(next_rgb, 'True Spikes', (10, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                     else:
-                        cv2.putText(curr_rgb, 'Current', (10, 30),
+                        cv2.putText(curr_rgb, 'Previous Spikes', (10, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                        cv2.putText(next_rgb, 'Actual Next', (10, 30),
+                        cv2.putText(next_rgb, 'True Spikes', (10, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                     
                     cv2.putText(pred_rgb, 'Predicted Spike Probabilities', (10, 30),
@@ -375,7 +377,7 @@ def create_color_coded_comparison_video(actual, predicted, sampled_predictions, 
         traceback.print_exc()
 
 
-def create_prediction_video(model, data_loader, output_path, num_frames=330, device='cuda', print_batch_metrics=True):
+def create_prediction_video(model, data_loader, output_path, num_frames=330, device='cuda', print_batch_metrics=True, sample_bernoulli=False, two_panel=False):
     """Create a video of model predictions vs actual brain activity with color-coded bottom right panel.
     
     Args:
@@ -385,6 +387,8 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
         num_frames: Maximum number of frames to include
         device: Device to run model on
         print_batch_metrics: Whether to print metrics for the batch being visualized
+        sample_bernoulli: Whether to use Bernoulli sampling for binary predictions
+        two_panel: Whether to create a two-panel video (True Spikes vs Predicted Probabilities)
     """
     # Get a single batch
     data_loader.reset()
@@ -424,13 +428,20 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
             # Get probability predictions from the model using binary inputs
             predictions = model.get_predictions(batch_for_model)
             
-            # Generate sampled binary predictions from the predicted probability distributions
-            sampled_predictions = (predictions > 0.5).float()
+            if two_panel:
+                # In two-panel mode we always threshold true spikes and show probabilities
+                sampled_predictions = None  # not used
+            elif sample_bernoulli:
+                # Bernoulli sampling to generate binary spikes
+                sampled_predictions = torch.bernoulli(predictions)
+            else:
+                # Threshold at 0.5 for deterministic binary predictions
+                sampled_predictions = (predictions > 0.5).float()
     
-    # Calculate metrics for THIS batch only if requested
+    # Calculate metrics for THIS batch only if requested (always threshold-based)
     if print_batch_metrics:
         with torch.no_grad():
-            preds = (sampled_predictions > 0.5).bool()
+            preds = (predictions > 0.5).bool()
             targets = (batch_for_model[:, 1:] > 0.5).bool()
             
             # Calculate TP, FP, FN for this batch
@@ -445,27 +456,69 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
             
             tqdm.write(f"Video batch metrics - Recall: {recall:.3f}, Precision: {precision:.3f}, F1: {f1:.3f}")
     
-    # Convert predictions to numpy for visualization
-    # We'll choose multiple sequences from the batch for visualization (up to 100)
+    # Prepare data for visualization
     num_sequences = min(100, batch_viz.size(0))
     rand_indices = torch.randperm(batch_viz.size(0))[:num_sequences]
-    
-    # For visualization, always use binary data (inputs are always binary in both modes)
     batch_np = batch_viz[rand_indices].cpu().numpy()
-    
-    # Always threshold left panels for clarity (inputs should be binary anyway)
-    tqdm.write("Creating video with binary inputs and probability predictions")
-    
-    # Create color-coded comparison visualization
-    create_color_coded_comparison_video(
-        actual=batch_np,
-        predicted=predictions[rand_indices].cpu().numpy(),
-        sampled_predictions=sampled_predictions[rand_indices].cpu().numpy(),
-        output_path=output_path,
-        num_frames=num_frames,
-        fps=1,
-        threshold_left_panels=True  # Always threshold for consistency
-    )
+
+    if two_panel:
+        tqdm.write("Creating two-panel video (True Spikes vs Predicted Probabilities)")
+        # dimensions
+        height = batch_np.shape[1]
+        width = batch_np.shape[2]
+        scale = 2
+        scaled_w = width*scale
+        scaled_h = height*scale
+        video_width = scaled_w*2
+        video_height = scaled_h
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        out = cv2.VideoWriter(output_path, fourcc, 1, (video_width, video_height))
+        if not out.isOpened():
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            out = cv2.VideoWriter(output_path, fourcc, 1, (video_width, video_height))
+        total_frames=0
+        for seq_idx in range(num_sequences):
+            true_seq = batch_np[seq_idx]
+            pred_prob_seq = predictions[rand_indices[seq_idx]].cpu().numpy()
+            seq_len=min(num_frames, true_seq.shape[0]-1)
+            for t in range(seq_len):
+                true_img = (true_seq[t+1]>0.5).astype(np.uint8)*255
+                pred_img = (pred_prob_seq[t]*255).astype(np.uint8)
+                true_rgb=cv2.cvtColor(cv2.resize(true_img,(scaled_w,scaled_h),interpolation=cv2.INTER_NEAREST),cv2.COLOR_GRAY2BGR)
+                pred_rgb=cv2.cvtColor(cv2.resize(pred_img,(scaled_w,scaled_h),interpolation=cv2.INTER_NEAREST),cv2.COLOR_GRAY2BGR)
+                cv2.putText(true_rgb,'True Spikes',(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,0),1)
+                cv2.putText(pred_rgb,'Predicted Spike Probabilities',(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,0),1)
+                combined=np.hstack([true_rgb,pred_rgb])
+                out.write(combined)
+                total_frames+=1
+                if total_frames>=1000:
+                    break
+            if total_frames>=1000:
+                break
+        out.release()
+        tqdm.write(f"Two-panel video saved: {os.path.basename(output_path)} ({total_frames} frames)")
+    elif sample_bernoulli:
+        tqdm.write("Creating video with Bernoulli-sampled predictions")
+        create_comparison_video(
+            actual=batch_np,
+            predicted=predictions[rand_indices].cpu().numpy(),
+            sampled_predictions=sampled_predictions[rand_indices].cpu().numpy(),
+            output_path=output_path,
+            num_frames=num_frames,
+            fps=1
+        )
+    else:
+        tqdm.write("Creating video with binary inputs and probability predictions")
+        create_color_coded_comparison_video(
+            actual=batch_np,
+            predicted=predictions[rand_indices].cpu().numpy(),
+            sampled_predictions=sampled_predictions[rand_indices].cpu().numpy(),
+            output_path=output_path,
+            num_frames=num_frames,
+            fps=1,
+            threshold_left_panels=True
+        )
 
 
 def update_loss_plot(train_losses, test_losses, raw_batch_losses, output_path):
