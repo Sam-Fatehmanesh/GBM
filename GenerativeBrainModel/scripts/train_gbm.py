@@ -112,7 +112,7 @@ def main():
             'mamba_state_multiplier': 8,
             'timesteps_per_sequence': 10,
             'train_ratio': 0.95,
-            'dali_num_threads': 2,
+            'dali_num_threads': 12,
             'gpu_prefetch': 1,
             'use_float16': False,
             'seed': seed,

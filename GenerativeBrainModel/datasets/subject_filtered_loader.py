@@ -215,8 +215,8 @@ class FastProbabilityGridLoader:
         # Clear previous batch z-starts and populate with new ones
         self.current_batch_z_starts = []
         
-        # Create batch of sequences - use float32 for probability data
-        batch = np.zeros((batch_size, self.seq_len, 256, 128), dtype=np.float32)
+        # Create batch of sequences - use float16 for probability data to save memory/bandwidth
+        batch = np.zeros((batch_size, self.seq_len, 256, 128), dtype=np.float16)
         
         # Open the HDF5 file for reading
         with h5py.File(self.h5_file_path, 'r', libver='latest', swmr=True) as f:

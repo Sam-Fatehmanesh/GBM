@@ -42,22 +42,14 @@ def create_comparison_video(actual, predicted, output_path, num_frames=330, fps=
             video_width = scaled_width * 3
             video_height = scaled_height
         
-        # Use H264 codec for MP4
+        # Use MP4 codec for better compatibility with video players
+        if output_path.endswith('.avi'):
+            output_path = output_path[:-4] + '.mp4'
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, 
-                            (video_width, video_height), 
-                            isColor=True)
-        
+        out = cv2.VideoWriter(output_path, fourcc, fps, (video_width, video_height), isColor=True)
         if not out.isOpened():
-            # Try an alternative codec silently
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            out = cv2.VideoWriter(output_path, fourcc, fps, 
-                                (video_width, video_height), 
-                                isColor=True)
-            
-            if not out.isOpened():
-                print(f"Failed to create video writer. Skipping video creation.")
-                return
+            print(f"Failed to open video writer for {output_path}. Skipping video creation.")
+            return
         
         # Process each sequence in the batch
         batch_size = min(actual.shape[0], 100)  # Limit to at most 100 sequences
@@ -196,27 +188,29 @@ def create_color_coded_comparison_video(actual, predicted, sampled_predictions, 
         
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        # Clean up any existing file to avoid appending to a corrupted one
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
         
         # 2x2 grid layout
         video_width = scaled_width * 2
         video_height = scaled_height * 2
         
-        # Use H264 codec for MP4
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, 
-                            (video_width, video_height), 
-                            isColor=True)
-        
+        # Force MJPG codec which is almost always available and save as .avi
+        # Use H.264 codec for better compatibility with video players
+        codec = 'mp4v'  # Use mp4v which is widely supported
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        # Ensure extension is .mp4
+        if output_path.endswith('.avi'):
+            output_path = output_path[:-4] + '.mp4'
+        out = cv2.VideoWriter(output_path, fourcc, fps, (video_width, video_height), isColor=True)
         if not out.isOpened():
-            # Try an alternative codec silently
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            out = cv2.VideoWriter(output_path, fourcc, fps, 
-                                (video_width, video_height), 
-                                isColor=True)
-            
-            if not out.isOpened():
-                print(f"Failed to create video writer. Skipping video creation.")
-                return
+            print(f"Failed to open video writer for {output_path}. Skipping video creation.")
+            return
         
         # Process each sequence in the batch
         batch_size = min(actual.shape[0], 100)  # Limit to at most 100 sequences
@@ -253,12 +247,31 @@ def create_color_coded_comparison_video(actual, predicted, sampled_predictions, 
                     # Ensure values are in appropriate ranges
                     if current.dtype == np.uint8:
                         current = current.astype(np.float32) / 255.0
+                    elif current.dtype in [np.float16, np.float32, np.float64]:
+                        current = np.clip(current.astype(np.float32), 0, 1)
+                    else:
+                        current = current.astype(np.float32)
+                        
                     if next_frame.dtype == np.uint8:
                         next_frame = next_frame.astype(np.float32) / 255.0
+                    elif next_frame.dtype in [np.float16, np.float32, np.float64]:
+                        next_frame = np.clip(next_frame.astype(np.float32), 0, 1)
+                    else:
+                        next_frame = next_frame.astype(np.float32)
+                        
                     if prediction.dtype == np.uint8:
                         prediction = prediction.astype(np.float32) / 255.0
+                    elif prediction.dtype in [np.float16, np.float32, np.float64]:
+                        prediction = np.clip(prediction.astype(np.float32), 0, 1)
+                    else:
+                        prediction = prediction.astype(np.float32)
+                        
                     if sampled.dtype == np.uint8:
                         sampled = sampled.astype(np.float32) / 255.0
+                    elif sampled.dtype in [np.float16, np.float32, np.float64]:
+                        sampled = np.clip(sampled.astype(np.float32), 0, 1)
+                    else:
+                        sampled = sampled.astype(np.float32)
                     
                     # Convert binary values to 0/1 for classification
                     sampled_binary = (sampled > 0.5).astype(np.uint8)
@@ -291,14 +304,15 @@ def create_color_coded_comparison_video(actual, predicted, sampled_predictions, 
                     
                     # Threshold left panels if using probability data
                     if threshold_left_panels:
-                        # Threshold at 0.5 for binary display
+                        # Threshold at 0.5 for binary display, ensures clean 0.0 or 1.0 floats
                         current_display = (current > 0.5).astype(np.float32)
                         next_frame_display = (next_frame > 0.5).astype(np.float32)
                     else:
+                        # Data is already normalized to [0, 1] range from above
                         current_display = current
                         next_frame_display = next_frame
                     
-                    # Convert other images to uint8
+                    # Convert all display images to uint8 by scaling from [0, 1] to [0, 255]
                     curr_img = (current_display * 255).astype(np.uint8)
                     pred_img = (prediction * 255).astype(np.uint8)
                     next_img = (next_frame_display * 255).astype(np.uint8)
@@ -359,17 +373,20 @@ def create_color_coded_comparison_video(actual, predicted, sampled_predictions, 
                 tqdm.write(f"Reached maximum frame limit ({max_total_frames}). Truncating video.")
                 break
         
+        # Release writer and validate file
         out.release()
-        # Simplify the output message
-        tqdm.write(f"Color-coded video saved: {os.path.basename(output_path)} ({total_frames} frames, {batch_size} sequences)")
-        
-        # Verify the video file was created successfully
-        if os.path.exists(output_path):
-            file_size = os.path.getsize(output_path)
-            if file_size < 1000:  # If file is very small, it likely failed
-                tqdm.write(f"Warning: Video file is unusually small ({file_size} bytes), generation may have failed")
+        if total_frames == 0:
+            # Remove empty file to avoid confusion
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
+            print(f"No frames written for {output_path}; file removed.")
         else:
-            tqdm.write(f"Warning: Video file was not created at {output_path}")
+            file_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+            if file_size < 1024:  # <1 KiB likely corrupted
+                print(f"Warning: generated video appears too small ({file_size} bytes).")
+            print(f"Video saved: {os.path.basename(output_path)} ({total_frames} frames, {batch_size} sequences)")
         
     except Exception as e:
         tqdm.write(f"Error creating color-coded video: {str(e)}")
@@ -471,13 +488,16 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
         scaled_h = height*scale
         video_width = scaled_w*2
         video_height = scaled_h
+        # Use MP4 for better compatibility
+        if output_path.endswith('.avi'):
+            output_path = output_path[:-4] + '.mp4'
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         out = cv2.VideoWriter(output_path, fourcc, 1, (video_width, video_height))
         if not out.isOpened():
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            out = cv2.VideoWriter(output_path, fourcc, 1, (video_width, video_height))
-        total_frames=0
+            print(f"Failed to open video writer for {output_path}")
+            return
+        total_frames = 0
         for seq_idx in range(num_sequences):
             true_seq = batch_np[seq_idx]
             pred_prob_seq = predictions[rand_indices[seq_idx]].cpu().numpy()

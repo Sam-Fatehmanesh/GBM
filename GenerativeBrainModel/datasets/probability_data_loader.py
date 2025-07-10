@@ -211,7 +211,7 @@ class ProbabilityGridLoader:
         input_batch = np.zeros((batch_size, self.seq_len, 256, 128), dtype=np.uint8)  # Always binary for model input
         
         if self.use_probabilities:
-            target_batch = np.zeros((batch_size, self.seq_len, 256, 128), dtype=np.float32)  # Probabilities for targets
+            target_batch = np.zeros((batch_size, self.seq_len, 256, 128), dtype=np.float16)  # Probabilities for targets
         else:
             target_batch = None  # Will use same as input for binary training
         

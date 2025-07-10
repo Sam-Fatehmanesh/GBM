@@ -63,7 +63,7 @@ class RegionPerformanceVisualizer:
             plt.style.use('seaborn-v0_8-darkgrid')
         
         # Color palette for brain regions
-        self.region_colors = plt.cm.Set3(np.linspace(0, 1, 20))  # Support up to 20 regions
+        self.region_colors = plt.cm.get_cmap('Set3')(np.linspace(0, 1, 20))  # Support up to 20 regions
     
     def plot_next_frame_performance(self, 
                                   evaluation_results: Dict[str, Dict[str, float]],
@@ -102,7 +102,7 @@ class RegionPerformanceVisualizer:
             sorted_values = [val.cpu().item() if isinstance(val, torch.Tensor) else float(val) for val in sorted_values]
             
             # Create color gradient based on performance
-            colors = plt.cm.viridis(np.linspace(0.3, 1.0, len(sorted_values)))
+            colors = plt.cm.get_cmap('viridis')(np.linspace(0.3, 1.0, len(sorted_values)))
             
             # Create bar plot
             bars = ax.bar(range(len(sorted_regions)), sorted_values, 
@@ -228,7 +228,7 @@ class RegionPerformanceVisualizer:
         plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
         
         # Add colorbar
-        cbar = ax.figure.colorbar(im, ax=ax)
+        cbar = plt.colorbar(im, ax=ax)
         cbar.ax.set_ylabel(f'{metric.capitalize()} Score', rotation=-90, va="bottom")
         
         # Remove text annotations for cleaner look
@@ -278,7 +278,7 @@ class RegionPerformanceVisualizer:
             ('mean_recall_over_time', 'std_recall_over_time', 'Recall')
         ]
         
-        colors = plt.cm.viridis(np.linspace(0, 1, len(metrics_to_plot)))
+        colors = plt.cm.get_cmap('viridis')(np.linspace(0, 1, len(metrics_to_plot)))
         
         for i, (mean_key, std_key, label) in enumerate(metrics_to_plot):
             if mean_key in temporal_summary and std_key in temporal_summary:
@@ -524,7 +524,7 @@ class RegionPerformanceVisualizer:
             Path to saved video
         """
         logger.info(f"Generating training-style comparison video")
-        # Convert tensors to numpy arrays
+        # Convert tensors to numpy arrays, preserving original data types
         pred_np = predictions.cpu().numpy()
         gt_np = ground_truth.cpu().numpy()
         input_np = input_frames.cpu().numpy() if input_frames is not None else None
@@ -535,11 +535,12 @@ class RegionPerformanceVisualizer:
             pred_np = pred_np[:-1]
             sampled_np = sampled_np[:-1]
         
-        # Expand to 4D: (batch_size=1, seq_len, H, W)
+        # Expand to 4D: (batch_size=1, seq_len, H, W) while preserving data types
         pred_np = np.expand_dims(pred_np, axis=0)
         sampled_np = np.expand_dims(sampled_np, axis=0)
-        actual_np = np.expand_dims(input_np, axis=0) if input_np is not None else None
-            # Ensure output directory exists
+        actual_np = np.expand_dims(input_np, axis=0) if input_np is not None else np.expand_dims(gt_np, axis=0)
+        
+        # Ensure output directory exists
         video_path = self.output_dir / "videos" / filename
         video_path.parent.mkdir(parents=True, exist_ok=True)
         # Delegate to shared visualization utility

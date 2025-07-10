@@ -462,7 +462,8 @@ def convert_to_grids(spike_data, cell_positions, split_ratio=0.95, seed=42, use_
     is_train[train_timepoints] = 1
     
     # Create grids - use float32 for probabilities, uint8 for binary
-    grid_dtype = np.float32 if use_probabilities else np.uint8
+    # Store probability grids in float16 to save space and speed up I/O
+    grid_dtype = np.float16 if use_probabilities else np.uint8
     grids = np.zeros((T, num_z, GRID_HEIGHT, GRID_WIDTH), dtype=grid_dtype)
     
     print("Converting spikes to grid format...")
