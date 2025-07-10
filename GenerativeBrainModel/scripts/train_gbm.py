@@ -3,6 +3,7 @@
 Train GBM model with a two-phase approach: pretrain on all subjects except the target, 
 then finetune on the target subject only.
 
+This script now uses probability data loaders by default instead of binary spike data.
 This is a refactored version of the original script with improved modularity.
 """
 
@@ -58,8 +59,8 @@ def main():
     try:
         # Parse command line arguments
         parser = argparse.ArgumentParser(description="Train GBM with a two-phase approach: pretrain on all subjects except target, then finetune on target. If no target subject is specified, only pretrain on all subjects only.")
-        parser.add_argument("--preaugmented-dir", type=str, default="processed_spike_grids_2018_new_aug_cascade", 
-                            help="Directory containing preaugmented data")
+        parser.add_argument("--preaugmented-dir", type=str, default="processed_spike_grids_2018_aug_prob_cascade", 
+                            help="Directory containing preaugmented probability data")
         parser.add_argument("--target-subject", type=str, default=None,
                             help="Name of the target subject to hold out for finetuning. If not specified, pretrain on all subjects only.")
         parser.add_argument("--num-epochs-pretrain", type=int, default=1,
@@ -139,23 +140,25 @@ def main():
         if pretrain_only_mode:
             experiment_metadata = {
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'experiment_type': 'Pretrain-Only GBM Training',
+                'experiment_type': 'Pretrain-Only GBM Training (Probability Data)',
                 'target_subject': None,
                 'pretrain_epochs': args.num_epochs_pretrain,
                 'finetune_epochs': 0,
                 'skip_pretrain': False,
                 'pretrain_checkpoint': args.pretrain_checkpoint,
+                'data_type': 'probability',
                 'parameters': base_params
             }
         else:
             experiment_metadata = {
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'experiment_type': 'Two-Phase GBM Training',
+                'experiment_type': 'Two-Phase GBM Training (Probability Data)',
                 'target_subject': args.target_subject,
                 'pretrain_epochs': args.num_epochs_pretrain,
                 'finetune_epochs': args.num_epochs_finetune,
                 'skip_pretrain': args.skip_pretrain,
                 'pretrain_checkpoint': args.pretrain_checkpoint,
+                'data_type': 'probability',
                 'parameters': base_params
             }
         save_experiment_metadata(exp_root, experiment_metadata)

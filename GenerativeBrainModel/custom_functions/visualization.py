@@ -460,7 +460,7 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
     num_sequences = min(100, batch_viz.size(0))
     rand_indices = torch.randperm(batch_viz.size(0))[:num_sequences]
     batch_np = batch_viz[rand_indices].cpu().numpy()
-
+    
     if two_panel:
         tqdm.write("Creating two-panel video (True Spikes vs Predicted Probabilities)")
         # dimensions
@@ -517,7 +517,7 @@ def create_prediction_video(model, data_loader, output_path, num_frames=330, dev
             output_path=output_path,
             num_frames=num_frames,
             fps=1,
-            threshold_left_panels=True
+                threshold_left_panels=True
         )
 
 

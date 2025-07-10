@@ -81,6 +81,10 @@ class GBM(nn.Module):
         
         # Flatten all grids more efficiently
         x_flat = x.reshape(batch_size, seq_len, -1)  # Use reshape instead of view for better compatibility
+
+        #Clamp and sample bernoulli
+        x_flat = torch.clamp(x_flat, min=0.0, max=1.0)
+        x_flat = torch.bernoulli(x_flat)
         
         # Encode all frames to latent space - encode method will convert to float32
         latents = self.encode(x_flat)  # (batch_size, seq_len, latent_dim)

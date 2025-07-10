@@ -71,18 +71,19 @@ def print_memory_stats(prefix=""):
     except ImportError:
         print(f"{prefix} Memory: psutil not available")
 
-def load_precomputed_spike_data(precomputed_file):
+def load_precomputed_spike_data(precomputed_file, use_probabilities=False):
     """
     Load pre-computed spike probabilities and binary spikes from HDF5 file.
     
     Args:
         precomputed_file: Path to HDF5 file with pre-computed spike data
+        use_probabilities: If True, use probabilities instead of binary spikes
         
     Returns:
         tuple: (calcium_data, prob_data, spike_data, cell_xyz, method_used)
             - calcium_data: (T, N) raw calcium data (if available, else None)
             - prob_data: (N, T) spike probabilities 
-            - spike_data: (T, N) binary spikes
+            - spike_data: (T, N) binary spikes or probabilities (based on use_probabilities flag)
             - cell_xyz: (N, 3) cell positions
             - method_used: string indicating 'cascade' or 'oasis'
     """
@@ -96,8 +97,20 @@ def load_precomputed_spike_data(precomputed_file):
         if 'probabilities' in f:
             # CASCADE format: has 'probabilities' and 'spikes'
             prob_data = f['probabilities'][:]  # (N, T)
-            spike_data = f['spikes'][:]        # (T, N) 
+            spike_data_binary = f['spikes'][:]        # (T, N) 
             method_used = 'cascade'
+            
+            # Handle NaN values in probabilities
+            prob_data = np.nan_to_num(prob_data, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Choose between probabilities and binary based on flag
+            if use_probabilities:
+                # Use probabilities, transpose to match expected (T, N) format
+                spike_data = prob_data.T  # (N, T) -> (T, N)
+                print(f"    Using continuous probabilities instead of binary spikes")
+            else:
+                # Use binary spikes
+                spike_data = spike_data_binary
             
             # Check if we have model_type attribute
             if 'model_type' in f.attrs:
@@ -115,8 +128,18 @@ def load_precomputed_spike_data(precomputed_file):
         elif 'calcium_denoised' in f:
             # OASIS format: has 'calcium_denoised' (used as probabilities) and 'spikes'
             prob_data = f['calcium_denoised'][:].T  # (T, N) -> (N, T)
-            spike_data = f['spikes'][:]             # (T, N)
+            spike_data_binary = f['spikes'][:]             # (T, N)
             method_used = 'oasis'
+            
+            # Handle NaN values in probabilities
+            prob_data = np.nan_to_num(prob_data, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # For OASIS, probabilities are denoised calcium values
+            if use_probabilities:
+                spike_data = prob_data.T  # (N, T) -> (T, N)
+                print(f"    Using continuous denoised calcium instead of binary spikes")
+            else:
+                spike_data = spike_data_binary
             
             if 'g' in f.attrs:
                 g_val = f.attrs['g']
@@ -134,7 +157,8 @@ def load_precomputed_spike_data(precomputed_file):
         if 'calcium_raw' in f:
             calcium_data = f['calcium_raw'][:]
         
-        print(f"    Loaded {spike_data.shape[1]} cells, {spike_data.shape[0]} timepoints")
+        data_type = "probabilities" if use_probabilities else "binary spikes"
+        print(f"    Loaded {spike_data.shape[1]} cells, {spike_data.shape[0]} timepoints ({data_type})")
         
     return calcium_data, prob_data, spike_data, cell_xyz, method_used
 
@@ -164,7 +188,7 @@ def compute_dff(calcium_data):
     
     return dff
 
-def run_cascade_inference(dff, batch_size=30000, model_type='Global_EXC_2Hz_smoothing500ms'):
+def run_cascade_inference(dff, batch_size=30000, model_type='Global_EXC_2Hz_smoothing500ms', keep_probabilities=False):
     """
     Run CASCADE inference on ΔF/F data to get spike probabilities.
     
@@ -172,10 +196,11 @@ def run_cascade_inference(dff, batch_size=30000, model_type='Global_EXC_2Hz_smoo
         dff: (T, N) array of ΔF/F data
         batch_size: Batch size for CASCADE processing
         model_type: CASCADE model to use
+        keep_probabilities: If True, use probabilities directly instead of sampling binary spikes
         
     Returns:
         prob_data: (N, T) array of spike probabilities
-        spike_data: (T, N) array of binary spikes
+        spike_data: (T, N) array of binary spikes (or probabilities if keep_probabilities=True)
     """
     if not CASCADE_AVAILABLE:
         raise ImportError("CASCADE not available. Please install neuralib or use OASIS method.")
@@ -207,10 +232,14 @@ def run_cascade_inference(dff, batch_size=30000, model_type='Global_EXC_2Hz_smoo
         
         prob_data[start:end] = batch_probs
     
-    # Sample binary spikes from probabilities
-    print("  → Sampling binary spikes from probabilities…")
-    prob_clamped = np.clip(prob_data, 0, 1)
-    spike_data = np.random.binomial(1, prob_clamped).astype(int)
+    # Handle spike data based on keep_probabilities flag
+    if keep_probabilities:
+        print("  → Using probabilities directly as spike data…")
+        spike_data = prob_data.T.copy()  # (N, T) -> (T, N), matching expected format
+    else:
+        print("  → Sampling binary spikes from probabilities…")
+        prob_clamped = np.clip(prob_data, 0, 1)
+        spike_data = np.random.binomial(1, prob_clamped).astype(int).T  # (N, T) -> (T, N)
     
     return prob_data, spike_data
 
@@ -290,7 +319,7 @@ def run_spike_inference(data, method='oasis', **kwargs):
         
     Returns:
         prob_data: (N, T) array of spike probabilities
-        spike_data: (T, N) array of binary spikes
+        spike_data: (T, N) array of binary spikes (or probabilities if keep_probabilities=True for CASCADE)
     """
     if method.lower() == 'cascade':
         return run_cascade_inference(data, **kwargs)
@@ -299,7 +328,7 @@ def run_spike_inference(data, method='oasis', **kwargs):
     else:
         raise ValueError(f"Unknown spike inference method: {method}. Use 'cascade' or 'oasis'.")
 
-def augment_z_frames(frame, z_index, num_z_planes, height=GRID_HEIGHT, width=GRID_WIDTH):
+def augment_z_frames(frame, z_index, num_z_planes, height=GRID_HEIGHT, width=GRID_WIDTH, use_probabilities=False):
     """
     Apply z-index based augmentation to a frame.
     
@@ -308,6 +337,7 @@ def augment_z_frames(frame, z_index, num_z_planes, height=GRID_HEIGHT, width=GRI
         z_index: Current z-index for the frame
         num_z_planes: Total number of z-planes
         height, width: Frame dimensions
+        use_probabilities: If True, the frame contains continuous probabilities
         
     Returns:
         Augmented frame
@@ -319,21 +349,23 @@ def augment_z_frames(frame, z_index, num_z_planes, height=GRID_HEIGHT, width=GRI
     marker_area_height = min(num_z_planes, height)
     augmented_frame[0:marker_area_height, width-1] = 0
     
-    # Set only the z-index pixel to 1
+    # Set only the z-index pixel to 1 (or 1.0 for probabilities)
     if z_index < height:
-        augmented_frame[z_index, width-1] = 1
+        marker_value = 1.0 if use_probabilities else 1
+        augmented_frame[z_index, width-1] = marker_value
     
     return augmented_frame
 
-def convert_to_grids(spike_data, cell_positions, split_ratio=0.95, seed=42):
+def convert_to_grids(spike_data, cell_positions, split_ratio=0.95, seed=42, use_probabilities=False):
     """
     Convert spike data to grid format with z-plane augmentation and train/test split.
     
     Args:
-        spike_data: (T, N) array of binary spikes
+        spike_data: (T, N) array of binary spikes or continuous probabilities
         cell_positions: (N, 3) array of cell positions
         split_ratio: Ratio of data to use for training
         seed: Random seed for reproducibility
+        use_probabilities: If True, spike_data contains continuous probabilities
         
     Returns:
         grids: (T, num_z, height, width) array of grid data
@@ -346,12 +378,18 @@ def convert_to_grids(spike_data, cell_positions, split_ratio=0.95, seed=42):
         print("Warning: NaN values found in cell positions, replacing with 0")
         cell_positions = np.nan_to_num(cell_positions)
     
+    # Handle NaN values in spike data
+    if np.isnan(spike_data).any():
+        print("Warning: NaN values found in spike data, replacing with 0")
+        spike_data = np.nan_to_num(spike_data, nan=0.0, posinf=0.0, neginf=0.0)
+    
     # Get unique z values (rounded to handle floating point precision)
     z_values = np.unique(np.round(cell_positions[:, 2], decimals=3))
     z_values = np.sort(z_values)  # Sort in ascending order
     num_z = len(z_values)
     
-    print(f"Found {T} timepoints and {num_z} z-planes")
+    data_type = "probabilities" if use_probabilities else "binary spikes"
+    print(f"Found {T} timepoints and {num_z} z-planes, processing {data_type}")
     
     # Normalize cell positions to [0, 1]
     pos_min = cell_positions.min(axis=0)
@@ -423,8 +461,9 @@ def convert_to_grids(spike_data, cell_positions, split_ratio=0.95, seed=42):
     is_train = np.zeros(T, dtype=np.uint8)
     is_train[train_timepoints] = 1
     
-    # Create grids
-    grids = np.zeros((T, num_z, GRID_HEIGHT, GRID_WIDTH), dtype=np.uint8)
+    # Create grids - use float32 for probabilities, uint8 for binary
+    grid_dtype = np.float32 if use_probabilities else np.uint8
+    grids = np.zeros((T, num_z, GRID_HEIGHT, GRID_WIDTH), dtype=grid_dtype)
     
     print("Converting spikes to grid format...")
     for t in tqdm(range(T), desc="Processing timepoints"):
@@ -433,30 +472,41 @@ def convert_to_grids(spike_data, cell_positions, split_ratio=0.95, seed=42):
             cell_indices = z_cell_indices[z_idx]['indices']
             
             # Create empty grid for this timepoint and z-plane
-            grid = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=np.uint8)
+            grid = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=grid_dtype)
             
             # Skip if no cells in this z-plane
             if len(cell_indices) == 0:
-                grid = augment_z_frames(grid, z_idx, num_z)
+                grid = augment_z_frames(grid, z_idx, num_z, use_probabilities=use_probabilities)
                 grids[t, z_idx] = grid
                 continue
             
             # Get spikes for this timepoint and z-plane
             spikes_t = spike_data[t][cell_indices]
             
-            # Find active cells
-            active_cells = np.abs(spikes_t) > 1e-6
+            # Find active cells - different logic for binary vs probabilities
+            if use_probabilities:
+                # For probabilities, use any non-zero value
+                active_cells = np.abs(spikes_t) > 1e-6
+            else:
+                # For binary, use threshold
+                active_cells = np.abs(spikes_t) > 1e-6
             
             if np.any(active_cells):
                 active_x = z_cell_indices[z_idx]['x'][active_cells]
                 active_y = z_cell_indices[z_idx]['y'][active_cells]
+                active_values = spikes_t[active_cells]
                 
-                # Set active cells to 1 in the grid
+                # Set active cells in the grid
                 for i in range(len(active_x)):
-                    grid[active_x[i], active_y[i]] = 1
+                    if use_probabilities:
+                        # For probabilities, use the actual probability value
+                        grid[active_x[i], active_y[i]] = active_values[i]
+                    else:
+                        # For binary, set to 1
+                        grid[active_x[i], active_y[i]] = 1
             
             # Apply z-plane augmentation
-            grid = augment_z_frames(grid, z_idx, num_z)
+            grid = augment_z_frames(grid, z_idx, num_z, use_probabilities=use_probabilities)
             grids[t, z_idx] = grid
     
     # Create metadata
@@ -466,7 +516,9 @@ def convert_to_grids(spike_data, cell_positions, split_ratio=0.95, seed=42):
         'z_values': z_values,
         'train_timepoints': train_timepoints,
         'test_timepoints': test_timepoints,
-        'is_train': is_train
+        'is_train': is_train,
+        'use_probabilities': use_probabilities,
+        'data_type': data_type
     }
     
     return grids, metadata
@@ -524,7 +576,7 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
                    split_ratio=0.95, seed=42, spike_method='oasis', 
                    cascade_model='Global_EXC_2Hz_smoothing500ms',
                    oasis_fudge_factor=0.98, oasis_penalty=1, oasis_threshold_factor=0.333,
-                   precomputed_dir=None):
+                   precomputed_dir=None, keep_cascade_probabilities=False, use_probabilities=False):
     """
     Process a single subject through the complete pipeline.
     
@@ -541,6 +593,8 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
         oasis_penalty: Penalty parameter for OASIS deconvolution
         oasis_threshold_factor: Factor to multiply noise std for OASIS thresholding
         precomputed_dir: Path to directory with pre-computed spike data (if provided, skips spike inference)
+        keep_cascade_probabilities: If True, use CASCADE probabilities directly instead of sampling binary spikes
+        use_probabilities: If True, use probabilities instead of binary spikes in final output
         
     Returns:
         subject_output_dir: Path to subject's output directory
@@ -572,7 +626,7 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
         
         try:
             # Load pre-computed spike data
-            calcium_data, prob_data, spike_data, cell_xyz, method_used = load_precomputed_spike_data(precomputed_file)
+            calcium_data, prob_data, spike_data, cell_xyz, method_used = load_precomputed_spike_data(precomputed_file, use_probabilities=use_probabilities)
             
             # If we don't have raw calcium data, create dummy data for visualization
             if calcium_data is None:
@@ -582,7 +636,7 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
             
             # Continue with grid conversion and visualization
             print("  → Converting to grid format with z-plane augmentation...")
-            grids, metadata = convert_to_grids(spike_data, cell_xyz, split_ratio, seed)
+            grids, metadata = convert_to_grids(spike_data, cell_xyz, split_ratio, seed, use_probabilities=use_probabilities)
             
             # Save final data
             print(f"  → Saving final data to {final_file}")
@@ -606,6 +660,8 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
                 f.attrs['spike_method'] = method_used
                 f.attrs['data_source'] = 'precomputed'
                 f.attrs['precomputed_file'] = precomputed_file
+                f.attrs['use_probabilities'] = use_probabilities
+                f.attrs['data_type'] = metadata['data_type']
             
             # Save metadata separately
             metadata_file = os.path.join(subject_output_dir, 'metadata.h5')
@@ -616,6 +672,8 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
                 f.create_dataset('train_timepoints', data=metadata['train_timepoints'])
                 f.create_dataset('test_timepoints', data=metadata['test_timepoints'])
                 f.create_dataset('is_train', data=metadata['is_train'])
+                f.attrs['use_probabilities'] = use_probabilities
+                f.attrs['data_type'] = metadata['data_type']
             
             # Create visualization PDF
             print("  → Creating visualization PDF...")
@@ -692,7 +750,8 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
                 prob_data, spike_data = run_spike_inference(
                     dff, method='cascade', 
                     batch_size=batch_size, 
-                    model_type=cascade_model
+                    model_type=cascade_model,
+                    keep_probabilities=keep_cascade_probabilities
                 )
                 
             elif spike_method.lower() == 'oasis':
@@ -709,7 +768,7 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
             
             # Step 3: Convert to grid format
             print("  → Converting to grid format with z-plane augmentation...")
-            grids, metadata = convert_to_grids(spike_data, cell_xyz, split_ratio, seed)
+            grids, metadata = convert_to_grids(spike_data, cell_xyz, split_ratio, seed, use_probabilities=use_probabilities)
             
             # Step 4: Save final data
             print(f"  → Saving final data to {final_file}")
@@ -733,6 +792,8 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
                 f.attrs['spike_method'] = spike_method
                 f.attrs['sampling_rate'] = SAMPLING_RATE
                 f.attrs['data_source'] = 'raw_calcium'
+                f.attrs['use_probabilities'] = use_probabilities
+                f.attrs['data_type'] = metadata['data_type']
                 
                 # Method-specific attributes
                 if spike_method.lower() == 'cascade':
@@ -753,6 +814,8 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
                 f.create_dataset('train_timepoints', data=metadata['train_timepoints'])
                 f.create_dataset('test_timepoints', data=metadata['test_timepoints'])
                 f.create_dataset('is_train', data=metadata['is_train'])
+                f.attrs['use_probabilities'] = use_probabilities
+                f.attrs['data_type'] = metadata['data_type']
             
             # Step 5: Create visualization PDF
             print("  → Creating visualization PDF...")
@@ -794,10 +857,14 @@ def main():
                         help='Number of parallel workers')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
+    parser.add_argument('--use_probabilities', action='store_true',
+                        help='Use continuous probabilities instead of binary spikes in final output')
     
     # CASCADE-specific arguments
     parser.add_argument('--cascade_model', type=str, default='Global_EXC_2Hz_smoothing500ms',
                         help='CASCADE model type to use')
+    parser.add_argument('--keep_cascade_probabilities', action='store_true',
+                        help='Use CASCADE probabilities directly instead of sampling binary spikes')
     
     # OASIS-specific arguments
     parser.add_argument('--oasis_fudge_factor', type=float, default=0.98,
@@ -866,6 +933,11 @@ def main():
     else:
         print(f"Using spike detection method: {args.spike_method.upper()}")
     
+    if args.use_probabilities:
+        print("Using continuous probabilities instead of binary spikes in final output")
+    else:
+        print("Using binary spikes in final output")
+    
     # Process subjects
     processed_subjects = []
     
@@ -886,7 +958,9 @@ def main():
                     args.oasis_fudge_factor,
                     args.oasis_penalty,
                     args.oasis_threshold_factor,
-                    args.precomputed_dir
+                    args.precomputed_dir,
+                    args.keep_cascade_probabilities,
+                    args.use_probabilities
                 )
                 for subject_dir in subjects
             ]
@@ -914,7 +988,9 @@ def main():
                     args.oasis_fudge_factor,
                     args.oasis_penalty,
                     args.oasis_threshold_factor,
-                    args.precomputed_dir
+                    args.precomputed_dir,
+                    args.keep_cascade_probabilities,
+                    args.use_probabilities
                 )
                 if result is not None:
                     processed_subjects.append(result)
@@ -939,6 +1015,10 @@ def main():
                     'test_timepoints': f['test_timepoints'][:],
                     'is_train': f['is_train'][:]
                 }
+                if 'use_probabilities' in f.attrs:
+                    subject_data['use_probabilities'] = f.attrs['use_probabilities']
+                if 'data_type' in f.attrs:
+                    subject_data['data_type'] = f.attrs['data_type']
                 combined_metadata[subject_name] = subject_data
     
     # Save combined metadata
@@ -951,10 +1031,15 @@ def main():
             f.attrs['data_source'] = 'raw_calcium'
             f.attrs['spike_method'] = args.spike_method
         
+        f.attrs['use_probabilities'] = args.use_probabilities
+        
         for subject, data in combined_metadata.items():
             subject_group = f.create_group(subject)
             for key, value in data.items():
-                subject_group.create_dataset(key, data=value)
+                if key in ['use_probabilities', 'data_type']:
+                    subject_group.attrs[key] = value
+                else:
+                    subject_group.create_dataset(key, data=value)
     
     print(f"\nUnified processing complete!")
     print(f"Processed {len(processed_subjects)} subjects using {processing_mode} data")
@@ -972,6 +1057,7 @@ def main():
     else:
         print(f"  Data source: Raw calcium traces")
         print(f"  Spike detection method: {args.spike_method.upper()}")
+    print(f"  Using probabilities: {args.use_probabilities}")
     print(f"  Total timepoints: {total_timepoints}")
     print(f"  Total z-planes: {total_z_planes}")
     print(f"  Grid size: {GRID_HEIGHT}x{GRID_WIDTH}")

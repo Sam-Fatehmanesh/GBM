@@ -14,7 +14,7 @@ from typing import Dict, Any, Optional, List
 
 # Import our modules
 from GenerativeBrainModel.models.gbm import GBM
-from GenerativeBrainModel.datasets.subject_filtered_loader import SubjectFilteredFastDALIBrainDataLoader
+from GenerativeBrainModel.datasets.subject_filtered_loader import SubjectFilteredFastProbabilityDALIBrainDataLoader
 from GenerativeBrainModel.training.memory_utils import print_memory_stats
 from GenerativeBrainModel.training.schedulers import get_lr_scheduler
 from GenerativeBrainModel.evaluation.metrics import track_metrics_during_validation
@@ -22,7 +22,6 @@ from GenerativeBrainModel.evaluation.data_saver import save_test_data_and_predic
 from GenerativeBrainModel.custom_functions.visualization import create_prediction_video
 from GenerativeBrainModel.utils.file_utils import create_experiment_dir, save_losses_to_csv
 from GenerativeBrainModel.utils.data_utils import get_max_z_planes
-from GenerativeBrainModel.datasets.probability_data_loader import SubjectFilteredProbabilityDALIBrainDataLoader
 
 
 class TwoPhaseTrainer:
@@ -58,7 +57,7 @@ class TwoPhaseTrainer:
         self.pretrain_only_mode = pretrain_only_mode
         
         # Initialize results
-        self.results = {
+        self.results: Dict[str, Optional[str]] = {
             'pretrain_checkpoint': None,
             'finetune_checkpoint': None
         }
@@ -85,7 +84,7 @@ class TwoPhaseTrainer:
                 self.results['pretrain_checkpoint'] = self._run_phase(
                     phase_name="pretrain",
                     params=self.pretrain_params,
-                    subjects_exclude=[self.target_subject],
+                    subjects_exclude=[self.target_subject] if self.target_subject else None,
                     subjects_include=None,
                     init_checkpoint=None
                 )
@@ -102,7 +101,7 @@ class TwoPhaseTrainer:
             self.results['finetune_checkpoint'] = self._run_phase(
                 phase_name="finetune",
                 params=self.finetune_params,
-                subjects_include=[self.target_subject],
+                subjects_include=[self.target_subject] if self.target_subject else None,
                 subjects_exclude=None,
                 init_checkpoint=self.results['pretrain_checkpoint']
             )
@@ -195,8 +194,8 @@ class TwoPhaseTrainer:
         return best_checkpoint_path
     
     def _create_data_loader(self, params, subjects_include, subjects_exclude, split, shuffle):
-        """Create a subject-filtered data loader."""
-        return SubjectFilteredFastDALIBrainDataLoader(
+        """Create a subject-filtered probability data loader."""
+        return SubjectFilteredFastProbabilityDALIBrainDataLoader(
             params['preaugmented_dir'],
             include_subjects=subjects_include,
             exclude_subjects=subjects_exclude,
