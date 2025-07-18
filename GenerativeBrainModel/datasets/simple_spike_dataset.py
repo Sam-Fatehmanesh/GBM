@@ -104,7 +104,7 @@ def create_simple_dataloaders(
     all_subjects = []
     for item in os.listdir(data_dir):
         if item.startswith('subject_') and os.path.isdir(os.path.join(data_dir, item)):
-            subject_id = int(item.split('_')[1])
+            subject_id = item.split('_', 1)[1]  # Get everything after first underscore
             all_subjects.append(subject_id)
     
     print(f"Found {len(all_subjects)} subjects: {all_subjects}")

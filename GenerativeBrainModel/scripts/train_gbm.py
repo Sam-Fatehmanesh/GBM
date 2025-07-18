@@ -30,11 +30,12 @@ mp.set_sharing_strategy('file_system')
 mp.set_start_method('spawn', force=True)
 
 import numpy as np
+import json
 
 # Import our refactored modules
 from GenerativeBrainModel.training import print_memory_stats, enable_memory_diagnostics
 from GenerativeBrainModel.utils import validate_subject_directory, save_experiment_metadata
-from GenerativeBrainModel.training.phase_runner import TwoPhaseTrainer
+from GenerativeBrainModel.training.phase_runner import MultiPhaseTrainer
 
 # Sets torch seed for reproducibility
 seed = 42
@@ -79,6 +80,8 @@ def main():
                             help="Path to a pretrained checkpoint to start from (skips pretrain phase)")
         parser.add_argument("--enable-memory-diagnostics", action="store_true",
                             help="Enable memory diagnostics during training")
+        parser.add_argument("--phase-config", type=str, default=None,
+                           help="Path to JSON file defining multiple phases")
         args = parser.parse_args()
         
         # Determine training mode
@@ -113,21 +116,45 @@ def main():
             'timesteps_per_sequence': 10,
             'train_ratio': 0.95,
             'dali_num_threads': 12,
-            'gpu_prefetch': 1,
+            'gpu_prefetch': 4,
             'use_float16': False,
             'seed': seed,
             'validation_per_epoch': 8,
             'timestep_stride': 5/8,
         }
         
-        # Set phase-specific parameters
-        pretrain_params = base_params.copy()
-        pretrain_params['num_epochs'] = args.num_epochs_pretrain
-        
-        finetune_params = base_params.copy()
-        finetune_params['num_epochs'] = args.num_epochs_finetune
-        finetune_params['scheduled_sampling'] = args.scheduled_sampling
-        
+        if args.phase_config:
+            with open(args.phase_config, 'r') as f:
+                phase_configs = json.load(f)
+            for pc in phase_configs:
+                params = base_params.copy()
+                params.update(pc.get('params', {}))
+                pc['params'] = params
+            experiment_type = 'Multi-Phase GBM Training (Probability Data)'
+            tqdm.write(f"Loaded {len(phase_configs)} phases from {args.phase_config}")
+        else:
+            pretrain_params = base_params.copy()
+            pretrain_params['num_epochs'] = args.num_epochs_pretrain
+            pretrain_params['scheduled_sampling'] = False
+            
+            finetune_params = base_params.copy()
+            finetune_params['num_epochs'] = args.num_epochs_finetune
+            finetune_params['scheduled_sampling'] = args.scheduled_sampling
+            
+            if pretrain_only_mode:
+                phase_configs = [
+                    {'name': 'pretrain', 'subjects': None, 'exclude': None, 'params': pretrain_params}
+                ]
+                experiment_type = 'Pretrain-Only GBM Training (Probability Data)'
+            else:
+                phase_configs = [
+                    {'name': 'pretrain', 'subjects': None, 'exclude': [args.target_subject], 'params': pretrain_params},
+                    {'name': 'finetune', 'subjects': [args.target_subject], 'params': finetune_params}
+                ]
+                experiment_type = 'Two-Phase GBM Training (Probability Data)'
+                if args.skip_pretrain:
+                    phase_configs = phase_configs[1:]
+ 
         # Create timestamped experiment root directory
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         if pretrain_only_mode:
@@ -137,41 +164,24 @@ def main():
         os.makedirs(exp_root, exist_ok=True)
         
         # Save experiment metadata
-        if pretrain_only_mode:
-            experiment_metadata = {
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'experiment_type': 'Pretrain-Only GBM Training (Probability Data)',
-                'target_subject': None,
-                'pretrain_epochs': args.num_epochs_pretrain,
-                'finetune_epochs': 0,
-                'skip_pretrain': False,
-                'pretrain_checkpoint': args.pretrain_checkpoint,
-                'data_type': 'probability',
-                'parameters': base_params
-            }
-        else:
-            experiment_metadata = {
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'experiment_type': 'Two-Phase GBM Training (Probability Data)',
-                'target_subject': args.target_subject,
-                'pretrain_epochs': args.num_epochs_pretrain,
-                'finetune_epochs': args.num_epochs_finetune,
-                'skip_pretrain': args.skip_pretrain,
-                'pretrain_checkpoint': args.pretrain_checkpoint,
-                'data_type': 'probability',
-                'parameters': base_params
-            }
+        experiment_metadata = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'experiment_type': experiment_type,
+            'target_subject': args.target_subject if not args.phase_config else None,
+            'skip_pretrain': args.skip_pretrain if not args.phase_config else False,
+            'pretrain_checkpoint': args.pretrain_checkpoint,
+            'data_type': 'probability',
+            'parameters': base_params,
+            'phases': [{k: v for k, v in pc.items() if k != 'params'} for pc in phase_configs]
+        }
         save_experiment_metadata(exp_root, experiment_metadata)
         
         # Create and run the trainer
-        trainer = TwoPhaseTrainer(
-            exp_root=exp_root,
-            pretrain_params=pretrain_params,
-            finetune_params=finetune_params,
-            target_subject=args.target_subject,
-            skip_pretrain=args.skip_pretrain,
-            pretrain_checkpoint=args.pretrain_checkpoint,
-            pretrain_only_mode=pretrain_only_mode
+        initial_checkpoint = args.pretrain_checkpoint if args.skip_pretrain and args.pretrain_checkpoint else None
+        trainer = MultiPhaseTrainer(
+           exp_root=exp_root,
+           phase_configs=phase_configs,
+           initial_checkpoint=initial_checkpoint
         )
         
         # Run the training
@@ -179,16 +189,10 @@ def main():
         
         # Print final summary
         tqdm.write("\n" + "="*50)
-        if pretrain_only_mode:
-            tqdm.write("Pretrain-only training complete!")
-            tqdm.write(f"Experiment directory: {exp_root}")
-            tqdm.write(f"Best pretrain checkpoint: {results['pretrain_checkpoint']}")
-        else:
-            tqdm.write("Two-phase training complete!")
-            tqdm.write(f"Experiment directory: {exp_root}")
-            if results['pretrain_checkpoint']:
-                tqdm.write(f"Best pretrain checkpoint: {results['pretrain_checkpoint']}")
-            tqdm.write(f"Best finetune checkpoint: {results['finetune_checkpoint']}")
+        tqdm.write(f"{experiment_type} complete!")
+        tqdm.write(f"Experiment directory: {exp_root}")
+        for phase_name, checkpoint in results.items():
+            tqdm.write(f"Best {phase_name}: {checkpoint}")
         tqdm.write("="*50)
         
     except Exception as e:

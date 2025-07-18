@@ -16,6 +16,7 @@ While generating visualization PDFs and eliminating intermediate files.
 Support for both OASIS (default) and CASCADE spike detection methods.
 """
 
+import scipy
 import os
 import time
 import argparse
@@ -207,39 +208,90 @@ def run_cascade_inference(dff, batch_size=30000, model_type='Global_EXC_2Hz_smoo
     
     T, N = dff.shape
     
-    # Prepare containers
-    prob_data = np.zeros((N, T), dtype=np.float32)
+    # Dynamically adjust batch size based on number of neurons to avoid OOM
+    if N > 50000:
+        batch_size = min(batch_size, 5000)
+        print(f"  → Large dataset detected ({N} neurons), reducing batch size to {batch_size}")
+    elif N > 20000:
+        batch_size = min(batch_size, 10000)
+        print(f"  → Medium dataset detected ({N} neurons), reducing batch size to {batch_size}")
     
-    # Batched CASCADE inference
+    # Prepare containers - use float16 to save memory
+    prob_data = np.zeros((N, T), dtype=np.float16)
+    
+    # Batched CASCADE inference with memory cleanup
     print(f"  → Running CASCADE in batches of {batch_size}…")
     traces = dff.T.astype(np.float32)  # (N, T)
+    
+    # Delete original dff to free memory
+    del dff
+    gc.collect()
     
     for start in tqdm(range(0, N, batch_size), desc="CASCADE batches"):
         end = min(start + batch_size, N)
         batch = traces[start:end]
         
-        batch_probs = cascade_predict(
-            batch,
-            model_type=model_type,
-            threshold=1,
-            padding=np.nan,
-            verbose=False
-        )
-        
-        batch_probs = np.atleast_2d(batch_probs)
-        if batch_probs.shape != (end-start, T):
-            raise ValueError(f"Unexpected batch_probs shape: {batch_probs.shape}, expected: {(end-start, T)}")
-        
-        prob_data[start:end] = batch_probs
+        try:
+            batch_probs = cascade_predict(
+                batch,
+                model_type=model_type,
+                threshold=0,
+                padding=np.nan,
+                verbose=False
+            )
+            
+            batch_probs = np.atleast_2d(batch_probs)
+            if batch_probs.shape != (end-start, T):
+                raise ValueError(f"Unexpected batch_probs shape: {batch_probs.shape}, expected: {(end-start, T)}")
+            
+            # Handle NaN, inf values and ensure probabilities are in [0, 1] range
+            batch_probs = np.nan_to_num(batch_probs, nan=0.0, posinf=1.0, neginf=0.0)
+            batch_probs = np.clip(batch_probs, 0.0, 1.0)
+            
+            # Store as float16 to save memory
+            prob_data[start:end] = batch_probs.astype(np.float16)
+            
+            # Clean up batch results
+            del batch_probs, batch
+            gc.collect()
+            
+        except Exception as e:
+            print(f"Error processing batch {start}-{end}: {e}")
+            # Fill with zeros if batch fails
+            prob_data[start:end] = 0
+            del batch
+            gc.collect()
+    
+    # Clean up traces
+    del traces
+    gc.collect()
     
     # Handle spike data based on keep_probabilities flag
     if keep_probabilities:
         print("  → Using probabilities directly as spike data…")
-        spike_data = prob_data.T.copy()  # (N, T) -> (T, N), matching expected format
+        spike_data = prob_data.T.copy().astype(np.float16)  # (N, T) -> (T, N), matching expected format
     else:
         print("  → Sampling binary spikes from probabilities…")
-        prob_clamped = np.clip(prob_data, 0, 1)
-        spike_data = np.random.binomial(1, prob_clamped).astype(int).T  # (N, T) -> (T, N)
+        # Convert to float32 for binomial sampling with additional safety checks
+        prob_for_sampling = prob_data.astype(np.float32)
+        
+        # Additional safety: handle any remaining NaN/inf values and ensure [0, 1] range
+        prob_for_sampling = np.nan_to_num(prob_for_sampling, nan=0.0, posinf=1.0, neginf=0.0)
+        prob_for_sampling = np.clip(prob_for_sampling, 0.0, 1.0)
+        
+        # Final validation before binomial sampling
+        if np.any(np.isnan(prob_for_sampling)) or np.any(np.isinf(prob_for_sampling)):
+            print("  → Warning: Still found NaN/inf values after cleanup, setting to 0")
+            prob_for_sampling = np.nan_to_num(prob_for_sampling, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        if np.any(prob_for_sampling < 0) or np.any(prob_for_sampling > 1):
+            print("  → Warning: Found values outside [0,1] range after clipping, re-clipping")
+            prob_for_sampling = np.clip(prob_for_sampling, 0.0, 1.0)
+        
+        # Now safe to use binomial sampling
+        spike_data = np.random.binomial(1, prob_for_sampling).astype(np.uint8).T  # (N, T) -> (T, N)
+        del prob_for_sampling
+        gc.collect()
     
     return prob_data, spike_data
 
@@ -577,7 +629,8 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
                    split_ratio=0.95, seed=42, spike_method='oasis', 
                    cascade_model='Global_EXC_2Hz_smoothing500ms',
                    oasis_fudge_factor=0.98, oasis_penalty=1, oasis_threshold_factor=0.333,
-                   precomputed_dir=None, keep_cascade_probabilities=False, use_probabilities=False):
+                   precomputed_dir=None, keep_cascade_probabilities=False, use_probabilities=False,
+                   test_run_neurons=None, original_sampling_rate=None, target_sampling_rate=None):
     """
     Process a single subject through the complete pipeline.
     
@@ -596,6 +649,9 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
         precomputed_dir: Path to directory with pre-computed spike data (if provided, skips spike inference)
         keep_cascade_probabilities: If True, use CASCADE probabilities directly instead of sampling binary spikes
         use_probabilities: If True, use probabilities instead of binary spikes in final output
+        test_run_neurons: If specified, randomly select only this many neurons for testing
+        original_sampling_rate: Original sampling rate of the calcium traces in Hz (required for CASCADE)
+        target_sampling_rate: Target sampling rate for interpolation in Hz (required for CASCADE)
         
     Returns:
         subject_output_dir: Path to subject's output directory
@@ -628,6 +684,27 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
         try:
             # Load pre-computed spike data
             calcium_data, prob_data, spike_data, cell_xyz, method_used = load_precomputed_spike_data(precomputed_file, use_probabilities=use_probabilities)
+            
+            # Apply test run neuron selection if specified
+            if test_run_neurons is not None:
+                T, N = spike_data.shape
+                if test_run_neurons < N:
+                    print(f"  → Test run: selecting {test_run_neurons} random neurons out of {N}")
+                    np.random.seed(seed)  # For reproducibility
+                    selected_indices = np.random.choice(N, test_run_neurons, replace=False)
+                    selected_indices = np.sort(selected_indices)  # Keep sorted for easier processing
+                    
+                    # Filter all data to selected neurons
+                    spike_data = spike_data[:, selected_indices]
+                    prob_data = prob_data[selected_indices, :]
+                    cell_xyz = cell_xyz[selected_indices, :]
+                    
+                    if calcium_data is not None:
+                        calcium_data = calcium_data[:, selected_indices]
+                    
+                    print(f"  → Reduced to {test_run_neurons} neurons for testing")
+                else:
+                    print(f"  → Test run: requested {test_run_neurons} neurons but only {N} available, using all")
             
             # If we don't have raw calcium data, create dummy data for visualization
             if calcium_data is None:
@@ -725,45 +802,176 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
             if isinstance(cell_xyz, np.ndarray) and cell_xyz.dtype == np.object_:
                 cell_xyz = cell_xyz[0, 0]
             
+            # Load fluorescence traces - prefer CellRespZ (already ΔF/F) if available
+            with h5py.File(os.path.join(subject_dir, 'TimeSeries.h5'), 'r') as f:
+                if 'CellRespZ' in f:
+                    calcium = f['CellRespZ'][:]  # May be (N, T) or (T, N)
+                    is_already_dff = True
+                    print("  → Using CellRespZ traces (already ΔF/F)")
+                else:
+                    calcium = f['CellResp'][:]  # May be (N, T) or (T, N)
+                    is_already_dff = False
+                    print("  → Using CellResp traces (raw fluorescence)")
+            
+            # Check dimensions and transpose if needed
+            # The calcium data might be stored as (N, T) instead of (T, N)
+            if calcium.shape[0] == cell_xyz.shape[0]:
+                # First dimension matches number of cells, so data is (N, T)
+                print(f"  → Calcium data is (N, T) = {calcium.shape}, transposing to (T, N)")
+                calcium = calcium.T
+            elif calcium.shape[1] == cell_xyz.shape[0]:
+                # Second dimension matches number of cells, so data is already (T, N)
+                print(f"  → Calcium data is already (T, N) = {calcium.shape}")
+            else:
+                # Neither dimension matches - this is the problematic case
+                print(f"  → Warning: Calcium shape {calcium.shape} doesn't match cell count {cell_xyz.shape[0]}")
+                print(f"  → Assuming calcium is (T, N) and truncating to match")
+                
+            T, N_original = calcium.shape
+            
             # Handle invalid anatomical indices
+            anatomical_mask = np.ones(N_original, bool)
             if 'IX_inval_anat' in data0.dtype.names:
                 inval = data0['IX_inval_anat']
                 if isinstance(inval, np.ndarray) and inval.dtype == np.object_:
                     inval = inval[0, 0].flatten()
-                mask = np.ones(cell_xyz.shape[0], bool)
-                mask[np.array(inval, int) - 1] = False
-                cell_xyz = cell_xyz[mask]
+                # Only apply anatomical mask if indices are within range
+                inval_indices = np.array(inval, int) - 1  # Convert to 0-based indexing
+                valid_inval_indices = inval_indices[inval_indices < N_original]
+                if len(valid_inval_indices) > 0:
+                    anatomical_mask[valid_inval_indices] = False
             
-            # Load raw fluorescence traces
-            with h5py.File(os.path.join(subject_dir, 'TimeSeries.h5'), 'r') as f:
-                calcium = f['CellResp'][:]  # shape = (T, N)
+            # Filter out neurons with invalid coordinates (NaN values)
+            coordinate_mask = ~np.isnan(cell_xyz).any(axis=1)
+            
+            # Combine both masks
+            valid_mask = anatomical_mask & coordinate_mask
+            
+            # Count how many neurons are being filtered out
+            n_invalid_anatomical = np.sum(~anatomical_mask)
+            n_invalid_coordinates = np.sum(~coordinate_mask)
+            n_total_filtered = np.sum(~valid_mask)
+            
+            if n_invalid_anatomical > 0:
+                print(f"  → Filtering out {n_invalid_anatomical} neurons with invalid anatomical indices")
+            if n_invalid_coordinates > 0:
+                print(f"  → Filtering out {n_invalid_coordinates} neurons with invalid coordinates (NaN values)")
+            if n_total_filtered > 0:
+                print(f"  → Total neurons filtered: {n_total_filtered} out of {N_original} ({n_total_filtered/N_original*100:.1f}%)")
+            # Apply the combined mask to both cell positions and calcium data
+            cell_xyz = cell_xyz[valid_mask]
+            calcium = calcium[:, valid_mask]  # Filter columns (neurons)
             
             T, N = calcium.shape
-            assert N == cell_xyz.shape[0], f"Cell count mismatch: {N} vs {cell_xyz.shape[0]}"
+            print(f"  → Retained {N} neurons with valid coordinates out of {N_original} total")
+            
+            # Apply test run neuron selection if specified
+            if test_run_neurons is not None and test_run_neurons < N:
+                print(f"  → Test run: selecting {test_run_neurons} random neurons out of {N}")
+                np.random.seed(seed)  # For reproducibility
+                selected_indices = np.random.choice(N, test_run_neurons, replace=False)
+                selected_indices = np.sort(selected_indices)  # Keep sorted for easier processing
+                
+                # Filter calcium data and cell positions to selected neurons
+                calcium = calcium[:, selected_indices]
+                cell_xyz = cell_xyz[selected_indices, :]
+                
+                T, N = calcium.shape
+                print(f"  → Reduced to {N} neurons for testing")
+            elif test_run_neurons is not None:
+                print(f"  → Test run: requested {test_run_neurons} neurons but only {N} available, using all")
+            
+            # Keep a copy of calcium for visualization (sample subset to save memory)
+            calcium_for_viz = calcium[:, :min(num_neurons * 2, N)].copy()
             
             # Step 2: Run spike inference based on method
             if spike_method.lower() == 'cascade':
-                # Compute ΔF/F for CASCADE
-                print("  → Computing ΔF/F (8th-percentile, 30s sliding window)...")
+                # Use ΔF/F for CASCADE
+                # if is_already_dff:
+                #     print("  → Using existing ΔF/F traces for CASCADE...")
+                #     dff = compute_dff(calcium)# calcium.copy()  # Make a copy to avoid modifying original
+                # else:
+                #     print("  → Computing ΔF/F (8th-percentile, 30s sliding window)...")
+                #     dff = compute_dff(calcium)
+
+                # perform linear interpolation on the calcium trace using scipy
+                print(f"  → Interpolating calcium traces from {original_sampling_rate}Hz to {target_sampling_rate}Hz...")
+                
+                # Validate sampling rates are provided for CASCADE
+                if original_sampling_rate is None or target_sampling_rate is None:
+                    raise ValueError("--original_sampling_rate and --target_sampling_rate must be provided when using CASCADE")
+                
+                # Create original time points
+                original_time = np.arange(T) / original_sampling_rate
+                
+                # Create new time points at target sampling rate
+                new_T = int(T * target_sampling_rate / original_sampling_rate)
+                new_time = np.arange(new_T) / target_sampling_rate
+                
+                # Interpolate each neuron's trace
+                from scipy.interpolate import interp1d
+                calcium_interpolated = np.zeros((new_T, N), dtype=calcium.dtype)
+                
+                for n in range(N):
+                    interp_func = interp1d(original_time, calcium[:, n], kind='linear', 
+                                         bounds_error=False, fill_value='extrapolate')
+                    calcium_interpolated[:, n] = interp_func(new_time)
+                
+                # Replace calcium with interpolated version
+                calcium = calcium_interpolated
+                T = new_T
+                print(f"  → Interpolated to {T} timepoints at {target_sampling_rate}Hz")
+
+
+                # perform dff on the whole calcium trace
                 dff = compute_dff(calcium)
                 
+                # Clean up calcium to free memory
+                del calcium
+                gc.collect()
+                print_memory_stats("After ΔF/F computation")
+                
                 # Run CASCADE inference
+                # If we want probabilities in final output, avoid binary sampling entirely
+                cascade_keep_probs = keep_cascade_probabilities or use_probabilities
                 prob_data, spike_data = run_spike_inference(
                     dff, method='cascade', 
                     batch_size=batch_size, 
                     model_type=cascade_model,
-                    keep_probabilities=keep_cascade_probabilities
+                    keep_probabilities=cascade_keep_probs
                 )
                 
+                # Clean up after CASCADE
+                del dff
+                gc.collect()
+                print_memory_stats("After CASCADE inference")
+                
             elif spike_method.lower() == 'oasis':
-                # Run OASIS directly on raw calcium
-                dff = compute_dff(calcium)
+                # OASIS expects raw calcium, but can also work with ΔF/F
+                if is_already_dff:
+                    print("  → Using existing ΔF/F traces for OASIS...")
+                    dff = calcium.copy()  # Make a copy to avoid modifying original
+                else:
+                    print("  → Computing ΔF/F (8th-percentile, 30s sliding window)...")
+                    dff = compute_dff(calcium)
+                
+                # Clean up calcium to free memory
+                del calcium
+                gc.collect()
+                print_memory_stats("After ΔF/F computation")
+                
                 prob_data, spike_data = run_spike_inference(
                     dff, method='oasis',
                     fudge_factor=oasis_fudge_factor,
                     penalty=oasis_penalty, 
                     threshold_factor=oasis_threshold_factor
                 )
+                
+                # Clean up after OASIS
+                del dff
+                gc.collect()
+                print_memory_stats("After OASIS inference")
+                
             else:
                 raise ValueError(f"Unknown spike method: {spike_method}. Use 'oasis' or 'cascade'.")
             
@@ -795,6 +1003,8 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
                 f.attrs['data_source'] = 'raw_calcium'
                 f.attrs['use_probabilities'] = use_probabilities
                 f.attrs['data_type'] = metadata['data_type']
+                f.attrs['is_already_dff'] = is_already_dff
+                f.attrs['calcium_source'] = 'CellRespZ' if is_already_dff else 'CellResp'
                 
                 # Method-specific attributes
                 if spike_method.lower() == 'cascade':
@@ -805,6 +1015,10 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
                     f.attrs['oasis_fudge_factor'] = oasis_fudge_factor
                     f.attrs['oasis_penalty'] = oasis_penalty
                     f.attrs['oasis_threshold_factor'] = oasis_threshold_factor
+                
+                # Force write to disk
+                f.flush()
+            print(f"  → ✓ Saved grid data: {final_file}")
             
             # Save metadata separately
             metadata_file = os.path.join(subject_output_dir, 'metadata.h5')
@@ -817,14 +1031,19 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
                 f.create_dataset('is_train', data=metadata['is_train'])
                 f.attrs['use_probabilities'] = use_probabilities
                 f.attrs['data_type'] = metadata['data_type']
+                
+                # Force write to disk
+                f.flush()
+            print(f"  → ✓ Saved metadata: {metadata_file}")
             
             # Step 5: Create visualization PDF
             print("  → Creating visualization PDF...")
-            create_visualization_pdf(calcium, prob_data, spike_data, subject_name, 
+            create_visualization_pdf(calcium_for_viz, prob_data, spike_data, subject_name, 
                                     pdf_file, num_neurons, spike_method)
+            print(f"  → ✓ Saved visualization: {pdf_file}")
             
             # Clean up memory
-            del calcium, prob_data, spike_data, grids
+            del calcium_for_viz, prob_data, spike_data, grids
             gc.collect()
             
             processing_time = time.time() - start_time
@@ -835,6 +1054,73 @@ def process_subject(subject_dir, output_dir, num_neurons=10, batch_size=30000,
         except Exception as e:
             print(f"  → Error processing {subject_name}: {e}")
             raise
+
+def update_combined_metadata(subject_output_dir, output_dir, processing_mode, args):
+    """
+    Update the combined metadata file with results from a single subject.
+    This allows progressive saving so completed subjects aren't lost if the process crashes.
+    """
+    subject_name = os.path.basename(subject_output_dir)
+    metadata_path = os.path.join(subject_output_dir, 'metadata.h5')
+    combined_metadata_path = os.path.join(output_dir, 'combined_metadata.h5')
+    
+    if not os.path.exists(metadata_path):
+        print(f"  → Warning: Metadata file not found for {subject_name}")
+        return
+    
+    # Load subject metadata
+    try:
+        with h5py.File(metadata_path, 'r') as f:
+            subject_data = {
+                'num_timepoints': f['num_timepoints'][()],
+                'num_z_planes': f['num_z_planes'][()],
+                'z_values': f['z_values'][:],
+                'train_timepoints': f['train_timepoints'][:],
+                'test_timepoints': f['test_timepoints'][:],
+                'is_train': f['is_train'][:]
+            }
+            if 'use_probabilities' in f.attrs:
+                subject_data['use_probabilities'] = f.attrs['use_probabilities']
+            if 'data_type' in f.attrs:
+                subject_data['data_type'] = f.attrs['data_type']
+    except Exception as e:
+        print(f"  → Error reading metadata for {subject_name}: {e}")
+        return
+    
+    # Update or create combined metadata file
+    try:
+        # Try to open existing file, create if doesn't exist
+        mode = 'a' if os.path.exists(combined_metadata_path) else 'w'
+        with h5py.File(combined_metadata_path, mode) as f:
+            # Set global attributes only if creating new file
+            if mode == 'w':
+                if processing_mode == "precomputed":
+                    f.attrs['data_source'] = 'precomputed'
+                    f.attrs['precomputed_dir'] = args.precomputed_dir
+                else:
+                    f.attrs['data_source'] = 'raw_calcium'
+                    f.attrs['spike_method'] = args.spike_method
+                f.attrs['use_probabilities'] = args.use_probabilities
+            
+            # Remove existing subject group if it exists (for reprocessing)
+            if subject_name in f:
+                del f[subject_name]
+            
+            # Add subject data
+            subject_group = f.create_group(subject_name)
+            for key, value in subject_data.items():
+                if key in ['use_probabilities', 'data_type']:
+                    subject_group.attrs[key] = value
+                else:
+                    subject_group.create_dataset(key, data=value)
+            
+            # Force write to disk
+            f.flush()
+            
+        print(f"  → ✓ Updated combined metadata for {subject_name}")
+        
+    except Exception as e:
+        print(f"  → Error updating combined metadata for {subject_name}: {e}")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -850,7 +1136,7 @@ def main():
                         help='Spike detection method: oasis (default) or cascade (ignored if --precomputed_dir is provided)')
     parser.add_argument('--num_neurons', type=int, default=10,
                         help='Number of neurons to visualize in PDFs')
-    parser.add_argument('--batch_size', type=int, default=30000,
+    parser.add_argument('--batch_size', type=int, default=5000,
                         help='Batch size for CASCADE processing')
     parser.add_argument('--split_ratio', type=float, default=0.95,
                         help='Ratio of data to use for training')
@@ -877,8 +1163,19 @@ def main():
     
     parser.add_argument('--skip', type=str, default='',
                         help='Comma-separated list of subjects to skip')
+    parser.add_argument('--test_run_neurons', type=int, default=None,
+                        help='For testing: randomly select only this many neurons from each subject')
+    parser.add_argument('--original_sampling_rate', type=float, default=None,
+                        help='Original sampling rate of the calcium traces in Hz (e.g., 2.73) - required when using CASCADE')
+    parser.add_argument('--target_sampling_rate', type=float, default=None,
+                        help='Target sampling rate for interpolation in Hz (e.g., 2.5 or 3.0) - required when using CASCADE')
     
     args = parser.parse_args()
+    
+    # Validate CASCADE-specific requirements
+    if not args.precomputed_dir and args.spike_method.lower() == 'cascade':
+        if args.original_sampling_rate is None or args.target_sampling_rate is None:
+            parser.error("--original_sampling_rate and --target_sampling_rate are required when using CASCADE")
     
     # Determine processing mode
     if args.precomputed_dir:
@@ -942,7 +1239,10 @@ def main():
     # Process subjects
     processed_subjects = []
     
-    if args.workers > 1:
+    # Force sequential processing for CASCADE to avoid memory issues
+    use_parallel = args.workers > 1 and not (processing_mode == "raw" and args.spike_method.lower() == 'cascade')
+    
+    if use_parallel:
         print(f"Processing subjects in parallel with {args.workers} workers")
         with ProcessPoolExecutor(max_workers=args.workers) as executor:
             futures = [
@@ -961,7 +1261,10 @@ def main():
                     args.oasis_threshold_factor,
                     args.precomputed_dir,
                     args.keep_cascade_probabilities,
-                    args.use_probabilities
+                    args.use_probabilities,
+                    args.test_run_neurons,
+                    args.original_sampling_rate,
+                    args.target_sampling_rate
                 )
                 for subject_dir in subjects
             ]
@@ -971,10 +1274,18 @@ def main():
                     result = future.result()
                     if result is not None:
                         processed_subjects.append(result)
+                        
+                        # Update combined metadata file immediately after each subject
+                        update_combined_metadata(result, args.output_dir, processing_mode, args)
+                        
                 except Exception as e:
                     print(f"Error in parallel processing: {e}")
     else:
-        print("Processing subjects sequentially")
+        if processing_mode == "raw" and args.spike_method.lower() == 'cascade':
+            print("Processing subjects sequentially (CASCADE requires sequential processing to avoid memory issues)")
+        else:
+            print("Processing subjects sequentially")
+            
         for subject_dir in subjects:
             try:
                 result = process_subject(
@@ -991,59 +1302,55 @@ def main():
                     args.oasis_threshold_factor,
                     args.precomputed_dir,
                     args.keep_cascade_probabilities,
-                    args.use_probabilities
+                    args.use_probabilities,
+                    args.test_run_neurons,
+                    args.original_sampling_rate,
+                    args.target_sampling_rate
                 )
                 if result is not None:
                     processed_subjects.append(result)
+                    
+                    # Update combined metadata file immediately after each subject
+                    update_combined_metadata(result, args.output_dir, processing_mode, args)
+                    
+                # Force garbage collection between subjects when using CASCADE
+                if processing_mode == "raw" and args.spike_method.lower() == 'cascade':
+                    gc.collect()
+                    print_memory_stats("After processing subject")
+                    
             except Exception as e:
                 print(f"Error processing {subject_dir}: {e}")
+                gc.collect()  # Clean up after errors too
     
-    # Create combined metadata file
-    print("\nCreating combined metadata file...")
+    # Load combined metadata file (progressively saved during processing)
+    print("\nReading combined metadata file...")
     combined_metadata = {}
-    
-    for subject_dir in processed_subjects:
-        subject_name = os.path.basename(subject_dir)
-        metadata_path = os.path.join(subject_dir, 'metadata.h5')
-        
-        if os.path.exists(metadata_path):
-            with h5py.File(metadata_path, 'r') as f:
-                subject_data = {
-                    'num_timepoints': f['num_timepoints'][()],
-                    'num_z_planes': f['num_z_planes'][()],
-                    'z_values': f['z_values'][:],
-                    'train_timepoints': f['train_timepoints'][:],
-                    'test_timepoints': f['test_timepoints'][:],
-                    'is_train': f['is_train'][:]
-                }
-                if 'use_probabilities' in f.attrs:
-                    subject_data['use_probabilities'] = f.attrs['use_probabilities']
-                if 'data_type' in f.attrs:
-                    subject_data['data_type'] = f.attrs['data_type']
-                combined_metadata[subject_name] = subject_data
-    
-    # Save combined metadata
     combined_metadata_path = os.path.join(args.output_dir, 'combined_metadata.h5')
-    with h5py.File(combined_metadata_path, 'w') as f:
-        if processing_mode == "precomputed":
-            f.attrs['data_source'] = 'precomputed'
-            f.attrs['precomputed_dir'] = args.precomputed_dir
-        else:
-            f.attrs['data_source'] = 'raw_calcium'
-            f.attrs['spike_method'] = args.spike_method
-        
-        f.attrs['use_probabilities'] = args.use_probabilities
-        
-        for subject, data in combined_metadata.items():
-            subject_group = f.create_group(subject)
-            for key, value in data.items():
-                if key in ['use_probabilities', 'data_type']:
-                    subject_group.attrs[key] = value
-                else:
-                    subject_group.create_dataset(key, data=value)
+    
+    if os.path.exists(combined_metadata_path):
+        with h5py.File(combined_metadata_path, 'r') as f:
+            for subject_name in f.keys():
+                subject_group = f[subject_name]
+                subject_data = {}
+                
+                # Load datasets
+                for key in ['num_timepoints', 'num_z_planes', 'z_values', 'train_timepoints', 'test_timepoints', 'is_train']:
+                    if key in subject_group:
+                        subject_data[key] = subject_group[key][()]
+                
+                # Load attributes
+                for key in ['use_probabilities', 'data_type']:
+                    if key in subject_group.attrs:
+                        subject_data[key] = subject_group.attrs[key]
+                
+                combined_metadata[subject_name] = subject_data
+    else:
+        print("  → Warning: Combined metadata file not found - this may indicate no subjects were successfully processed")
     
     print(f"\nUnified processing complete!")
     print(f"Processed {len(processed_subjects)} subjects using {processing_mode} data")
+    if args.test_run_neurons is not None:
+        print(f"Test mode: Used only {args.test_run_neurons} randomly selected neurons per subject")
     print(f"Output saved to: {args.output_dir}")
     print(f"Combined metadata: {combined_metadata_path}")
     

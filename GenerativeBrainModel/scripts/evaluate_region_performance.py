@@ -23,6 +23,13 @@ import sys
 import traceback
 import pdb
 import h5py
+import torch
+import numpy as np
+
+# set seed
+torch.manual_seed(41)
+np.random.seed(41)
+
 
 
 # Add parent directory to path for imports

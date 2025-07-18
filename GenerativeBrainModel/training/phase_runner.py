@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import gc
 import time
 from typing import Dict, Any, Optional, List
+import json
 
 # Import our modules
 from GenerativeBrainModel.models.gbm import GBM
@@ -24,91 +25,97 @@ from GenerativeBrainModel.utils.file_utils import create_experiment_dir, save_lo
 from GenerativeBrainModel.utils.data_utils import get_max_z_planes
 
 
-class TwoPhaseTrainer:
-    """Orchestrates two-phase GBM training: pretrain on multiple subjects, then finetune on target subject."""
-    
+def get_all_subjects(preaugmented_dir: str) -> List[str]:
+    """Get list of all valid subject directories."""
+    all_subjects = []
+    for subject_dir in os.listdir(preaugmented_dir):
+        subject_path = os.path.join(preaugmented_dir, subject_dir)
+        if os.path.isdir(subject_path):
+            grid_file = os.path.join(subject_path, 'preaugmented_grids.h5')
+            if os.path.exists(grid_file):
+                all_subjects.append(subject_dir)
+    return all_subjects
+
+
+class MultiPhaseTrainer:
+    """Orchestrates multi-phase GBM training."""
+
     def __init__(
         self,
         exp_root: str,
-        pretrain_params: Dict[str, Any],
-        finetune_params: Dict[str, Any],
-        target_subject: Optional[str],
-        skip_pretrain: bool = False,
-        pretrain_checkpoint: Optional[str] = None,
-        pretrain_only_mode: bool = False
+        phase_configs: List[Dict[str, Any]],
+        initial_checkpoint: Optional[str] = None
     ):
-        """Initialize the two-phase trainer.
-        
+        """Initialize the multi-phase trainer.
+
         Args:
             exp_root: Root experiment directory
-            pretrain_params: Parameters for pretraining phase
-            finetune_params: Parameters for finetuning phase
-            target_subject: Name of target subject for finetuning (None for pretrain-only mode)
-            skip_pretrain: Whether to skip pretraining phase
-            pretrain_checkpoint: Path to existing pretrain checkpoint
-            pretrain_only_mode: If True, only run pretraining phase on all subjects
+            phase_configs: List of phase configurations, each a dict with 'name', 'subjects' (list or None), 
+                          'exclude' (optional list), 'params' (dict)
+            initial_checkpoint: Optional checkpoint to start the first phase from
         """
         self.exp_root = exp_root
-        self.pretrain_params = pretrain_params
-        self.finetune_params = finetune_params
-        self.target_subject = target_subject
-        self.skip_pretrain = skip_pretrain
-        self.pretrain_checkpoint = pretrain_checkpoint
-        self.pretrain_only_mode = pretrain_only_mode
-        
+        self.phase_configs = phase_configs
+        self.initial_checkpoint = initial_checkpoint
+
         # Initialize results
-        self.results: Dict[str, Optional[str]] = {
-            'pretrain_checkpoint': None,
-            'finetune_checkpoint': None
-        }
-        
+        self.results: Dict[str, Optional[str]] = {}
+
+    def validate_phases(self, all_subjects: List[str]):
+        """Validate phase configurations for no subject overlaps."""
+        phase_subjects = {}
+        for config in self.phase_configs:
+            name = config['name']
+            if 'subjects' in config and config['subjects']:
+                effective = set(config['subjects'])
+            elif 'exclude' in config:
+                effective = set(all_subjects) - set(config['exclude'])
+            else:
+                effective = set(all_subjects)
+
+            phase_subjects[name] = effective
+
+            if not effective:
+                raise ValueError(f"Phase {name} has no subjects!")
+
+        # Check for overlaps
+        for i, config1 in enumerate(self.phase_configs):
+            set1 = phase_subjects[config1['name']]
+            for config2 in self.phase_configs[i+1:]:
+                set2 = phase_subjects[config2['name']]
+                overlap = set1.intersection(set2)
+                if overlap:
+                    raise ValueError(f"Overlap between {config1['name']} and {config2['name']}: {overlap}")
+
     def run(self) -> Dict[str, Any]:
-        """Run the complete two-phase training process.
-        
+        """Run the complete multi-phase training process.
+
         Returns:
             dict: Training results including checkpoint paths
         """
-        # Phase 1: Pretraining
-        if not self.skip_pretrain and self.pretrain_checkpoint is None:
-            if self.pretrain_only_mode:
-                tqdm.write(f"Running pretraining phase on ALL subjects (pretrain-only mode)...")
-                self.results['pretrain_checkpoint'] = self._run_phase(
-                    phase_name="pretrain",
-                    params=self.pretrain_params,
-                    subjects_exclude=None,  # Don't exclude any subjects
-                    subjects_include=None,
-                    init_checkpoint=None
-                )
-            else:
-                tqdm.write(f"Running pretraining phase on all subjects except '{self.target_subject}'...")
-                self.results['pretrain_checkpoint'] = self._run_phase(
-                    phase_name="pretrain",
-                    params=self.pretrain_params,
-                    subjects_exclude=[self.target_subject] if self.target_subject else None,
-                    subjects_include=None,
-                    init_checkpoint=None
-                )
-        elif self.pretrain_checkpoint:
-            tqdm.write(f"Skipping pretraining, using provided checkpoint: {self.pretrain_checkpoint}")
-            self.results['pretrain_checkpoint'] = self.pretrain_checkpoint
-        else:
-            tqdm.write(f"Skipping pretraining phase as requested.")
-            
-        # Phase 2: Finetuning (skip if in pretrain-only mode)
-        if not self.pretrain_only_mode:
-            tqdm.write(f"Running finetuning phase on target subject '{self.target_subject}'...")
-            
-            self.results['finetune_checkpoint'] = self._run_phase(
-                phase_name="finetune",
-                params=self.finetune_params,
-                subjects_include=[self.target_subject] if self.target_subject else None,
-                subjects_exclude=None,
-                init_checkpoint=self.results['pretrain_checkpoint']
+        # Get all subjects
+        preaugmented_dir = self.phase_configs[0]['params']['preaugmented_dir']  # Assume same for all
+        all_subjects = get_all_subjects(preaugmented_dir)
+        self.validate_phases(all_subjects)
+
+        prev_checkpoint = self.initial_checkpoint
+        for config in self.phase_configs:
+            tqdm.write(f"Running phase {config['name']} on subjects {config.get('subjects', 'all')}...")
+
+            include = config.get('subjects', None)
+            exclude = config.get('exclude', None)
+
+            checkpoint = self._run_phase(
+                phase_name=config['name'],
+                params=config['params'],
+                subjects_include=include,
+                subjects_exclude=exclude,
+                init_checkpoint=prev_checkpoint
             )
-        else:
-            tqdm.write(f"Skipping finetuning phase (pretrain-only mode)")
-            self.results['finetune_checkpoint'] = None
-        
+
+            self.results[f"{config['name']}_checkpoint"] = checkpoint
+            prev_checkpoint = checkpoint
+
         return self.results
     
     def _run_phase(
@@ -181,16 +188,13 @@ class TwoPhaseTrainer:
             model, optimizer, lr_scheduler, train_loader, test_loader,
             phase_dir, phase_name, params
         )
-        
-        # Save test data and predictions if this is the finetuning phase OR pretrain-only mode
-        if phase_name == "finetune" or (phase_name == "pretrain" and self.pretrain_only_mode):
-            tqdm.write("Saving test data and predictions for analysis...")
-            # Directory for test data HDF5
-            save_data_dir = os.path.join(phase_dir, 'test_data')
-            os.makedirs(save_data_dir, exist_ok=True)
-            # Use the original binary data loader to capture sequence z starts
-            save_test_data_and_predictions(model, test_loader, save_data_dir, num_samples=100, params=params)
-        
+
+        # Always save test data and predictions for each phase
+        tqdm.write("Saving test data and predictions for analysis...")
+        save_data_dir = os.path.join(phase_dir, 'test_data')
+        os.makedirs(save_data_dir, exist_ok=True)
+        save_test_data_and_predictions(model, test_loader, save_data_dir, num_samples=100, params=params)
+
         return best_checkpoint_path
     
     def _create_data_loader(self, params, subjects_include, subjects_exclude, split, shuffle):

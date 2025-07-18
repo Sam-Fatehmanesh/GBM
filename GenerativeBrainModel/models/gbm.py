@@ -9,7 +9,7 @@ import pdb
 import os
 
 class GBM(nn.Module):
-    def __init__(self, mamba_layers=1, mamba_dim=2048, mamba_state_multiplier=1, pretrained_ae_path="/home/user/GBM/experiments/autoencoder/20250627_090051/checkpoints/best_model.pt"):
+    def __init__(self, mamba_layers=1, mamba_dim=2048, mamba_state_multiplier=1, pretrained_ae_path="/home/user/GBM/experiments/autoencoder/20250715_220015/checkpoints/best_model.pt"):
         """Generative Brain Model combining pretrained autoencoder with Mamba for sequential prediction.
         
         Args:
@@ -26,6 +26,7 @@ class GBM(nn.Module):
                 checkpoint_ae = torch.load(pretrained_ae_path, map_location='cpu')
                 self.autoencoder.load_state_dict(checkpoint_ae['model_state_dict'])
             except Exception:
+                print(f"Error loading autoencoder weights from {pretrained_ae_path}")
                 # Skip loading if any error
                 pass
         

@@ -109,17 +109,24 @@ def track_metrics_during_validation(model, data_loader, device):
                 # Keep predictions as bool to save memory
                 preds = (probs > 0.5)
                 
-                # Calculate Bernoulli-sampled spike counts
-                bernoulli_preds = torch.bernoulli(probs).to(torch.int64)
+                # Calculate Bernoulli-sampled spike counts - clean probs for safety
+                probs_clean = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+                probs_clean = torch.clamp(probs_clean, min=0.0, max=1.0)
+                bernoulli_preds = torch.bernoulli(probs_clean).to(torch.int64)
                 total_pred_spikes_bernoulli += bernoulli_preds.sum().item()
                 
-                del predictions, probs, bernoulli_preds
+                del predictions, probs, probs_clean, bernoulli_preds
                 
                 # Keep targets as bool as well - use 0.5 threshold for consistency with predictions
                 targets = (batch_for_model[:, 1:] > 0.5).bool()
-                total_true_spikes += targets.to(torch.int64).sum().item()
                 
-                del batch, batch_for_model
+                # Clean target data before passing to torch.bernoulli() to avoid device-side assertion
+                target_data = batch_for_model[:, 1:]
+                target_data = torch.nan_to_num(target_data, nan=0.0, posinf=1.0, neginf=0.0)
+                target_data = torch.clamp(target_data, min=0.0, max=1.0)
+                total_true_spikes += torch.bernoulli(target_data).bool().to(torch.int64).sum().item()
+                
+                del batch, batch_for_model, target_data
                 torch.cuda.empty_cache()
                 
                 # Use boolean operations for memory efficiency

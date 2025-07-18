@@ -125,3 +125,4 @@ __MACOSX
 old_scripts
 .env
 *.avi
+*.json
