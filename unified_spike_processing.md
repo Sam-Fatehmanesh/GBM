@@ -117,6 +117,111 @@ volumization:
 
 ---
 
+## Raw Data Analysis Mode
+
+The `--raw_data_info` flag allows you to analyze the raw data structure and characteristics without running the full processing pipeline. This is useful for:
+
+- **Data quality assessment** - Check for missing files, dimension mismatches, or invalid data
+- **Parameter optimization** - Determine optimal volume dimensions and memory requirements
+- **Troubleshooting** - Identify issues before running expensive processing
+
+### Information Provided
+
+For each subject found in the input directory, the analysis reports:
+
+#### File Structure
+- Presence of required files (`data_full.mat`, `TimeSeries.h5`)
+- Available datasets in `TimeSeries.h5`
+- Verification of configured `calcium_dataset` name
+
+#### Cell Position Data
+- **Total neurons**: Count of cells with position data
+- **Valid/Invalid coordinates**: Cells with NaN vs. valid spatial coordinates
+- **Spatial bounds**: Min/max coordinates in X, Y, Z dimensions
+- **Spatial statistics**: Mean and standard deviation of cell positions
+- **Invalid anatomical indices**: Count of cells marked for exclusion
+
+#### Calcium Trace Data
+- **Dataset shape**: Dimensions of calcium fluorescence data
+- **Data type**: Storage format (float32, float64, etc.)
+- **Format detection**: Whether data is (T, N) or (N, T) format
+- **Temporal information**: Duration and sampling rate calculations
+- **Memory requirements**: Estimated RAM usage during processing
+- **Data statistics**: Min/max/mean/std of sample data
+- **Data quality**: Detection of NaN or infinity values
+
+#### Volumization Preview
+- **Target volume shape**: Configured 3D volume dimensions
+- **Volume memory requirements**: Estimated storage size
+- **Spatial resolution**: Physical units per voxel
+- **Neuron density**: Average neurons per voxel
+- **Optimization warnings**: Suggestions for volume dimension adjustments
+
+### Example Output
+
+```
+================================================================================
+RAW DATA ANALYSIS
+================================================================================
+Found 5 subjects in raw_trace_data_2018
+Skipping subjects: []
+
+Subject: subject_001
+----------------------------------------
+  Cell positions shape: (45123, 3)
+  Valid coordinate neurons: 44891
+  Invalid coordinate neurons: 232
+  Spatial bounds:
+    X: 12.50 to 487.30 (range: 474.80)
+    Y: 8.75 to 512.44 (range: 503.69)
+    Z: 0.00 to 79.50 (range: 79.50)
+  Spatial statistics:
+    Mean: X=250.15, Y=260.87, Z=39.75
+    Std:  X=137.42, Y=145.23, Z=22.95
+  Invalid anatomical indices: 1247 neurons
+  Available datasets in TimeSeries.h5: ['CellResp', 'CellRespZ', 'TimeStamps']
+  Calcium dataset 'CellResp':
+    Shape: (45123, 18750)
+    Data type: float32
+    Format: (N, T) - will be transposed to (T, N)
+    Interpreted as: 18750 timepoints, 45123 neurons
+    Duration: 6863.64 seconds at 2.73 Hz
+    After resampling: 17159 timepoints at 2.5 Hz (6863.60 seconds)
+    Memory requirement: ~3.40 GB (float32)
+    Sample statistics (first 1000 neurons, 1000 timepoints):
+      Min: 125.2341
+      Max: 8943.7754
+      Mean: 1247.3829
+      Std: 891.2456
+  Volumization settings:
+    Target volume shape: [64, 64, 32]
+    Data type: float16
+    Volume memory requirement: ~0.70 GB
+    Spatial resolution: X=7.42, Y=7.87, Z=2.48 units/voxel
+    Average neurons per voxel: 3.44
+```
+
+### Optimization Recommendations
+
+Based on the analysis output, you can optimize processing parameters:
+
+**Volume Dimensions:**
+- **Too sparse** (< 0.1 neurons/voxel): Consider smaller volume dimensions
+- **Too dense** (> 10 neurons/voxel): Consider larger volume dimensions
+- **Optimal**: 1-5 neurons per voxel for good spatial resolution
+
+**Memory Management:**
+- Large datasets (> 2 GB): Reduce `batch_size` in configuration
+- Multiple subjects: Process sequentially to avoid memory issues
+- Consider using `test_run_neurons` for initial parameter testing
+
+**Data Quality:**
+- NaN/inf values: May require data preprocessing
+- Dimension mismatches: Check data loading and transposition logic
+- Missing datasets: Verify `calcium_dataset` name in configuration
+
+---
+
 ## Output Data Format
 
 ### Directory Structure Produced
@@ -230,7 +335,10 @@ volumization:
 # Create default configuration
 python unified_spike_processing.py --create-default-config config.yaml
 
-# Edit config.yaml as needed, then run
+# Analyze raw data information without processing
+python unified_spike_processing.py --config config.yaml --raw_data_info
+
+# Edit config.yaml as needed, then run full processing
 python unified_spike_processing.py --config config.yaml
 ```
 
@@ -267,6 +375,46 @@ time_series = volumes[:, x, y, z]  # Shape: (T,)
 active_mask = volumes[t] > 0.01  # Threshold for "active"
 active_coords = np.where(active_mask)
 ```
+
+---
+
+## Command Line Options
+
+The script supports several command line options:
+
+```bash
+python unified_spike_processing.py [OPTIONS]
+
+Options:
+  --config PATH                 Path to YAML configuration file (required for processing)
+  --create-default-config PATH  Create default configuration file at specified path and exit
+  --raw_data_info              Analyze and display raw data information without processing
+  -h, --help                   Show help message and exit
+```
+
+### Usage Patterns
+
+1. **First-time setup**: Create default configuration and analyze data
+   ```bash
+   python unified_spike_processing.py --create-default-config config.yaml
+   python unified_spike_processing.py --config config.yaml --raw_data_info
+   ```
+
+2. **Parameter optimization**: Use raw data analysis to optimize volume dimensions
+   ```bash
+   # Analyze data to determine optimal volume shape
+   python unified_spike_processing.py --config config.yaml --raw_data_info
+   
+   # Edit config.yaml based on analysis recommendations
+   # Run full processing
+   python unified_spike_processing.py --config config.yaml
+   ```
+
+3. **Troubleshooting**: Check data quality before processing
+   ```bash
+   # Quick data validation
+   python unified_spike_processing.py --config config.yaml --raw_data_info
+   ```
 
 ---
 
@@ -331,4 +479,6 @@ The script automatically reports:
 
 - **2025-07-18**: Initial 3D volumetric processing pipeline
 - **2025-07-18**: Added proper ΔF/F support and reorganized configuration
-- **2025-07-18**: Simplified file structure and merged metadata 
+- **2025-07-18**: Simplified file structure and merged metadata
+- **2025-07-18**: Added Poisson spike rate to probability conversion
+- **2025-07-18**: Added `--raw_data_info` flag for data analysis without processing 

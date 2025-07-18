@@ -145,7 +145,7 @@ def compute_baseline_correction(calcium_data, window_length=30.0, percentile=8, 
     
     return processed_data
 
-def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_2Hz_smoothing500ms'):
+def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_2Hz_smoothing500ms', sampling_rate=2.0):
     """
     Run CASCADE inference on calcium data to get spike probabilities.
     
@@ -153,9 +153,10 @@ def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_
         calcium_data: (T, N) array of calcium data (raw or baseline-subtracted)
         batch_size: Batch size for CASCADE processing
         model_type: CASCADE model to use
+        sampling_rate: Sampling rate in Hz for converting spike rates to probabilities
         
     Returns:
-        prob_data: (N, T) array of spike probabilities
+        prob_data: (N, T) array of spike probabilities converted from CASCADE spike rates
     """
     if not CASCADE_AVAILABLE:
         raise ImportError("CASCADE not available. Please install neuralib.")
@@ -186,7 +187,7 @@ def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_
         batch = traces[start:end]
         
         try:
-            batch_probs = cascade_predict(
+            batch_rates = cascade_predict(
                 batch,
                 model_type=model_type,
                 threshold=0,
@@ -194,12 +195,18 @@ def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_
                 verbose=False
             )
             
-            batch_probs = np.atleast_2d(batch_probs)
-            if batch_probs.shape != (end-start, T):
-                raise ValueError(f"Unexpected batch_probs shape: {batch_probs.shape}, expected: {(end-start, T)}")
+            batch_rates = np.atleast_2d(batch_rates)
+            if batch_rates.shape != (end-start, T):
+                raise ValueError(f"Unexpected batch_rates shape: {batch_rates.shape}, expected: {(end-start, T)}")
             
-            # Handle NaN, inf values and ensure probabilities are in [0, 1] range
-            batch_probs = np.nan_to_num(batch_probs, nan=0.0, posinf=1.0, neginf=0.0)
+            # Handle NaN, inf values - CASCADE outputs spike rates in Hz
+            batch_rates = np.nan_to_num(batch_rates, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Convert spike rates to probabilities using Poisson process: P = 1 - e^(-λ/F)
+            # where λ is spike rate (Hz) and F is sampling rate (Hz)
+            batch_probs = 1.0 - np.exp(-batch_rates / sampling_rate)
+            
+            # Ensure probabilities are in [0, 1] range (should be by construction, but safety check)
             batch_probs = np.clip(batch_probs, 0.0, 1.0)
             
             prob_data[start:end] = batch_probs
@@ -521,7 +528,8 @@ def process_subject(subject_dir, config):
         prob_data = run_cascade_inference(
             processed_calcium, 
             config['processing']['batch_size'], 
-            config['cascade']['model_type']
+            config['cascade']['model_type'],
+            target_rate or orig_rate or 2.0
                 )
                 
                 # Clean up after CASCADE
@@ -583,6 +591,198 @@ def process_subject(subject_dir, config):
         print(f"  → Error processing {subject_name}: {e}")
         raise
 
+def analyze_raw_data(config):
+    """
+    Analyze and output information about raw data without processing.
+    
+    Args:
+        config: Configuration dictionary
+    """
+    print("="*80)
+    print("RAW DATA ANALYSIS")
+    print("="*80)
+    
+    # Find subjects
+    subjects = sorted([
+        os.path.join(config['data']['input_dir'], d)
+        for d in os.listdir(config['data']['input_dir'])
+        if d.startswith('subject_') and d not in config['data'].get('skip_subjects', []) and
+        os.path.isdir(os.path.join(config['data']['input_dir'], d))
+    ])
+    
+    if not subjects:
+        print(f"No subjects found in {config['data']['input_dir']}")
+        return
+    
+    print(f"Found {len(subjects)} subjects in {config['data']['input_dir']}")
+    print(f"Skipping subjects: {config['data'].get('skip_subjects', [])}")
+    print()
+    
+    # Analyze each subject
+    for subject_dir in subjects:
+        subject_name = os.path.basename(os.path.normpath(subject_dir))
+        print(f"Subject: {subject_name}")
+        print("-" * 40)
+        
+        try:
+            # Load cell positions
+            mat_file = os.path.join(subject_dir, 'data_full.mat')
+            if not os.path.exists(mat_file):
+                print(f"  ERROR: data_full.mat not found")
+                continue
+                
+            mat = loadmat(mat_file)
+            data0 = mat['data'][0, 0]
+            cell_xyz = data0['CellXYZ']
+            
+            if isinstance(cell_xyz, np.ndarray) and cell_xyz.dtype == np.object_:
+                cell_xyz = cell_xyz[0, 0]
+            
+            print(f"  Cell positions shape: {cell_xyz.shape}")
+            
+            # Analyze cell positions
+            valid_coords = ~np.isnan(cell_xyz).any(axis=1)
+            num_valid = np.sum(valid_coords)
+            num_invalid = np.sum(~valid_coords)
+            
+            print(f"  Valid coordinate neurons: {num_valid}")
+            print(f"  Invalid coordinate neurons: {num_invalid}")
+            
+            if num_valid > 0:
+                valid_positions = cell_xyz[valid_coords]
+                
+                # Spatial bounds
+                min_coords = valid_positions.min(axis=0)
+                max_coords = valid_positions.max(axis=0)
+                ranges = max_coords - min_coords
+                
+                print(f"  Spatial bounds:")
+                print(f"    X: {min_coords[0]:.2f} to {max_coords[0]:.2f} (range: {ranges[0]:.2f})")
+                print(f"    Y: {min_coords[1]:.2f} to {max_coords[1]:.2f} (range: {ranges[1]:.2f})")
+                print(f"    Z: {min_coords[2]:.2f} to {max_coords[2]:.2f} (range: {ranges[2]:.2f})")
+                
+                # Spatial statistics
+                mean_coords = valid_positions.mean(axis=0)
+                std_coords = valid_positions.std(axis=0)
+                
+                print(f"  Spatial statistics:")
+                print(f"    Mean: X={mean_coords[0]:.2f}, Y={mean_coords[1]:.2f}, Z={mean_coords[2]:.2f}")
+                print(f"    Std:  X={std_coords[0]:.2f}, Y={std_coords[1]:.2f}, Z={std_coords[2]:.2f}")
+            
+            # Check for invalid anatomical indices
+            if 'IX_inval_anat' in data0.dtype.names:
+                inval = data0['IX_inval_anat']
+                if isinstance(inval, np.ndarray) and inval.dtype == np.object_:
+                    inval = inval[0, 0].flatten()
+                inval_indices = np.array(inval, int) - 1  # Convert to 0-based
+                print(f"  Invalid anatomical indices: {len(inval_indices)} neurons")
+            else:
+                print(f"  Invalid anatomical indices: None specified")
+            
+            # Load calcium data
+            timeseries_file = os.path.join(subject_dir, 'TimeSeries.h5')
+            if not os.path.exists(timeseries_file):
+                print(f"  ERROR: TimeSeries.h5 not found")
+                continue
+                
+            calcium_dataset = config['data']['calcium_dataset']
+            with h5py.File(timeseries_file, 'r') as f:
+                print(f"  Available datasets in TimeSeries.h5: {list(f.keys())}")
+                
+                if calcium_dataset not in f:
+                    print(f"  ERROR: Dataset '{calcium_dataset}' not found")
+                    continue
+                    
+                calcium_shape = f[calcium_dataset].shape
+                calcium_dtype = f[calcium_dataset].dtype
+                
+                print(f"  Calcium dataset '{calcium_dataset}':")
+                print(f"    Shape: {calcium_shape}")
+                print(f"    Data type: {calcium_dtype}")
+                
+                # Determine if transposition is needed
+                if calcium_shape[0] == cell_xyz.shape[0]:
+                    print(f"    Format: (N, T) - will be transposed to (T, N)")
+                    T, N = calcium_shape[1], calcium_shape[0]
+                elif calcium_shape[1] == cell_xyz.shape[0]:
+                    print(f"    Format: (T, N) - correct format")
+                    T, N = calcium_shape[0], calcium_shape[1]
+                else:
+                    print(f"    WARNING: Shape mismatch with cell positions ({cell_xyz.shape[0]} cells)")
+                    T, N = calcium_shape[0], calcium_shape[1]
+                
+                print(f"    Interpreted as: {T} timepoints, {N} neurons")
+                
+                # Sampling rate information
+                orig_rate = config['processing'].get('original_sampling_rate')
+                target_rate = config['processing'].get('target_sampling_rate')
+                
+                if orig_rate:
+                    duration = T / orig_rate
+                    print(f"    Duration: {duration:.2f} seconds at {orig_rate} Hz")
+                    
+                    if target_rate and target_rate != orig_rate:
+                        new_T = int(T * target_rate / orig_rate)
+                        new_duration = new_T / target_rate
+                        print(f"    After resampling: {new_T} timepoints at {target_rate} Hz ({new_duration:.2f} seconds)")
+                
+                # Memory requirements estimation
+                memory_gb = (T * N * 4) / (1024**3)  # Assuming float32
+                print(f"    Memory requirement: ~{memory_gb:.2f} GB (float32)")
+                
+                # Sample some data statistics
+                sample_size = min(1000, T)
+                sample_indices = np.random.choice(T, sample_size, replace=False)
+                sample_indices = np.sort(sample_indices)  # HDF5 requires sorted indices
+                sample_data = f[calcium_dataset][sample_indices, :min(1000, N)]
+                
+                print(f"    Sample statistics (first {min(1000, N)} neurons, {sample_size} timepoints):")
+                print(f"      Min: {sample_data.min():.4f}")
+                print(f"      Max: {sample_data.max():.4f}")
+                print(f"      Mean: {sample_data.mean():.4f}")
+                print(f"      Std: {sample_data.std():.4f}")
+                
+                # Check for NaN/inf values
+                num_nan = np.sum(np.isnan(sample_data))
+                num_inf = np.sum(np.isinf(sample_data))
+                if num_nan > 0 or num_inf > 0:
+                    print(f"      WARNING: Found {num_nan} NaN and {num_inf} inf values in sample")
+            
+            # Volumization preview
+            volume_shape = config['volumization']['volume_shape']
+            volume_dtype = config['volumization']['dtype']
+            
+            print(f"  Volumization settings:")
+            print(f"    Target volume shape: {volume_shape}")
+            print(f"    Data type: {volume_dtype}")
+            
+            if num_valid > 0:
+                # Estimate volume memory requirements
+                vol_memory_gb = (T * np.prod(volume_shape) * (2 if volume_dtype == 'float16' else 4)) / (1024**3)
+                print(f"    Volume memory requirement: ~{vol_memory_gb:.2f} GB")
+                
+                # Estimate spatial resolution
+                if ranges[0] > 0 and ranges[1] > 0 and ranges[2] > 0:
+                    x_res = ranges[0] / volume_shape[0]
+                    y_res = ranges[1] / volume_shape[1]
+                    z_res = ranges[2] / volume_shape[2]
+                    print(f"    Spatial resolution: X={x_res:.2f}, Y={y_res:.2f}, Z={z_res:.2f} units/voxel")
+                
+                # Estimate neurons per voxel
+                total_voxels = np.prod(volume_shape)
+                neurons_per_voxel = num_valid / total_voxels
+                print(f"    Average neurons per voxel: {neurons_per_voxel:.2f}")
+                
+                if neurons_per_voxel < 0.1:
+                    print(f"    WARNING: Very sparse volume - consider smaller volume dimensions")
+                elif neurons_per_voxel > 10:
+                    print(f"    WARNING: Very dense volume - consider larger volume dimensions")
+            
+        except Exception as e:
+            print(f"  ERROR: {e}")
+        
+        print()
+
 def main():
     parser = argparse.ArgumentParser(
         description='3D Volumetric Spike Processing Pipeline'
@@ -591,6 +791,8 @@ def main():
                         help='Path to YAML configuration file')
     parser.add_argument('--create-default-config', type=str, default=None,
                         help='Create default configuration file at specified path and exit')
+    parser.add_argument('--raw_data_info', action='store_true',
+                        help='Analyze and display raw data information without processing')
     
     args = parser.parse_args()
     
@@ -612,6 +814,11 @@ def main():
         return
     
     config = load_config(args.config)
+    
+    # Handle raw data info request
+    if args.raw_data_info:
+        analyze_raw_data(config)
+        return
     
     # Validate CASCADE availability
     if not CASCADE_AVAILABLE:
