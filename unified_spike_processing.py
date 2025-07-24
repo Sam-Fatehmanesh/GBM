@@ -291,9 +291,17 @@ def create_3d_volumes(prob_data, cell_positions, volume_shape, dtype='float16'):
             active_probs = probs_t[active_cells]
                 
             # Set active cells in the volume
-            # If multiple cells map to same volume element, sum their probabilities
+            # If multiple cells map to same volume element, compute probability that any cell is active (1 - product of (1-p))
+            # First, group by voxel indices
+            from collections import defaultdict
+            voxel_probs = defaultdict(list)
             for i in range(len(active_x)):
-                volumes[t, active_x[i], active_y[i], active_z[i]] += active_probs[i]
+                key = (active_x[i], active_y[i], active_z[i])
+                voxel_probs[key].append(active_probs[i])
+            for (x, y, z), probs in voxel_probs.items():
+                # Probability that at least one cell is active: 1 - product(1 - p)
+                p_any = 1.0 - np.prod(1.0 - np.clip(probs, 0, 1))
+                volumes[t, x, y, z] = p_any
 
     # Create metadata
     metadata = {
