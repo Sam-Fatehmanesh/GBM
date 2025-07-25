@@ -22,7 +22,7 @@ class SpatioTemporalRegionModel(nn.Module):
         self.norm_3 = RMSNorm(d_model)
         self.mlp = MLP(layers_num=1, input_size=d_model, hidden_size=d_model*2, output_size=d_model)
 
-    def forward(self, x):
+    def forward(self, x, apply_last_norm=True):
         # expects x of shape (batch_size, seq_len, n_regions, d_model)
         B, T, N, D = x.shape
 
@@ -57,7 +57,8 @@ class SpatioTemporalRegionModel(nn.Module):
         res = x
         x = self.mlp(x)
         x = x + res
-        x = self.norm_3(x)
+        if apply_last_norm:
+            x = self.norm_3(x)
         # Output shape: (B, T, N, D)
         return x
 
@@ -133,12 +134,12 @@ class GBM(nn.Module):
 
 
         # Encode the regions
-        x = self.autoencoder.encode(x, apply_norm=True) # (B, T, hidden_channels, n_blocks_x, n_blocks_y, n_blocks_z)
+        x = self.autoencoder.encode(x, apply_norm=False) # (B, T, hidden_channels, n_blocks_x, n_blocks_y, n_blocks_z)
         # Move hidden_channels to the end, then flatten spatial dims to n_regions
         x = x.permute(0, 1, 3, 4, 5, 2).reshape(B, T, self.n_regions, self.d_model) # (B, T, n_regions, d_model)
 
-        for layer in self.layers:
-            x = layer(x) # (B, T, n_regions, d_model)
+        for i, layer in enumerate(self.layers):
+            x = layer(x, apply_last_norm = i != len(self.layers) - 1) # (B, T, n_regions, d_model)
 
         # Reshape n_regions back to (n_blocks_x, n_blocks_y, n_blocks_z, d_model)
         x = x.view(B, T, self.n_blocks_x, self.n_blocks_y, self.n_blocks_z, self.d_model)  # (B, T, n_blocks_x, n_blocks_y, n_blocks_z, d_model)
@@ -146,7 +147,7 @@ class GBM(nn.Module):
         x = x.permute(0, 1, 5, 2, 3, 4)
 
         # Decode the regions
-        x = self.autoencoder.decode(x, get_logits=get_logits, apply_norm=False)
+        x = self.autoencoder.decode(x, get_logits=get_logits, apply_norm=True)
 
         # Reshape back to original volume shape: (B, T, X, Y, Z)
         x = x.reshape(B, T, vol_x, vol_y, vol_z)

@@ -158,10 +158,10 @@ class ConvNormEncoder(nn.Module):
         B, T, vol_x, vol_y, vol_z = x.shape
 
         # Apply Bernoulli sampling
-        x = torch.bernoulli(torch.clamp(x, min=0.0, max=1.0))
+        # x = torch.bernoulli(torch.clamp(x, min=0.0, max=1.0))
         
         # Reshape for conv3d: (B, T, vol_x, vol_y, vol_z) -> (B*T, 1, vol_x, vol_y, vol_z)
-        x = x.view(B*T, self.input_channels, vol_x, vol_y, vol_z)
+        x = x.contiguous().view(B*T, self.input_channels, vol_x, vol_y, vol_z)
 
         # Apply 3D convolution - this automatically extracts regions
         x = self.encoder_conv(x)  # (B*T, hidden_channels, n_blocks_x, n_blocks_y, n_blocks_z)

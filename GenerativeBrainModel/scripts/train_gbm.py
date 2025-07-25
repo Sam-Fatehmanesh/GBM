@@ -74,6 +74,7 @@ def create_default_config() -> Dict[str, Any]:
             'weight_decay': 1e-4,
             'scheduler': 'linear_warmup',  # Linear warmup for first 10% of batches
             'gradient_clip_norm': 1.0,
+            'gradient_accumulation_steps': None,  # Number of batches to accumulate gradients over (None/0 = disabled)
             'validation_frequency': 8,  # Number of times to run validation per epoch
             
             # Sequence parameters for GBM (seq2seq training)
@@ -668,7 +669,7 @@ class GBMTrainer:
         loss_fn = self.get_loss_function()
         
         # Initialize PR AUC binned accumulators to avoid storing all predictions
-        threshold = self.metrics_tracker.threshold
+        threshold = self.metrics_tracker.validation_tracker.threshold
         device = self.device
         num_bins = 1000
         bin_edges = torch.linspace(0.0, 1.0, num_bins + 1, device=device)
@@ -735,8 +736,8 @@ class GBMTrainer:
         del tp_counts, total_counts, tp_flipped, total_flipped, cumulative_tp, cumulative_fp
         del precision, recall, recall_diff, bin_edges
         torch.cuda.empty_cache()
-        # Log validation metrics directly
-        self.metrics_tracker.csv_logger.log_metrics({
+        # Log validation metrics directly to validation CSV
+        self.metrics_tracker.validation_tracker.csv_logger.log_metrics({
             'epoch': epoch,
             'batch_idx': batch_idx,
             'validation_loss': avg_val_loss,
@@ -808,41 +809,59 @@ class GBMTrainer:
                 # Prepare seq2seq data
                 input_seq, target_seq = self.prepare_seq2seq_data(sequences)
                 
-                # Forward/backward pass
-                self.optimizer.zero_grad()
+                # Get gradient accumulation settings
+                grad_accum_steps = self.config['training'].get('gradient_accumulation_steps')
+                use_grad_accum = grad_accum_steps is not None and grad_accum_steps > 1
+                
+                # Zero gradients at start of accumulation cycle
+                if not use_grad_accum or (batch_idx % grad_accum_steps == 0):
+                    self.optimizer.zero_grad()
                 
                 with autocast(enabled=self.scaler is not None):
                     # Predict next volumes
                     output_seq = self.model(input_seq, get_logits=True)
                     loss = self.get_loss_function()(output_seq, target_seq)
+                    
+                    # Scale loss by accumulation steps for proper averaging
+                    if use_grad_accum:
+                        loss = loss / grad_accum_steps
                 
                 if self.scaler:
                     self.scaler.scale(loss).backward()
-                    if self.config['training'].get('gradient_clip_norm'):
-                        self.scaler.unscale_(self.optimizer)
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.config['training']['gradient_clip_norm']
-                        )
-                    else:
-                        grad_norm = None
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    
+                    # Only step optimizer at end of accumulation cycle
+                    if not use_grad_accum or ((batch_idx + 1) % grad_accum_steps == 0):
+                        if self.config['training'].get('gradient_clip_norm'):
+                            self.scaler.unscale_(self.optimizer)
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), self.config['training']['gradient_clip_norm']
+                            )
+                        else:
+                            grad_norm = None
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
                 else:
                     loss.backward()
-                    if self.config['training'].get('gradient_clip_norm'):
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.config['training']['gradient_clip_norm']
-                        )
-                    else:
-                        grad_norm = None
-                    self.optimizer.step()
+                    
+                    # Only step optimizer at end of accumulation cycle
+                    if not use_grad_accum or ((batch_idx + 1) % grad_accum_steps == 0):
+                        if self.config['training'].get('gradient_clip_norm'):
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), self.config['training']['gradient_clip_norm']
+                            )
+                        else:
+                            grad_norm = None
+                        self.optimizer.step()
 
-                # Scheduler per batch for linear warmup
-                if self.scheduler and self.config['training']['scheduler'] == 'linear_warmup':
+                # Scheduler per batch for linear warmup (only when actually stepping)
+                if (self.scheduler and self.config['training']['scheduler'] == 'linear_warmup' and
+                    (not use_grad_accum or ((batch_idx + 1) % grad_accum_steps == 0))):
                     self.scheduler.step()
                 
                 # Update running loss
-                running_loss += loss.item()
+                # Note: loss.item() already scaled by grad_accum_steps if accumulation is used
+                actual_loss = loss.item() * (grad_accum_steps if use_grad_accum else 1)
+                running_loss += actual_loss
                 current_lr = self.optimizer.param_groups[0]['lr']
 
                 # Current batch loss
@@ -887,7 +906,8 @@ class GBMTrainer:
                 validation_loader=self.test_loader,
                 device=self.device,
                 experiment_dir=self.experiment_dir,
-                video_name="gbm_validation_comparison.mp4"
+                video_name="gbm_validation_comparison.mp4",
+                seq2seq=True  # GBM is a seq2seq model that predicts next frames
             )
             self.logger.info(f"Validation comparison video saved to: {video_path}")
         except Exception as e:

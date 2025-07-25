@@ -13,7 +13,7 @@ class VideoVisualizer:
     Generates comparison videos showing original vs predicted volumes from validation data.
     """
     
-    def __init__(self, output_dir: Path, fps: int = 10):
+    def __init__(self, output_dir: Path, fps: int = 1):
         """
         Initialize the video visualizer.
         
@@ -185,7 +185,8 @@ class VideoVisualizer:
                                            validation_loader: torch.utils.data.DataLoader,
                                            device: torch.device,
                                            video_name: str = "validation_comparison.mp4",
-                                           max_batches: int = 5) -> Path:
+                                           max_batches: int = 5,
+                                           seq2seq: bool = False) -> Path:
         """
         Generate comparison video using validation data and model predictions.
         
@@ -195,6 +196,7 @@ class VideoVisualizer:
             device: Device to run inference on
             video_name: Name of the output video file
             max_batches: Maximum number of batches to process
+            seq2seq: If True, model predicts next frame (shift original frames by 1 for alignment)
             
         Returns:
             Path to the saved video file
@@ -228,23 +230,45 @@ class VideoVisualizer:
                     data = data.unsqueeze(1)
                     target = target.unsqueeze(1)
                 
-                # Get model predictions (logits)
-                predicted_logits = model(data)
-                
-                # Convert logits to probabilities
-                predicted_probs = torch.sigmoid(predicted_logits)
-                
-                # Store original and predicted volumes
-                original_volumes_list.append(target)
-                predicted_volumes_list.append(predicted_probs)
+                if seq2seq:
+                    # For seq2seq models, we need sequences with T > 1 to predict next frames
+                    if data.shape[1] < 2:
+                        logger.warning(f"Seq2seq mode requires sequences with T >= 2, got T={data.shape[1]}. Skipping batch.")
+                        continue
+                    
+                    # Prepare input (all frames except last) and target (all frames except first)
+                    input_seq = data[:, :-1]  # (B, T-1, X, Y, Z)
+                    target_seq = target[:, 1:]  # (B, T-1, X, Y, Z) - next frames
+                    
+                    # Get model predictions for next frames
+                    predicted_logits = model(input_seq, get_logits=True)
+                    predicted_probs = torch.sigmoid(predicted_logits)
+                    
+                    # Store aligned volumes: target_seq contains the true "next frames"
+                    # that correspond to the predicted "next frames"
+                    original_volumes_list.append(target_seq)
+                    predicted_volumes_list.append(predicted_probs)
+                else:
+                    # Standard autoencoder mode: predict same frame
+                    predicted_logits = model(data)
+                    predicted_probs = torch.sigmoid(predicted_logits)
+                    
+                    # Store original and predicted volumes (same frame alignment)
+                    original_volumes_list.append(target)
+                    predicted_volumes_list.append(predicted_probs)
                 
                 batch_count += 1
+        
+        if not original_volumes_list:
+            raise ValueError("No valid batches processed for video generation")
         
         # Concatenate all batches
         original_volumes = torch.cat(original_volumes_list, dim=0)
         predicted_volumes = torch.cat(predicted_volumes_list, dim=0)
         
         logger.info(f"Collected {original_volumes.shape[0]} volumes for video generation")
+        if seq2seq:
+            logger.info("Using seq2seq mode: comparing true next frames with predicted next frames")
         
         # Generate the comparison video
         return self.generate_comparison_video(
@@ -259,7 +283,8 @@ def create_validation_video(model: torch.nn.Module,
                           validation_loader: torch.utils.data.DataLoader,
                           device: torch.device,
                           experiment_dir: Path,
-                          video_name: str = "validation_comparison.mp4") -> Path:
+                          video_name: str = "validation_comparison.mp4",
+                          seq2seq: bool = False) -> Path:
     """
     Convenience function to create validation comparison video.
     
@@ -269,6 +294,7 @@ def create_validation_video(model: torch.nn.Module,
         device: Device for inference
         experiment_dir: Experiment directory
         video_name: Name of output video
+        seq2seq: If True, model predicts next frame (for seq2seq models)
         
     Returns:
         Path to saved video
@@ -285,5 +311,6 @@ def create_validation_video(model: torch.nn.Module,
         validation_loader=validation_loader,
         device=device,
         video_name=video_name,
-        max_batches=5  # Process 5 batches for video
+        max_batches=5,  # Process 5 batches for video
+        seq2seq=seq2seq
     ) 
