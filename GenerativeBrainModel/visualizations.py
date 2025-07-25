@@ -56,7 +56,7 @@ class VideoVisualizer:
         return (array * 255).astype(np.uint8)
     
     def create_side_by_side_frame(self, original: np.ndarray, predicted: np.ndarray, 
-                                 frame_idx: int) -> np.ndarray:
+                                 frame_idx: int, seq_info: dict = None) -> np.ndarray:
         """
         Create a side-by-side comparison frame.
         
@@ -64,6 +64,7 @@ class VideoVisualizer:
             original: Original 2D slice (H, W) as uint8
             predicted: Predicted 2D slice (H, W) as uint8
             frame_idx: Frame index for labeling
+            seq_info: Optional dict with 'seq_idx', 'time_idx', 'is_seq2seq' for sequence labeling
             
         Returns:
             Side-by-side frame (H, W*2) as uint8, converted to BGR for OpenCV
@@ -78,11 +79,11 @@ class VideoVisualizer:
         # Convert grayscale to BGR for OpenCV
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         
-        # Add text labels
+        # Add text labels with reduced font size (1/3 of original)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.7
+        font_scale = 0.23  # Reduced to ~1/3 of original (0.7 -> 0.23)
         color = (255, 255, 255)  # White text
-        thickness = 2
+        thickness = 1  # Reduced thickness for smaller text
         
         # Add "Original" label
         cv2.putText(frame_bgr, "Original", (10, 30), font, font_scale, color, thickness)
@@ -93,13 +94,22 @@ class VideoVisualizer:
         # Add frame index
         cv2.putText(frame_bgr, f"Frame {frame_idx}", (10, H - 10), font, font_scale, color, thickness)
         
+        # Add sequence information for seq2seq videos
+        if seq_info and seq_info.get('is_seq2seq', False):
+            seq_idx = seq_info.get('seq_idx', 0)
+            time_idx = seq_info.get('time_idx', 0)
+            seq_text = f"Seq {seq_idx}, Time {time_idx}"
+            # Position sequence info in the middle-right area
+            cv2.putText(frame_bgr, seq_text, (W + 10, H - 10), font, font_scale, color, thickness)
+        
         return frame_bgr
     
     def generate_comparison_video(self, 
                                  original_volumes: torch.Tensor, 
                                  predicted_volumes: torch.Tensor,
                                  video_name: str = "validation_comparison.mp4",
-                                 max_frames: Optional[int] = None) -> Path:
+                                 max_frames: Optional[int] = None,
+                                 seq2seq: bool = False) -> Path:
         """
         Generate a comparison video from validation volumes.
         
@@ -108,6 +118,7 @@ class VideoVisualizer:
             predicted_volumes: Predicted volumes tensor (B, T, X, Y, Z) 
             video_name: Name of the output video file
             max_frames: Maximum number of frames to include (None for all)
+            seq2seq: If True, add sequence information to video frames
             
         Returns:
             Path to the saved video file
@@ -131,6 +142,8 @@ class VideoVisualizer:
         
         logger.info(f"Processing {total_frames} frames from volumes of shape {original_volumes.shape}")
         logger.info(f"Using middle z slice: {middle_z} (out of {Z})")
+        if seq2seq:
+            logger.info("Adding sequence information to video frames")
         
         # Setup video writer
         video_path = self.output_dir / video_name
@@ -164,8 +177,17 @@ class VideoVisualizer:
                     orig_uint8 = self.tensor_to_uint8(orig_slice)
                     pred_uint8 = self.tensor_to_uint8(pred_slice)
                     
+                    # Prepare sequence info for seq2seq videos
+                    seq_info = None
+                    if seq2seq:
+                        seq_info = {
+                            'seq_idx': b,
+                            'time_idx': t,
+                            'is_seq2seq': True
+                        }
+                    
                     # Create side-by-side frame
-                    frame = self.create_side_by_side_frame(orig_uint8, pred_uint8, frame_count)
+                    frame = self.create_side_by_side_frame(orig_uint8, pred_uint8, frame_count, seq_info)
                     
                     # Write frame to video
                     video_writer.write(frame)
@@ -275,7 +297,8 @@ class VideoVisualizer:
             original_volumes=original_volumes,
             predicted_volumes=predicted_volumes,
             video_name=video_name,
-            max_frames=200  # Limit to 200 frames for reasonable video length
+            max_frames=200,  # Limit to 200 frames for reasonable video length
+            seq2seq=seq2seq
         )
 
 
@@ -304,7 +327,7 @@ def create_validation_video(model: torch.nn.Module,
     video_dir.mkdir(exist_ok=True)
     
     # Create visualizer and generate video
-    visualizer = VideoVisualizer(output_dir=video_dir, fps=10)
+    visualizer = VideoVisualizer(output_dir=video_dir, fps=1)
     
     return visualizer.generate_validation_comparison_video(
         model=model,
