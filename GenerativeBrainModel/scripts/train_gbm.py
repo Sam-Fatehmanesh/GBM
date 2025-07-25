@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Main training script for LinNormEncoder autoencoder.
+Main training script for GBM (Generative Brain Model) with seq2seq training.
 """
 
 import os
@@ -25,7 +25,7 @@ project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 # Import our modules
-from GenerativeBrainModel.models.convnormencoder import ConvNormEncoder
+from GenerativeBrainModel.models.gbm import GBM, EnsembleGBM
 from GenerativeBrainModel.dataloaders.volume_dataloader import create_dataloaders, get_volume_info
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_validation_video
@@ -34,16 +34,16 @@ from GenerativeBrainModel.visualizations import create_validation_video
 # Configuration utilities embedded in this script
 def create_default_config() -> Dict[str, Any]:
     """
-    Create default configuration dictionary for autoencoder training.
+    Create default configuration dictionary for GBM training.
     
     Returns:
         Dictionary with all configuration parameters
     """
     return {
         'experiment': {
-            'name': 'linnormencode_training',
-            'description': 'LinNormEncoder autoencoder training on 3D volumetric spike data',
-            'tags': ['autoencoder', 'linnorm', '3d-volumes', 'spike-data']
+            'name': 'gbm_training',
+            'description': 'GBM (Generative Brain Model) sequence-to-sequence training on 3D volumetric spike data',
+            'tags': ['gbm', 'seq2seq', '3d-volumes', 'spike-data', 'temporal-modeling']
         },
         
         'data': {
@@ -53,39 +53,40 @@ def create_default_config() -> Dict[str, Any]:
                 'subject_4', 
                 'subject_5'
             ],
-            'volume_size': None,  # MUST be provided if auto-detection fails
-            'volumes_per_batch': 8,
-            'max_timepoints_per_subject': None, # -1 for all
-            'use_cache': False,
-            'cache_data': False  # Test performance with caching disabled
+            'use_cache': False  # Test performance with caching disabled
         },
         
         'model': {
-            'hidden_size': 256,
+            'd_model': 256,
+            'n_heads': 8,
+            'n_layers': 4,
+            'autoencoder_path': None,  # Path to pretrained autoencoder checkpoint
             'volume_size': [256, 128, 30],
             'region_size': [32, 16, 2],
-            'num_frequencies': 32,
-            'sigma': 1.0
+            'ensemble_size': 1,  # Number of models in ensemble (1 = single model)
+            'different_seeds': True  # Use different seeds for ensemble models
         },
         
         'training': {
-            'volumes_per_batch': 8,  # Number of full volumes per batch (effective batch size will be volumes_per_batch * n_regions)
+            'volumes_per_batch': 4,  # Number of sequences per batch
             'num_epochs': 100,
-            'learning_rate': 0.001,
-            'weight_decay': 1e-5,
+            'learning_rate': 0.0005,  # Lower LR for fine-tuning
+            'weight_decay': 1e-4,
             'scheduler': 'linear_warmup',  # Linear warmup for first 10% of batches
             'gradient_clip_norm': 1.0,
             'validation_frequency': 8,  # Number of times to run validation per epoch
             
-            # Sequence parameters for autoencoder (single timepoint reconstruction)
-            'sequence_length': 1,  # Single timepoint for autoencoder
-            'stride': 1,  # Use every timepoint (step size between sequences)
+            # Sequence parameters for GBM (seq2seq training)
+            'sequence_length': 8,  # Length of input sequences (longer for temporal modeling)
+            'stride': 2,  # Stride between sequences (overlap for more training data)
             'max_timepoints_per_subject': None,  # Max timepoints per subject file (None = use all available)
             
             # Hardware settings
             'use_gpu': True,
-            'num_workers': 4,  # DataLoader worker processes
-            'pin_memory': True,  # Faster GPU transfer (keeps data in pinned CPU memory)
+            'pin_memory': False,  # Large 3-D volumes + shared memory → bus errors; default off
+            'persistent_workers': False,  # Safer default; can enable if system SHM is large
+            'prefetch_factor': 2,  # Reduce SHM usage vs default 8
+            'num_workers': 2,
             'mixed_precision': True,
             'compile_model': False,  # PyTorch 2.0 compile
             
@@ -94,7 +95,7 @@ def create_default_config() -> Dict[str, Any]:
         },
         
         'loss': {
-            'loss_function': 'bce',  # 'mse', 'mae', 'huber', 'bce' - BCE for probability reconstruction
+            'loss_function': 'bce',  # BCE for probability prediction
             'loss_weights': {
                 'reconstruction': 1.0,
                 'regularization': 0.0
@@ -104,12 +105,12 @@ def create_default_config() -> Dict[str, Any]:
         'logging': {
             'log_level': 'INFO',
             'log_frequency': 10,  # Log every N batches
-            'save_checkpoint_frequency': 10,  # Save checkpoint every N epochs
-            'keep_n_checkpoints': 5
+            'save_checkpoint_frequency': 5,  # Save checkpoint every N epochs
+            'keep_n_checkpoints': 3
         },
         
         'paths': {
-            'output_base_dir': 'experiments/autoencoder',
+            'output_base_dir': 'experiments/gbm',
             'checkpoint_dir': None,  # Will be set automatically
             'log_dir': None,  # Will be set automatically
             'plot_dir': None  # Will be set automatically
@@ -235,10 +236,19 @@ def validate_config(config: Dict[str, Any]) -> None:
                 f"at dimension {i}"
             )
     
-    # Calculate and log input size for reference
-    input_size = region_size[0] * region_size[1] * region_size[2]
+    # Check autoencoder path if provided
+    autoencoder_path = model_config.get('autoencoder_path')
+    if autoencoder_path and not Path(autoencoder_path).exists():
+        raise ValueError(f"Autoencoder checkpoint not found: {autoencoder_path}")
+    
+    # Validate sequence length
+    seq_len = config['training']['sequence_length']
+    if seq_len < 2:
+        raise ValueError(f"Sequence length must be at least 2 for seq2seq training, got {seq_len}")
+    
     print(f"Configuration validation passed!")
-    print(f"Calculated input_size: {input_size} (from region_size {region_size})")
+    print(f"GBM Model: d_model={model_config['d_model']}, n_heads={model_config['n_heads']}, n_layers={model_config['n_layers']}")
+    print(f"Sequence length: {seq_len}, Ensemble size: {model_config['ensemble_size']}")
 
 
 def deep_update(base_dict: Dict, update_dict: Dict) -> Dict:
@@ -275,9 +285,9 @@ def save_config(config: Dict[str, Any], save_path: str) -> None:
         yaml.dump(config, f, default_flow_style=False, indent=2, sort_keys=False)
 
 
-class AutoencoderTrainer:
+class GBMTrainer:
     """
-    Comprehensive autoencoder trainer with all bells and whistles.
+    Comprehensive GBM trainer with sequence-to-sequence training.
     """
     
     def __init__(self, config: Dict):
@@ -298,7 +308,7 @@ class AutoencoderTrainer:
         self.scheduler = None
         self.scaler = None
         self.train_loader = None
-        
+        self.test_loader = None
         
         # Training state
         self.current_epoch = 0
@@ -361,17 +371,41 @@ class AutoencoderTrainer:
         self.logger.info(f"Random seed set to: {seed}")
     
     def build_model(self):
-        """Build and initialize the model."""
+        """Build and initialize the GBM model."""
         model_config = self.config['model']
         
-        # Use ConvNormEncoder - no need to calculate input_size as it works directly on volumes
-        self.model = ConvNormEncoder(
-            hidden_channels=model_config['hidden_size'],
-            volume_size=model_config['volume_size'],
-            region_size=model_config['region_size'],
-            num_frequencies=model_config['num_frequencies'],
-            sigma=model_config['sigma']
-        )
+        ensemble_size = model_config.get('ensemble_size', 1)
+        
+        if ensemble_size > 1:
+            # Create ensemble model
+            self.model = EnsembleGBM(
+                n_models=ensemble_size,
+                d_model=model_config['d_model'],
+                n_heads=model_config['n_heads'],
+                n_layers=model_config['n_layers'],
+                autoencoder_path=model_config.get('autoencoder_path'),
+                volume_size=tuple(model_config['volume_size']),
+                region_size=tuple(model_config['region_size']),
+                different_seeds=model_config.get('different_seeds', True)
+            )
+            self.logger.info(f"Created EnsembleGBM with {ensemble_size} models")
+        else:
+            # Create single GBM model
+            self.model = GBM(
+                d_model=model_config['d_model'],
+                n_heads=model_config['n_heads'],
+                n_layers=model_config['n_layers'],
+                autoencoder_path=model_config.get('autoencoder_path'),
+                volume_size=tuple(model_config['volume_size']),
+                region_size=tuple(model_config['region_size'])
+            )
+            self.logger.info("Created single GBM model")
+        
+        autoencoder_path = model_config.get('autoencoder_path')
+        if autoencoder_path:
+            self.logger.info(f"Loaded pretrained autoencoder from: {autoencoder_path}")
+        else:
+            self.logger.warning("No autoencoder path provided - using randomly initialized autoencoder")
         
         self.logger.info(f"Model volume size: {model_config['volume_size']}, region size: {model_config['region_size']}")
         
@@ -379,9 +413,18 @@ class AutoencoderTrainer:
         
         # Compile model if requested (PyTorch 2.0+)
         if self.config['training'].get('compile_model', False):
+            # Disable Dynamo compilation for Mamba layers which already ship Triton kernels
             try:
+                import torch._dynamo as _dynamo
+                from mamba_ssm import Mamba2 as Mamba
+
+                def _disable_mamba(module: torch.nn.Module):
+                    if isinstance(module, Mamba):
+                        module.forward = _dynamo.disable(module.forward)
+                self.model.apply(_disable_mamba)
+
                 self.model = torch.compile(self.model)
-                self.logger.info("Model compiled with PyTorch 2.0")
+                self.logger.info("Model compiled with PyTorch 2.0 (Mamba layers excluded from compilation)")
             except Exception as e:
                 self.logger.warning(f"Model compilation failed: {e}")
         
@@ -412,7 +455,7 @@ class AutoencoderTrainer:
         
         with open(architecture_file, 'w') as f:
             f.write("=" * 80 + "\n")
-            f.write("MODEL ARCHITECTURE SUMMARY\n")
+            f.write("GBM MODEL ARCHITECTURE SUMMARY\n")
             f.write("=" * 80 + "\n\n")
             
             # Basic model info
@@ -443,7 +486,7 @@ class AutoencoderTrainer:
             for name, param in self.model.named_parameters():
                 param_count = param.numel()
                 trainable = "✓" if param.requires_grad else "✗"
-                f.write(f"  {name:<30} {param_count:>10,} [{trainable}] {tuple(param.shape)}\n")
+                f.write(f"  {name:<40} {param_count:>10,} [{trainable}] {tuple(param.shape)}\n")
             f.write("\n")
             
             # Buffer information (non-trainable tensors)
@@ -452,7 +495,7 @@ class AutoencoderTrainer:
             for name, buffer in self.model.named_buffers():
                 buffer_count = buffer.numel() if buffer is not None else 0
                 shape = tuple(buffer.shape) if buffer is not None else "None"
-                f.write(f"  {name:<30} {buffer_count:>10,} {shape}\n")
+                f.write(f"  {name:<40} {buffer_count:>10,} {shape}\n")
             f.write("\n")
             
             # Model architecture string representation
@@ -489,15 +532,19 @@ class AutoencoderTrainer:
         """Build optimizer and scheduler."""
         training_config = self.config['training']
         
-        # Optimizer
+        # Optimizer - only optimize trainable parameters
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        
         self.optimizer = optim.AdamW(
-            self.model.parameters(),
+            trainable_params,
             lr=training_config['learning_rate'],
             weight_decay=training_config['weight_decay']
         )
         
+        self.logger.info(f"Optimizer parameters: {sum(p.numel() for p in trainable_params):,}")
+        
         # Scheduler
-        scheduler_type = training_config.get('scheduler', 'linear_warmup')
+        scheduler_type = training_config.get('scheduler', 'cosine')
         
         if scheduler_type == 'linear_warmup':
             # Calculate total batches for warmup (10% of first epoch)
@@ -564,8 +611,6 @@ class AutoencoderTrainer:
         self.logger.info(f"Train loader: {len(self.train_loader.dataset)} samples")
         self.logger.info(f"Test loader: {len(self.test_loader.dataset)} samples")
     
-
-    
     def get_loss_function(self):
         """Get loss function based on configuration."""
         loss_type = self.config['loss']['loss_function'].lower()
@@ -581,9 +626,30 @@ class AutoencoderTrainer:
         else:
             raise ValueError(f"Unknown loss function: {loss_type}")
     
-
-    
-
+    def prepare_seq2seq_data(self, sequences):
+        """
+        Prepare input and target sequences for seq2seq training.
+        
+        Args:
+            sequences: Tensor of shape (B, T, X, Y, Z)
+            
+        Returns:
+            Tuple of (input_sequences, target_sequences)
+            - input_sequences: (B, T-1, X, Y, Z) - sequences[0:T-1]
+            - target_sequences: (B, T-1, X, Y, Z) - sequences[1:T]
+        """
+        B, T, X, Y, Z = sequences.shape
+        
+        if T < 2:
+            raise ValueError(f"Sequence length must be at least 2 for seq2seq training, got {T}")
+        
+        # Input: all timesteps except the last
+        input_seq = sequences[:, :-1, :, :, :]  # (B, T-1, X, Y, Z)
+        
+        # Target: all timesteps except the first  
+        target_seq = sequences[:, 1:, :, :, :]   # (B, T-1, X, Y, Z)
+        
+        return input_seq, target_seq
 
     def run_validation(self, epoch: int, batch_idx: int):
         """
@@ -601,11 +667,14 @@ class AutoencoderTrainer:
         
         loss_fn = self.get_loss_function()
         
-        # Collect predictions and targets in smaller chunks to avoid memory issues
-        prediction_chunks = []
-        target_chunks = []
-        max_chunk_size = 25000  # Process in chunks of ~25k elements
-        current_chunk_size = 0
+        # Initialize PR AUC binned accumulators to avoid storing all predictions
+        threshold = self.metrics_tracker.threshold
+        device = self.device
+        num_bins = 1000
+        bin_edges = torch.linspace(0.0, 1.0, num_bins + 1, device=device)
+        tp_counts = torch.zeros(num_bins, device=device)
+        total_counts = torch.zeros(num_bins, device=device)
+        total_positives = 0.0
         
         with torch.no_grad():
             val_pbar = tqdm(self.test_loader, desc=f"Validation E{epoch}B{batch_idx}", leave=False, ncols=100)
@@ -613,70 +682,74 @@ class AutoencoderTrainer:
             for val_batch_data in val_pbar:
                 # To device
                 if isinstance(val_batch_data, (list, tuple)):
-                    val_data, val_target = val_batch_data
+                    val_sequences, _ = val_batch_data
                 else:
-                    val_data = val_batch_data
-                    val_target = val_data  # Autoencoder target is input
+                    val_sequences = val_batch_data
                 
-                val_data = val_data.to(self.device, non_blocking=True)
-                val_target = val_target.to(self.device, non_blocking=True)
+                val_sequences = val_sequences.to(self.device, non_blocking=True)
                 
-                # Add sequence dimension T=1 for autoencoder: (B, X, Y, Z) -> (B, T=1, X, Y, Z)
-                if len(val_data.shape) == 4:  # (B, X, Y, Z)
-                    val_data = val_data.unsqueeze(1)  # (B, 1, X, Y, Z)
-                    val_target = val_target.unsqueeze(1)  # (B, 1, X, Y, Z)
+                # Prepare seq2seq data
+                val_input, val_target = self.prepare_seq2seq_data(val_sequences)
                 
                 # Forward pass
                 with autocast(enabled=self.scaler is not None):
-                    # ConvNormEncoder works directly on volumes - no region extraction needed
-                    val_output_volumes = self.model(val_data)
-                    val_loss = loss_fn(val_output_volumes, val_target)
+                    # Get predicted next volumes
+                    val_output = self.model(val_input, get_logits=True)
+                    val_loss = loss_fn(val_output, val_target)
                 
                 total_val_loss += val_loss.item()
                 num_batches += 1
                 
                 # Convert logits to probabilities for metrics calculation
-                val_probabilities = torch.sigmoid(val_output_volumes)
+                val_probabilities = torch.sigmoid(val_output)
                 
                 # Flatten predictions and targets
                 batch_preds = val_probabilities.flatten()
                 batch_targets = val_target.flatten()
-                
-                # Add to current chunk
-                if len(prediction_chunks) == 0 or current_chunk_size + batch_preds.numel() > max_chunk_size:
-                    # Start new chunk
-                    prediction_chunks.append([batch_preds])
-                    target_chunks.append([batch_targets])
-                    current_chunk_size = batch_preds.numel()
-                else:
-                    # Add to current chunk
-                    prediction_chunks[-1].append(batch_preds)
-                    target_chunks[-1].append(batch_targets)
-                    current_chunk_size += batch_preds.numel()
-                
+                # Binarize and accumulate for PR AUC
+                binary_targets = (batch_targets >= threshold).float()
+                total_positives += binary_targets.sum().item()
+                bin_indices = torch.searchsorted(bin_edges[1:], batch_preds, right=False)
+                tp_counts.scatter_add_(0, bin_indices, binary_targets)
+                total_counts.scatter_add_(0, bin_indices, torch.ones_like(binary_targets))
                 # Update progress bar
                 val_pbar.set_postfix({'Val Loss': f'{total_val_loss/num_batches:.4f}'})
+                # Free GPU memory from this validation batch
+                del val_sequences, val_input, val_target, val_output, val_loss, val_probabilities, batch_preds, batch_targets
+                torch.cuda.empty_cache()
         
         # Calculate average validation loss
         avg_val_loss = total_val_loss / num_batches
-        
-        # Concatenate chunks and compute metrics
-        # This processes data in manageable chunks rather than one huge tensor
-        all_predictions = torch.cat([torch.cat(chunk) for chunk in prediction_chunks])
-        all_targets = torch.cat([torch.cat(chunk) for chunk in target_chunks])
-        
-        # Use metrics tracker to compute and log validation metrics
-        metrics = self.metrics_tracker.log_validation_step(
-            epoch=epoch,
-            batch_idx=batch_idx,
-            predictions=all_predictions,
-            targets=all_targets,
-            validation_loss=avg_val_loss
-        )
-        
-        # GPU memory cleanup for large tensors
-        del all_predictions, all_targets, prediction_chunks, target_chunks
+        # Compute PR AUC from accumulators
+        tp_flipped = torch.flip(tp_counts, [0])
+        total_flipped = torch.flip(total_counts, [0])
+        cumulative_tp = torch.cumsum(tp_flipped, dim=0)
+        cumulative_fp = torch.cumsum(total_flipped - tp_flipped, dim=0)
+        precision = cumulative_tp / (cumulative_tp + cumulative_fp + 1e-8)
+        recall = cumulative_tp / (total_positives + 1e-8)
+        precision = torch.cat([torch.tensor([1.0], device=device), precision])
+        recall = torch.cat([torch.tensor([0.0], device=device), recall])
+        recall_diff = recall[1:] - recall[:-1]
+        pr_auc = torch.sum(recall_diff * precision[:-1]).item()
+        # Cleanup bins
+        del tp_counts, total_counts, tp_flipped, total_flipped, cumulative_tp, cumulative_fp
+        del precision, recall, recall_diff, bin_edges
         torch.cuda.empty_cache()
+        # Log validation metrics directly
+        self.metrics_tracker.csv_logger.log_metrics({
+            'epoch': epoch,
+            'batch_idx': batch_idx,
+            'validation_loss': avg_val_loss,
+            'pr_auc': pr_auc
+        })
+        self.logger.info(f"Validation - Loss: {avg_val_loss:.6f}, PR AUC: {pr_auc:.4f}")
+        # Generate updated plots
+        if self.metrics_tracker.plot_generator is not None:
+            try:
+                self.metrics_tracker.plot_generator.generate_training_plots()
+            except Exception as e:
+                self.logger.warning(f"Failed to generate plots: {e}")
+        metrics = {'validation_loss': avg_val_loss, 'pr_auc': pr_auc}
         
         # Check if this is the best validation loss and save best model
         if avg_val_loss < self.best_val_loss:
@@ -690,11 +763,9 @@ class AutoencoderTrainer:
         self.model.train()
         return avg_val_loss
 
-
-
     def train(self):
         """Main training loop."""
-        self.logger.info("Starting training...")
+        self.logger.info("Starting GBM training...")
         
         # Build all components
         self.build_model()
@@ -728,26 +799,22 @@ class AutoencoderTrainer:
 
                 # To device
                 if isinstance(batch_data, (list, tuple)):
-                    data, target = batch_data
+                    sequences, _ = batch_data
                 else:
-                    data = batch_data
-                    target = data # Autoencoder target is input
+                    sequences = batch_data
                 
-                data = data.to(self.device, non_blocking=True)
-                target = target.to(self.device, non_blocking=True)
+                sequences = sequences.to(self.device, non_blocking=True)
                 
-                # Add sequence dimension T=1 for autoencoder: (B, X, Y, Z) -> (B, T=1, X, Y, Z)
-                if len(data.shape) == 4:  # (B, X, Y, Z)
-                    data = data.unsqueeze(1)  # (B, 1, X, Y, Z)
-                    target = target.unsqueeze(1)  # (B, 1, X, Y, Z)
+                # Prepare seq2seq data
+                input_seq, target_seq = self.prepare_seq2seq_data(sequences)
                 
                 # Forward/backward pass
                 self.optimizer.zero_grad()
                 
                 with autocast(enabled=self.scaler is not None):
-                    # ConvNormEncoder works directly on volumes - no region extraction needed
-                    output_volumes = self.model(data)
-                    loss = self.get_loss_function()(output_volumes, target)
+                    # Predict next volumes
+                    output_seq = self.model(input_seq, get_logits=True)
+                    loss = self.get_loss_function()(output_seq, target_seq)
                 
                 if self.scaler:
                     self.scaler.scale(loss).backward()
@@ -789,7 +856,7 @@ class AutoencoderTrainer:
                     learning_rate=current_lr
                 )
  
-                 # Update progress bar with EMA loss
+                # Update progress bar with EMA loss
                 ema_loss = self.metrics_tracker.get_current_training_ema()
                 pbar.set_postfix({
                     'Loss': f'{batch_loss:.6f}',
@@ -799,6 +866,8 @@ class AutoencoderTrainer:
                 # Run validation at specified frequency
                 if (batch_idx + 1) % validation_interval == 0 or batch_idx == total_batches - 1:
                     self.run_validation(epoch, batch_idx + 1)
+                # Free GPU tensors for this batch
+                del sequences, input_seq, target_seq, output_seq, loss
 
             # Scheduler step per epoch for other schedulers
             if self.scheduler and self.config['training']['scheduler'] != 'linear_warmup':
@@ -808,7 +877,7 @@ class AutoencoderTrainer:
             if epoch % self.config['logging']['save_checkpoint_frequency'] == 0:
                 self.save_checkpoint(epoch, global_step)
         
-        self.logger.info("Training completed!")
+        self.logger.info("GBM training completed!")
         
         # Generate validation comparison video
         try:
@@ -818,14 +887,12 @@ class AutoencoderTrainer:
                 validation_loader=self.test_loader,
                 device=self.device,
                 experiment_dir=self.experiment_dir,
-                video_name="validation_comparison.mp4"
+                video_name="gbm_validation_comparison.mp4"
             )
             self.logger.info(f"Validation comparison video saved to: {video_path}")
         except Exception as e:
             self.logger.error(f"Failed to generate validation video: {e}")
             self.logger.error("Continuing without video generation...")
-    
-
 
     def save_checkpoint(self, epoch: int, step: int):
         """
@@ -867,7 +934,7 @@ class AutoencoderTrainer:
             batch_idx: Current batch index
             val_loss: Validation loss that triggered this save
         """
-        best_model_name = "best_model.pth"
+        best_model_name = "best_gbm_model.pth"
         best_model_path = self.checkpoint_dir / best_model_name
         
         # Remove previous best model if it exists
@@ -891,7 +958,7 @@ class AutoencoderTrainer:
             
         torch.save(state, best_model_path)
         self.best_model_path = best_model_path
-        self.logger.info(f"Best model saved with validation loss: {val_loss:.6f} at epoch {epoch}, batch {batch_idx}")
+        self.logger.info(f"Best GBM model saved with validation loss: {val_loss:.6f} at epoch {epoch}, batch {batch_idx}")
         
         return best_model_path
         
@@ -910,16 +977,11 @@ class AutoencoderTrainer:
             for checkpoint in checkpoints[:-keep_n]:
                 checkpoint.unlink()
                 self.logger.debug(f"Removed old checkpoint: {checkpoint}")
-    
-
-    
-
-        
 
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Train an autoencoder on 3D volume data.")
+    parser = argparse.ArgumentParser(description="Train GBM on 3D volume sequences.")
     
     # Config generation
     parser.add_argument(
@@ -941,7 +1003,7 @@ def main():
     if args.generate_config:
         try:
             generate_config_file(args.generate_config)
-            print(f"Default config file generated at: {args.generate_config}")
+            print(f"Default GBM config file generated at: {args.generate_config}")
         except Exception as e:
             print(f"Error generating config file: {e}")
         return
@@ -955,7 +1017,7 @@ def main():
     validate_config(config)
     
     # Start training
-    trainer = AutoencoderTrainer(config)
+    trainer = GBMTrainer(config)
     trainer.train()
 
 if __name__ == '__main__':

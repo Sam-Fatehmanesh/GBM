@@ -52,7 +52,7 @@ class ConvNormEncoder(nn.Module):
     extract regions from volumes, eliminating the need for manual volume-to-region conversion.
     """
     
-    def __init__(self, input_channels=1, hidden_channels=256, volume_size=(256, 128, 30), 
+    def __init__(self, hidden_channels=256, volume_size=(256, 128, 30), 
                  region_size=(32, 16, 2), num_frequencies=32, sigma=1.0):
         super(ConvNormEncoder, self).__init__()
         
@@ -60,7 +60,7 @@ class ConvNormEncoder(nn.Module):
         self.volume_size = volume_size
         self.region_size = region_size
         self.hidden_channels = hidden_channels
-        self.input_channels = input_channels
+        self.input_channels = 1
 
         # Assertions, region sizes divide volume sizes
         assert volume_size[0] % region_size[0] == 0, "Region size must divide volume size along x axis"
@@ -76,7 +76,7 @@ class ConvNormEncoder(nn.Module):
         # Encoder: 3D conv with kernel_size=region_size, stride=region_size
         # This automatically extracts regions from volumes
         self.encoder_conv = nn.Conv3d(
-            in_channels=input_channels,
+            in_channels=self.input_channels,
             out_channels=hidden_channels,
             kernel_size=region_size,
             stride=region_size,
@@ -89,7 +89,7 @@ class ConvNormEncoder(nn.Module):
         # Decoder: 3D transposed conv to reconstruct volumes
         self.decoder_conv = nn.ConvTranspose3d(
             in_channels=hidden_channels,
-            out_channels=input_channels,
+            out_channels=self.input_channels,
             kernel_size=region_size,
             stride=region_size,
             padding=0

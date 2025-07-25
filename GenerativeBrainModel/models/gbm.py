@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from GenerativeBrainModel.models.rms import RMSNorm
 from GenerativeBrainModel.models.mlp import MLP
-from GenerativeBrainModel.models.linnormencode import LinNormEncoder
+from GenerativeBrainModel.models.convnormencoder import ConvNormEncoder
 from mamba_ssm import Mamba2 as Mamba
 import pdb
 import os
@@ -83,31 +83,45 @@ class GBM(nn.Module):
         self.layers = nn.ModuleList([SpatioTemporalRegionModel(d_model, n_heads, self.n_regions) for _ in range(n_layers)])
 
         # initialize the autoencoder which has frozen weights
-        self.autoencoder = LinNormEncoder(
-            input_size=np.prod(region_size), 
-            hidden_size=d_model,
+        self.autoencoder = ConvNormEncoder(
+            hidden_channels=d_model,
             volume_size=volume_size,
-            region_size=region_size
+            region_size=region_size,
+            num_frequencies=32,
+            sigma=1.0
         )
 
         if autoencoder_path is not None:
-            self.autoencoder = LinNormEncoder(
-                input_size=np.prod(region_size), 
-                hidden_size=d_model,
-                volume_size=volume_size,
-                region_size=region_size
-            )
-            self.autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=torch.device('cpu')))
+            checkpoint = torch.load(autoencoder_path, map_location=torch.device('cpu'))
+            # Handle both direct model state_dict and full training checkpoints
+            if 'model_state_dict' in checkpoint:
+                # Full training checkpoint - extract model weights
+                model_state_dict = checkpoint['model_state_dict']
+            else:
+                # Direct model state_dict
+                model_state_dict = checkpoint
+            
+            # Handle torch.compile() prefixes (_orig_mod.) in state dict keys
+            cleaned_state_dict = {}
+            for key, value in model_state_dict.items():
+                # Remove _orig_mod. prefix if present (from torch.compile)
+                if key.startswith('_orig_mod.'):
+                    cleaned_key = key[len('_orig_mod.'):]
+                else:
+                    cleaned_key = key
+                cleaned_state_dict[cleaned_key] = value
+            
+            self.autoencoder.load_state_dict(cleaned_state_dict)
 
         for param in self.autoencoder.parameters():
             param.requires_grad = False
 
-    def forward(self, x):
+    def forward(self, x, get_logits=True):
         # Takes as input sequences of shape (batch_size, seq_len, volume_size**)
         # Returns sequences of shape (batch_size, seq_len, volume_size**)
         B, T, *vol_size = x.shape
 
-        assert vol_size == self.volume_size, "volume_size must match the input volume size"
+        assert list(vol_size) == list(self.volume_size), "volume_size must match the input volume size"
 
         # reshape to (batch_size, seq_len, n_regions, d_model) where the whole volume is divided up into 3d regions
         # Spatially-aware reshaping: split the volume into regions (macro-blocks), preserving spatial locality.
@@ -132,7 +146,7 @@ class GBM(nn.Module):
         x = x.permute(0, 1, 5, 2, 3, 4)
 
         # Decode the regions
-        x = self.autoencoder.decode(x, get_logits=True, apply_norm=False)
+        x = self.autoencoder.decode(x, get_logits=get_logits, apply_norm=False)
 
         # Reshape back to original volume shape: (B, T, X, Y, Z)
         x = x.reshape(B, T, vol_x, vol_y, vol_z)
@@ -276,7 +290,26 @@ class EnsembleGBM(nn.Module):
         
         for i, (model, path) in enumerate(zip(self.models, checkpoint_paths)):
             if path is not None:
-                model.load_state_dict(torch.load(path, map_location=torch.device('cpu')))
+                checkpoint = torch.load(path, map_location=torch.device('cpu'))
+                # Handle both direct model state_dict and full training checkpoints
+                if 'model_state_dict' in checkpoint:
+                    # Full training checkpoint - extract model weights
+                    model_state_dict = checkpoint['model_state_dict']
+                else:
+                    # Direct model state_dict
+                    model_state_dict = checkpoint
+                
+                # Handle torch.compile() prefixes (_orig_mod.) in state dict keys
+                cleaned_state_dict = {}
+                for key, value in model_state_dict.items():
+                    # Remove _orig_mod. prefix if present (from torch.compile)
+                    if key.startswith('_orig_mod.'):
+                        cleaned_key = key[len('_orig_mod.'):]
+                    else:
+                        cleaned_key = key
+                    cleaned_state_dict[cleaned_key] = value
+                
+                model.load_state_dict(cleaned_state_dict)
                 print(f"Loaded weights for model {i} from {path}")
     
     def save_ensemble_weights(self, checkpoint_dir, prefix="model"):

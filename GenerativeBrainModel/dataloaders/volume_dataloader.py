@@ -10,6 +10,16 @@ import random
 from pathlib import Path
 
 import torch
+import torch.multiprocessing as mp
+
+# Set multiprocessing tensor sharing strategy to file_system to reduce shared memory usage
+# This avoids `bus error` crashes when /dev/shm is limited (common in Docker/WSL environments)
+try:
+    mp.set_sharing_strategy('file_system')
+except RuntimeError:
+    # Sharing strategy may already be set – ignore in that case
+    pass
+
 from torch.utils.data import Dataset, DataLoader
 
 class VolumeDataset(Dataset):
@@ -168,7 +178,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     sequence_length = training_config.get('sequence_length', 1)
     stride = training_config.get('stride', 1)
     max_timepoints_per_subject = training_config.get('max_timepoints_per_subject', None)
-    use_cache = data_config.get('cache_data', True)
+    use_cache = data_config.get('use_cache', True)
 
     train_dataset = VolumeDataset(
         train_files, 
@@ -186,24 +196,25 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         use_cache=use_cache
     )
     
+    # Use safer defaults for DataLoader memory usage. Users can override via config.
+    dl_kwargs = {
+        'batch_size': training_config.get('volumes_per_batch', 4),
+        'num_workers': training_config.get('num_workers', 2),
+        'pin_memory': training_config.get('pin_memory', False),  # Pinning large 3-D volumes quickly exhausts shared memory
+        'persistent_workers': training_config.get('persistent_workers', False),
+        'prefetch_factor': training_config.get('prefetch_factor', 2),
+    }
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=training_config.get('volumes_per_batch', 4),
         shuffle=True,
-        num_workers=training_config.get('num_workers', 4),
-        pin_memory=training_config.get('pin_memory', True),
-        persistent_workers=True,
-        prefetch_factor=8
+        **dl_kwargs
     )
-    
+
     test_loader = DataLoader(
         test_dataset,
-        batch_size=training_config.get('volumes_per_batch', 4),
         shuffle=False,
-        num_workers=training_config.get('num_workers', 4),
-        pin_memory=training_config.get('pin_memory', True),
-        persistent_workers=True,
-        prefetch_factor=8
+        **dl_kwargs
     )
     
     return train_loader, test_loader
