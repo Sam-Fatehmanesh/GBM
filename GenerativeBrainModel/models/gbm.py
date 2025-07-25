@@ -62,6 +62,24 @@ class SpatioTemporalRegionModel(nn.Module):
         # Output shape: (B, T, N, D)
         return x
 
+class SpatialModel(nn.Module):
+    def __init__(self, d_model, n_heads, n_regions):
+        super(SpatialModel, self).__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_regions = n_regions
+        self.spatial_model = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+
+    def forward(self, x):
+        # expects x of shape (batch_size, seq_len, n_regions, d_model)
+        B, T, N, D = x.shape
+        x = x.reshape(B * T, N, D)
+        res = x
+        x = self.spatial_model(x, x, x)[0]
+        x = x + res
+        # Output shape: (B, T, N, D)
+        return x.view(B, T, N, D)
+
 
 class GBM(nn.Module):
     def __init__(self, d_model, n_heads, n_layers, autoencoder_path=None, volume_size=(256, 128, 30), region_size=(32, 16, 2)):
@@ -82,6 +100,8 @@ class GBM(nn.Module):
         self.n_blocks_y = volume_size[1] // region_size[1]
         self.n_blocks_z = volume_size[2] // region_size[2]
         self.layers = nn.ModuleList([SpatioTemporalRegionModel(d_model, n_heads, self.n_regions) for _ in range(n_layers)])
+
+        self.final_spatial_mixer = SpatialModel(d_model, n_heads, self.n_regions)
 
         # initialize the autoencoder which has frozen weights
         self.autoencoder = ConvNormEncoder(
@@ -114,8 +134,8 @@ class GBM(nn.Module):
             
             self.autoencoder.load_state_dict(cleaned_state_dict)
 
-        for param in self.autoencoder.parameters():
-            param.requires_grad = False
+        # for param in self.autoencoder.parameters():
+        #     param.requires_grad = False
 
     def forward(self, x, get_logits=True):
         # Takes as input sequences of shape (batch_size, seq_len, volume_size**)
@@ -139,7 +159,9 @@ class GBM(nn.Module):
         x = x.permute(0, 1, 3, 4, 5, 2).reshape(B, T, self.n_regions, self.d_model) # (B, T, n_regions, d_model)
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, apply_last_norm = i != len(self.layers) - 1) # (B, T, n_regions, d_model)
+            x = layer(x, apply_last_norm = True)# i != len(self.layers) - 1) # (B, T, n_regions, d_model)
+
+        x = self.final_spatial_mixer(x)
 
         # Reshape n_regions back to (n_blocks_x, n_blocks_y, n_blocks_z, d_model)
         x = x.view(B, T, self.n_blocks_x, self.n_blocks_y, self.n_blocks_z, self.d_model)  # (B, T, n_blocks_x, n_blocks_y, n_blocks_z, d_model)
