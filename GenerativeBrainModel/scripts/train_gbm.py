@@ -72,7 +72,22 @@ def create_default_config() -> Dict[str, Any]:
             'num_epochs': 100,
             'learning_rate': 0.0005,  # Lower LR for fine-tuning
             'weight_decay': 1e-4,
-            'scheduler': 'linear_warmup',  # Linear warmup for first 10% of batches
+            'optimizer': 'adamw',  # Optimizer type: 'adamw' or 'muon'
+            # Muon-specific settings (used when optimizer='muon')
+            'muon_lr': 0.02,  # Learning rate for Muon (hidden weights)
+            'muon_momentum': 0.95,  # Momentum for Muon
+            'muon_nesterov': True,  # Use Nesterov momentum for Muon
+            'muon_ns_steps': 5,  # Number of steps for Muon
+            # AdamW settings for non-hidden params when using Muon
+            'adamw_lr': 3e-4,  # Learning rate for AdamW params (when using Muon)
+            'adamw_betas': [0.9, 0.95],  # Beta values for AdamW
+            'adamw_eps': 1e-8,           # Epsilon for AdamW
+            # Muon-specific hyperparameters
+            'muon_betas': [0.9, 0.95],    # Beta values for Muon optimizer
+            'muon_eps': 1e-8,             # Epsilon for Muon optimizer
+            'scheduler': 'warmup_cosine',  # Linear warmup + cosine annealing
+            # Available schedulers: 'linear_warmup', 'warmup_cosine', 'warmup_lineardecay', 'cosine', 'step', or None
+            'min_lr_ratio': 0.01,  # Minimum LR as ratio of initial LR (for warmup_cosine and warmup_lineardecay)
             'gradient_clip_norm': 1.0,
             'gradient_accumulation_steps': None,  # Number of batches to accumulate gradients over (None/0 = disabled)
             'validation_frequency': 8,  # Number of times to run validation per epoch
@@ -536,28 +551,241 @@ class GBMTrainer:
         # Optimizer - only optimize trainable parameters
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         
-        self.optimizer = optim.AdamW(
-            trainable_params,
-            lr=training_config['learning_rate'],
-            weight_decay=training_config['weight_decay']
-        )
+        optimizer_type = training_config.get('optimizer', 'adamw')
+        
+        if optimizer_type == 'adamw':
+            self.optimizer = optim.AdamW(
+                trainable_params,
+                lr=training_config['learning_rate'],
+                weight_decay=training_config['weight_decay']
+            )
+            self.logger.info(f"Using AdamW optimizer with learning rate {training_config['learning_rate']}")
+        elif optimizer_type == 'muon':
+            # Import Muon optimizer
+            try:
+                from muon import MuonWithAuxAdam
+            except ImportError:
+                raise ImportError("Muon optimizer not found. Please install with: pip install git+https://github.com/KellerJordan/Muon")
+            
+            # Separate parameters according to Muon guidelines
+            hidden_weights = []
+            hidden_gains_biases = []
+            nonhidden_params = []
+            
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                    
+                # Parameters from autoencoder should use AdamW (non-hidden)
+                if 'autoencoder' in name:
+                    nonhidden_params.append(param)
+                # Hidden weights: parameters with ndim >= 2 (weight matrices, conv filters)
+                elif param.ndim >= 2:
+                    hidden_weights.append(param)
+                # Hidden gains/biases: parameters with ndim < 2 (biases, layer norms, etc.)
+                else:
+                    hidden_gains_biases.append(param)
+            
+            # Get optimizer settings
+            muon_lr = training_config.get('muon_lr', 0.02)
+            muon_momentum = training_config.get('muon_momentum', 0.95)
+            muon_nesterov = training_config.get('muon_nesterov', True)
+            muon_ns_steps = training_config.get('muon_ns_steps', 5)
+            
+            # AdamW optimizer for non-hidden parameters
+            adamw_lr = training_config.get('adamw_lr', 3e-4)
+            adamw_betas = training_config.get('adamw_betas', [0.9, 0.95])
+            
+            # Create parameter groups for MuonWithAuxAdam
+            param_groups = []
+            
+            # Hidden weights use Muon
+            if hidden_weights:
+                # Muon group: params, use_muon, lr, momentum, weight_decay
+                param_groups.append({
+                    'params': hidden_weights,
+                    'use_muon': True,
+                    'lr': muon_lr,
+                    'momentum': muon_momentum,
+                    'weight_decay': training_config['weight_decay']
+                })
+            
+            # Hidden gains/biases and non-hidden params use AdamW
+            if hidden_gains_biases or nonhidden_params:
+                # AdamW group in MuonWithAuxAdam: params, use_muon, lr, betas, eps, weight_decay
+                param_groups.append({
+                    'params': hidden_gains_biases + nonhidden_params,
+                    'use_muon': False,
+                    'lr': adamw_lr,
+                    'betas': training_config.get('adamw_betas'),
+                    'eps': training_config.get('adamw_eps'),
+                    'weight_decay': training_config['weight_decay']
+                })
+            
+            self.optimizer = MuonWithAuxAdam(param_groups)
+            
+            self.logger.info(f"Using Muon optimizer:")
+            self.logger.info(f"  Hidden weights ({len(hidden_weights)} params): Muon (LR: {muon_lr})")
+            self.logger.info(f"  Other params ({len(hidden_gains_biases) + len(nonhidden_params)} params): AdamW (LR: {adamw_lr})")
+        else:
+            raise ValueError(f"Unknown optimizer type: {optimizer_type}")
         
         self.logger.info(f"Optimizer parameters: {sum(p.numel() for p in trainable_params):,}")
         
         # Scheduler
         scheduler_type = training_config.get('scheduler', 'cosine')
         
+        # For Muon optimizer, we need to handle multiple parameter groups with different base LRs
+        if optimizer_type == 'muon':
+            base_muon_lr = training_config.get('muon_lr', 0.02)
+            base_adamw_lr = training_config.get('adamw_lr', 3e-4)
+        else:
+            base_lr = training_config['learning_rate']
+        
         if scheduler_type == 'linear_warmup':
             # Calculate total batches for warmup (10% of first epoch)
             warmup_batches = int(0.1 * len(self.train_loader))
             
-            def lr_lambda(batch):
-                if batch < warmup_batches:
-                    return float(batch) / float(max(1, warmup_batches))
-                return 1.0
+            if optimizer_type == 'muon':
+                # Different lambda functions for different parameter groups
+                def muon_lr_lambda(batch):
+                    if batch < warmup_batches:
+                        return float(batch) / float(max(1, warmup_batches))
+                    return 1.0
+                
+                def adamw_lr_lambda(batch):
+                    if batch < warmup_batches:
+                        return float(batch) / float(max(1, warmup_batches))
+                    return 1.0
+                
+                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, [muon_lr_lambda, adamw_lr_lambda])
+            else:
+                def lr_lambda(batch):
+                    if batch < warmup_batches:
+                        return float(batch) / float(max(1, warmup_batches))
+                    return 1.0
+                
+                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
             
-            self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
             self.logger.info(f"Using Linear Warmup scheduler with {warmup_batches} warmup batches.")
+        
+        elif scheduler_type == 'warmup_cosine':
+            # Linear warmup followed by cosine annealing
+            warmup_batches = int(0.1 * len(self.train_loader))  # 10% of first epoch for warmup
+            total_batches = training_config['num_epochs'] * len(self.train_loader)
+            cosine_batches = total_batches - warmup_batches  # Remaining batches for cosine annealing
+            
+            # Get minimum learning rate (default to 1% of initial LR)
+            min_lr_ratio = training_config.get('min_lr_ratio', 0.01)
+            if optimizer_type == 'muon':
+                # Different lambda functions for different parameter groups
+                min_muon_lr = base_muon_lr * min_lr_ratio
+                min_adamw_lr = base_adamw_lr * min_lr_ratio
+                
+                def muon_lr_lambda(batch):
+                    if batch < warmup_batches:
+                        return float(batch) / float(max(1, warmup_batches))
+                    else:
+                        cosine_batch = batch - warmup_batches
+                        cosine_progress = cosine_batch / cosine_batches
+                        cosine_progress = min(cosine_progress, 1.0)
+                        
+                        lr = min_muon_lr + 0.5 * (base_muon_lr - min_muon_lr) * (1 + np.cos(np.pi * cosine_progress))
+                        return lr / base_muon_lr
+                
+                def adamw_lr_lambda(batch):
+                    if batch < warmup_batches:
+                        return float(batch) / float(max(1, warmup_batches))
+                    else:
+                        cosine_batch = batch - warmup_batches
+                        cosine_progress = cosine_batch / cosine_batches
+                        cosine_progress = min(cosine_progress, 1.0)
+                        
+                        lr = min_adamw_lr + 0.5 * (base_adamw_lr - min_adamw_lr) * (1 + np.cos(np.pi * cosine_progress))
+                        return lr / base_adamw_lr
+                
+                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, [muon_lr_lambda, adamw_lr_lambda])
+                min_lrs = f"Muon: {min_muon_lr:.2e}, AdamW: {min_adamw_lr:.2e}"
+            else:
+                min_lr = base_lr * min_lr_ratio
+                
+                def lr_lambda(batch):
+                    if batch < warmup_batches:
+                        return float(batch) / float(max(1, warmup_batches))
+                    else:
+                        cosine_batch = batch - warmup_batches
+                        cosine_progress = cosine_batch / cosine_batches
+                        cosine_progress = min(cosine_progress, 1.0)
+                        
+                        lr = min_lr + 0.5 * (base_lr - min_lr) * (1 + np.cos(np.pi * cosine_progress))
+                        return lr / base_lr
+                
+                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+                min_lrs = f"{min_lr:.2e}"
+            
+            self.logger.info(f"Using Warmup + Cosine Annealing scheduler:")
+            self.logger.info(f"  Warmup batches: {warmup_batches}")
+            self.logger.info(f"  Total batches: {total_batches}")
+            self.logger.info(f"  Min LR ratio: {min_lr_ratio} (min_lrs: {min_lrs})")
+        
+        elif scheduler_type == 'warmup_lineardecay':
+            # Linear warmup followed by linear decay
+            warmup_batches = int(0.1 * len(self.train_loader))  # 10% of first epoch for warmup
+            total_batches = training_config['num_epochs'] * len(self.train_loader)
+            decay_batches = total_batches - warmup_batches  # Remaining batches for linear decay
+            
+            # Get minimum learning rate (default to 1% of initial LR)
+            min_lr_ratio = training_config.get('min_lr_ratio', 0.01)
+            if optimizer_type == 'muon':
+                # Different lambda functions for different parameter groups
+                min_muon_lr = base_muon_lr * min_lr_ratio
+                min_adamw_lr = base_adamw_lr * min_lr_ratio
+                
+                def muon_lr_lambda(batch):
+                    if batch < warmup_batches:
+                        return float(batch) / float(max(1, warmup_batches))
+                    else:
+                        decay_batch = batch - warmup_batches
+                        decay_progress = decay_batch / decay_batches
+                        decay_progress = min(decay_progress, 1.0)
+                        
+                        lr = base_muon_lr - (base_muon_lr - min_muon_lr) * decay_progress
+                        return lr / base_muon_lr
+                
+                def adamw_lr_lambda(batch):
+                    if batch < warmup_batches:
+                        return float(batch) / float(max(1, warmup_batches))
+                    else:
+                        decay_batch = batch - warmup_batches
+                        decay_progress = decay_batch / decay_batches
+                        decay_progress = min(decay_progress, 1.0)
+                        
+                        lr = base_adamw_lr - (base_adamw_lr - min_adamw_lr) * decay_progress
+                        return lr / base_adamw_lr
+                
+                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, [muon_lr_lambda, adamw_lr_lambda])
+                min_lrs = f"Muon: {min_muon_lr:.2e}, AdamW: {min_adamw_lr:.2e}"
+            else:
+                min_lr = base_lr * min_lr_ratio
+                
+                def lr_lambda(batch):
+                    if batch < warmup_batches:
+                        return float(batch) / float(max(1, warmup_batches))
+                    else:
+                        decay_batch = batch - warmup_batches
+                        decay_progress = decay_batch / decay_batches
+                        decay_progress = min(decay_progress, 1.0)
+                        
+                        lr = base_lr - (base_lr - min_lr) * decay_progress
+                        return lr / base_lr
+                
+                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+                min_lrs = f"{min_lr:.2e}"
+            
+            self.logger.info(f"Using Warmup + Linear Decay scheduler:")
+            self.logger.info(f"  Warmup batches: {warmup_batches}")
+            self.logger.info(f"  Total batches: {total_batches}")
+            self.logger.info(f"  Min LR ratio: {min_lr_ratio} (min_lrs: {min_lrs})")
         
         elif scheduler_type == 'cosine':
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -767,6 +995,19 @@ class GBMTrainer:
     def train(self):
         """Main training loop."""
         self.logger.info("Starting GBM training...")
+        # If not in distributed mode, ensure Muon optimizer sees world size = 1 and stub all_gather
+        try:
+            import torch.distributed as dist
+            if not dist.is_initialized():
+                dist.get_world_size = lambda group=None: 1
+                dist.get_rank = lambda group=None: 0
+                # Stub all_gather so Muon step doesn't require init_process_group
+                def _fake_all_gather(tensor_list, tensor, group=None):
+                    # For world_size=1, just copy tensor to output list
+                    tensor_list[0].copy_(tensor)
+                dist.all_gather = _fake_all_gather
+        except ImportError:
+            pass
         
         # Build all components
         self.build_model()
@@ -854,7 +1095,7 @@ class GBMTrainer:
                         self.optimizer.step()
 
                 # Scheduler per batch for linear warmup (only when actually stepping)
-                if (self.scheduler and self.config['training']['scheduler'] == 'linear_warmup' and
+                if (self.scheduler and self.config['training']['scheduler'] in ['linear_warmup', 'warmup_cosine', 'warmup_lineardecay'] and
                     (not use_grad_accum or ((batch_idx + 1) % grad_accum_steps == 0))):
                     self.scheduler.step()
                 
@@ -889,7 +1130,7 @@ class GBMTrainer:
                 del sequences, input_seq, target_seq, output_seq, loss
 
             # Scheduler step per epoch for other schedulers
-            if self.scheduler and self.config['training']['scheduler'] != 'linear_warmup':
+            if self.scheduler and self.config['training']['scheduler'] not in ['linear_warmup', 'warmup_cosine', 'warmup_lineardecay']:
                 self.scheduler.step()
         
             # Save checkpoint at end of epoch
@@ -898,11 +1139,20 @@ class GBMTrainer:
         
         self.logger.info("GBM training completed!")
         
+        # Load best model for video generation
+        try:
+            best_model_for_video = self.load_best_model_for_inference()
+        except (ValueError, FileNotFoundError) as e:
+            self.logger.warning(f"Could not load best model checkpoint: {e}")
+            self.logger.warning("Using current model state for video generation...")
+            best_model_for_video = self.model
+        
         # Generate validation comparison video
         try:
             self.logger.info("Generating validation comparison video...")
+            self.logger.info("Using best model checkpoint for video generation...")
             video_path = create_validation_video(
-                model=self.model,
+                model=best_model_for_video,
                 validation_loader=self.test_loader,
                 device=self.device,
                 experiment_dir=self.experiment_dir,
@@ -997,6 +1247,78 @@ class GBMTrainer:
             for checkpoint in checkpoints[:-keep_n]:
                 checkpoint.unlink()
                 self.logger.debug(f"Removed old checkpoint: {checkpoint}")
+
+    def load_best_model_for_inference(self) -> torch.nn.Module:
+        """
+        Load the best model checkpoint for inference.
+        
+        Returns:
+            The loaded model.
+            
+        Raises:
+            ValueError: If no best model checkpoint path is available
+            FileNotFoundError: If the best model checkpoint file doesn't exist
+        """
+        if self.best_model_path is None:
+            raise ValueError("No best model checkpoint found. Please train the model first.")
+        
+        if not self.best_model_path.exists():
+            raise FileNotFoundError(f"Best model checkpoint file not found: {self.best_model_path}")
+        
+        self.logger.info(f"Loading best model from: {self.best_model_path}")
+        state_dict = torch.load(self.best_model_path, map_location=self.device)
+        
+        # Handle torch.compile() prefixes (_orig_mod.) in state dict keys
+        model_state_dict = state_dict['model_state_dict']
+        cleaned_state_dict = {}
+        for key, value in model_state_dict.items():
+            # Remove _orig_mod. prefix if present (from torch.compile)
+            if key.startswith('_orig_mod.'):
+                cleaned_key = key[len('_orig_mod.'):]
+            else:
+                cleaned_key = key
+            cleaned_state_dict[cleaned_key] = value
+        
+        # Create a new model instance to avoid modifying the current model's state
+        model_config = self.config['model']
+        ensemble_size = model_config.get('ensemble_size', 1)
+        
+        if ensemble_size > 1:
+            best_model = EnsembleGBM(
+                n_models=ensemble_size,
+                d_model=model_config['d_model'],
+                n_heads=model_config['n_heads'],
+                n_layers=model_config['n_layers'],
+                autoencoder_path=model_config.get('autoencoder_path'),
+                volume_size=tuple(model_config['volume_size']),
+                region_size=tuple(model_config['region_size']),
+                different_seeds=model_config.get('different_seeds', True)
+            )
+        else:
+            best_model = GBM(
+                d_model=model_config['d_model'],
+                n_heads=model_config['n_heads'],
+                n_layers=model_config['n_layers'],
+                autoencoder_path=model_config.get('autoencoder_path'),
+                volume_size=tuple(model_config['volume_size']),
+                region_size=tuple(model_config['region_size'])
+            )
+        
+        best_model.load_state_dict(cleaned_state_dict)
+        best_model.to(self.device)
+        
+        # Log information about the best model
+        best_val_loss = state_dict.get('validation_loss', 'unknown')
+        best_epoch = state_dict.get('epoch', 'unknown')
+        best_batch = state_dict.get('batch_idx', 'unknown')
+        model_size = sum(p.numel() for p in best_model.parameters())
+        
+        self.logger.info(f"Best model loaded successfully:")
+        self.logger.info(f"  Validation loss: {best_val_loss}")
+        self.logger.info(f"  Epoch: {best_epoch}, Batch: {best_batch}")
+        self.logger.info(f"  Model size: {model_size:,} parameters")
+        
+        return best_model
 
 
 def main():
