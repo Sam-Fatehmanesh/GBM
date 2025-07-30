@@ -134,8 +134,6 @@ class GBM(nn.Module):
             
             self.autoencoder.load_state_dict(cleaned_state_dict)
 
-        # for param in self.autoencoder.parameters():
-        #     param.requires_grad = False
 
     def forward(self, x, get_logits=True):
         # Takes as input sequences of shape (batch_size, seq_len, volume_size**)
@@ -175,6 +173,30 @@ class GBM(nn.Module):
         x = x.reshape(B, T, vol_x, vol_y, vol_z)
 
         return x
+
+    def autoregress(self, init_x, n_steps, context_len=12):
+        # init_x: (B, T, X, Y, Z)
+        # n_steps: number of steps to generate
+        # context_len: number of steps to use as context
+        B, T, *vol_size = init_x.shape
+        assert T >= context_len, "context_len must be less than or equal to T"
+        assert n_steps > 0, "n_steps must be greater than 0"
+        assert context_len > 0, "context_len must be greater than 0"
+
+        # Start with the initial sequence
+        current_sequence = init_x
+        
+        # generate n_steps steps
+        for i in range(n_steps):
+            # get the context from the current sequence
+            context = current_sequence[:, -context_len:]
+            # generate the next step
+            next_step = self.forward(context)[:, -1:]  # (B, 1, X, Y, Z)
+            # append the next step to the current sequence
+            current_sequence = torch.cat([current_sequence, next_step], dim=1)
+
+        # Return the full sequence including the original init_x and the generated steps
+        return current_sequence
 
 # During training loss of each GBM is indepedent, during inference we average the output logits of all GBMs 
 
