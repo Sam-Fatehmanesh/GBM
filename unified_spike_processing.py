@@ -251,9 +251,7 @@ def create_3d_volumes(prob_data, cell_positions, volume_shape, dtype='float16'):
         cell_positions = np.nan_to_num(cell_positions)
     
     # Handle NaN values in probability data
-    if np.isnan(prob_data).any():
-        print("Warning: NaN values found in probability data, replacing with 0")
-        prob_data = np.nan_to_num(prob_data, nan=0.0, posinf=0.0, neginf=0.0)
+    prob_data = np.nan_to_num(prob_data, nan=0.0, posinf=0.0, neginf=0.0)
     
     print(f"Creating 3D volumes with shape {volume_shape} from {N} cells and {T} timepoints")
     
@@ -277,31 +275,50 @@ def create_3d_volumes(prob_data, cell_positions, volume_shape, dtype='float16'):
     volumes = np.zeros((T, x_size, y_size, z_size), dtype=volume_dtype)
     
     print("Converting probabilities to 3D volumes...")
+    
+    # Vectorized processing using numpy operations
+    # Create flat indices for 3D volume
+    flat_indices = volume_x * (y_size * z_size) + volume_y * z_size + volume_z
+    
     for t in tqdm(range(T), desc="Processing timepoints"):
-        # Get probabilities for this timepoint
         probs_t = prob_data[:, t]
         
-        # Find cells with non-zero probabilities
-        active_cells = np.abs(probs_t) > 1e-6
+        # Find active cells
+        active_mask = probs_t > 1e-6
+        if not np.any(active_mask):
+            continue
             
-        if np.any(active_cells):
-            active_x = volume_x[active_cells]
-            active_y = volume_y[active_cells]
-            active_z = volume_z[active_cells]
-            active_probs = probs_t[active_cells]
-                
-            # Set active cells in the volume
-            # If multiple cells map to same volume element, compute probability that any cell is active (1 - product of (1-p))
-            # First, group by voxel indices
-            from collections import defaultdict
-            voxel_probs = defaultdict(list)
-            for i in range(len(active_x)):
-                key = (active_x[i], active_y[i], active_z[i])
-                voxel_probs[key].append(active_probs[i])
-            for (x, y, z), probs in voxel_probs.items():
-                # Probability that at least one cell is active: 1 - product(1 - p)
-                p_any = 1.0 - np.prod(1.0 - np.clip(probs, 0, 1))
-                volumes[t, x, y, z] = p_any
+        active_probs = probs_t[active_mask]
+        active_indices = flat_indices[active_mask]
+        
+        # Use numpy's bincount for efficient aggregation
+        # First, sort by indices to group identical voxels
+        sort_order = np.argsort(active_indices)
+        sorted_indices = active_indices[sort_order]
+        sorted_probs = active_probs[sort_order]
+        
+        # Find unique voxel indices and their positions
+        unique_indices, inverse_indices = np.unique(sorted_indices, return_inverse=True)
+        
+        # Compute probability for each unique voxel
+        # Using log-space to avoid underflow: 1 - exp(sum(log(1-p)))
+        log_probs = np.log1p(-np.clip(sorted_probs, 0, 1))
+        
+        # Sum log probabilities for each unique voxel
+        voxel_log_probs = np.zeros(len(unique_indices))
+        np.add.at(voxel_log_probs, inverse_indices, log_probs)
+        
+        # Convert back to probability space
+        voxel_probs = 1.0 - np.exp(voxel_log_probs)
+        
+        # Convert flat indices back to 3D coordinates
+        x_coords = unique_indices // (y_size * z_size)
+        yz_coords = unique_indices % (y_size * z_size)
+        y_coords = yz_coords // z_size
+        z_coords = yz_coords % z_size
+        
+        # Assign probabilities to volume
+        volumes[t, x_coords, y_coords, z_coords] = voxel_probs.astype(volume_dtype)
 
     # Create metadata
     metadata = {
@@ -505,13 +522,12 @@ def process_subject(subject_dir, config):
             new_T = int(T * target_rate / orig_rate)
             new_time = np.arange(new_T) / target_rate
             
-            # Interpolate each neuron's trace
-            from scipy.interpolate import interp1d
+            # Interpolate each neuron's trace using PCHIP
+            from scipy.interpolate import PchipInterpolator
             calcium_interpolated = np.zeros((new_T, N), dtype=calcium.dtype)
             
             for n in range(N):
-                interp_func = interp1d(original_time, calcium[:, n], kind='linear', 
-                                        bounds_error=False, fill_value='extrapolate')
+                interp_func = PchipInterpolator(original_time, calcium[:, n], extrapolate=True)
                 calcium_interpolated[:, n] = interp_func(new_time)
             
             calcium = calcium_interpolated
