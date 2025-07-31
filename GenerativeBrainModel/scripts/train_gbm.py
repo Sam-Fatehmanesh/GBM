@@ -61,6 +61,8 @@ def create_default_config() -> Dict[str, Any]:
             'n_heads': 8,
             'n_layers': 4,
             'autoencoder_path': None,  # Path to pretrained autoencoder checkpoint
+            'gbm_checkpoint_path': None,  # Path to complete GBM checkpoint for continued training
+            'reset_training_state': False,  # If True, reset epoch/step counters when loading GBM checkpoint
             'volume_size': [256, 128, 30],
             'region_size': [32, 16, 2],
             'ensemble_size': 1,  # Number of models in ensemble (1 = single model)
@@ -115,7 +117,14 @@ def create_default_config() -> Dict[str, Any]:
             'loss_weights': {
                 'reconstruction': 1.0,
                 'regularization': 0.0
-            }
+            },
+            # Two-Step Rollout Loss configuration
+            'use_two_step_rollout': False,  # Enable/disable two-step rollout loss
+            'two_step_alpha': 0.5,  # Weight for L2 loss component (α in L = L1 + α*L2)
+            'two_step_curriculum': True,  # Enable curriculum learning for α
+            'two_step_alpha_start': 0.1,  # Starting α value for curriculum
+            'two_step_alpha_end': 1.0,  # Final α value for curriculum
+            'two_step_ramp_fraction': 0.5  # Fraction of total training steps to ramp α (0.5 = first 50% of training)
         },
         
         'logging': {
@@ -257,14 +266,62 @@ def validate_config(config: Dict[str, Any]) -> None:
     if autoencoder_path and not Path(autoencoder_path).exists():
         raise ValueError(f"Autoencoder checkpoint not found: {autoencoder_path}")
     
+    # Check GBM checkpoint path if provided
+    gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
+    if gbm_checkpoint_path and not Path(gbm_checkpoint_path).exists():
+        raise ValueError(f"GBM checkpoint not found: {gbm_checkpoint_path}")
+    
     # Validate sequence length
     seq_len = config['training']['sequence_length']
-    if seq_len < 2:
-        raise ValueError(f"Sequence length must be at least 2 for seq2seq training, got {seq_len}")
+    use_two_step_rollout = config['loss'].get('use_two_step_rollout', False)
+    
+    if use_two_step_rollout:
+        if seq_len < 2:
+            raise ValueError(f"Sequence length must be at least 2 for two-step rollout training, got {seq_len}")
+        print(f"Two-Step Rollout Loss enabled - will request {seq_len + 1} timesteps from dataloader")
+    else:
+        if seq_len < 2:
+            raise ValueError(f"Sequence length must be at least 2 for seq2seq training, got {seq_len}")
+    
+    # Validate two-step rollout loss configuration
+    if use_two_step_rollout:
+        loss_config = config['loss']
+        alpha = loss_config.get('two_step_alpha', 0.5)
+        if not (0.0 <= alpha <= 10.0):  # Allow alpha > 1 for emphasis on L2
+            raise ValueError(f"two_step_alpha must be between 0.0 and 10.0, got {alpha}")
+        
+        if loss_config.get('two_step_curriculum', False):
+            alpha_start = loss_config.get('two_step_alpha_start', 0.1)
+            alpha_end = loss_config.get('two_step_alpha_end', 1.0)
+            ramp_fraction = loss_config.get('two_step_ramp_fraction', 0.5)
+            
+            if not (0.0 <= alpha_start <= 10.0):
+                raise ValueError(f"two_step_alpha_start must be between 0.0 and 10.0, got {alpha_start}")
+            if not (0.0 <= alpha_end <= 10.0):
+                raise ValueError(f"two_step_alpha_end must be between 0.0 and 10.0, got {alpha_end}")
+            if not (0.0 < ramp_fraction <= 1.0):
+                raise ValueError(f"two_step_ramp_fraction must be between 0.0 and 1.0, got {ramp_fraction}")
+            
+            print(f"Two-step curriculum: α ramps from {alpha_start} to {alpha_end} over {ramp_fraction*100:.0f}% of training")
+        else:
+            print(f"Two-step rollout: fixed α = {alpha}")
     
     print(f"Configuration validation passed!")
     print(f"GBM Model: d_model={model_config['d_model']}, n_heads={model_config['n_heads']}, n_layers={model_config['n_layers']}")
     print(f"Sequence length: {seq_len}, Ensemble size: {model_config['ensemble_size']}")
+    
+    # Show checkpoint/autoencoder loading info
+    gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
+    autoencoder_path = model_config.get('autoencoder_path')
+    reset_training_state = model_config.get('reset_training_state', False)
+    
+    if gbm_checkpoint_path:
+        reset_msg = " (with training state reset)" if reset_training_state else " (continuing from checkpoint)"
+        print(f"Will load complete GBM checkpoint: {gbm_checkpoint_path}{reset_msg}")
+    elif autoencoder_path:
+        print(f"Will load pretrained autoencoder: {autoencoder_path}")
+    else:
+        print("Will use randomly initialized model")
 
 
 def deep_update(base_dict: Dict, update_dict: Dict) -> Dict:
@@ -331,6 +388,10 @@ class GBMTrainer:
         self.best_val_loss = float('inf')
         self.best_model_path = None
         self.early_stopping_counter = 0
+        self.loaded_from_checkpoint = False
+        self.checkpoint_epoch = 0
+        self.checkpoint_step = 0
+        self.checkpoint_data = None  # Store checkpoint data for optimizer/scheduler loading
         
         # Setup experiment directory
         self.experiment_dir = Path(config['paths']['experiment_dir'])
@@ -418,14 +479,23 @@ class GBMTrainer:
             self.logger.info("Created single GBM model")
         
         autoencoder_path = model_config.get('autoencoder_path')
-        if autoencoder_path:
+        gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
+        
+        if gbm_checkpoint_path and autoencoder_path:
+            self.logger.info(f"Both GBM checkpoint and autoencoder path provided - GBM checkpoint takes precedence")
+        elif autoencoder_path and not gbm_checkpoint_path:
             self.logger.info(f"Loaded pretrained autoencoder from: {autoencoder_path}")
-        else:
-            self.logger.warning("No autoencoder path provided - using randomly initialized autoencoder")
+        elif not autoencoder_path and not gbm_checkpoint_path:
+            self.logger.warning("No autoencoder path or GBM checkpoint provided - using randomly initialized autoencoder")
         
         self.logger.info(f"Model volume size: {model_config['volume_size']}, region size: {model_config['region_size']}")
         
         self.model.to(self.device)
+        
+        # Load complete GBM checkpoint if provided (takes precedence over autoencoder_path)
+        gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
+        if gbm_checkpoint_path:
+            self.load_gbm_checkpoint(gbm_checkpoint_path)
         
         # Compile model if requested (PyTorch 2.0+)
         if self.config['training'].get('compile_model', False):
@@ -543,6 +613,117 @@ class GBMTrainer:
             f.write("\n" + "=" * 80 + "\n")
         
         self.logger.info(f"Model architecture saved to: {architecture_file}")
+    
+    def load_gbm_checkpoint(self, checkpoint_path: str):
+        """
+        Load a complete GBM checkpoint for continued training.
+        
+        Args:
+            checkpoint_path: Path to the GBM checkpoint file
+        """
+        checkpoint_path = Path(checkpoint_path)
+        self.logger.info(f"Loading GBM checkpoint from: {checkpoint_path}")
+        
+        try:
+            # Load checkpoint
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Handle torch.compile() prefixes (_orig_mod.) in state dict keys
+            model_state_dict = checkpoint['model_state_dict']
+            cleaned_state_dict = {}
+            for key, value in model_state_dict.items():
+                # Remove _orig_mod. prefix if present (from torch.compile)
+                if key.startswith('_orig_mod.'):
+                    cleaned_key = key[len('_orig_mod.'):]
+                else:
+                    cleaned_key = key
+                cleaned_state_dict[cleaned_key] = value
+            
+            # Load model state
+            self.model.load_state_dict(cleaned_state_dict)
+            
+            # Load training state (unless reset is requested)
+            reset_training_state = self.config['model'].get('reset_training_state', False)
+            if reset_training_state:
+                self.checkpoint_epoch = 0
+                self.checkpoint_step = 0
+                self.best_val_loss = float('inf')
+                self.logger.info("Training state reset - will start training from epoch 1")
+            else:
+                self.checkpoint_epoch = checkpoint.get('epoch', 0)
+                self.checkpoint_step = checkpoint.get('step', 0)
+                self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+                
+                # If this was the best model, update best_model_path
+                if 'validation_loss' in checkpoint:
+                    self.best_val_loss = checkpoint['validation_loss']
+            
+            self.loaded_from_checkpoint = True
+            self.checkpoint_data = checkpoint  # Store for optimizer/scheduler loading
+            
+            self.logger.info(f"Successfully loaded GBM checkpoint:")
+            self.logger.info(f"  Checkpoint epoch: {self.checkpoint_epoch}")
+            self.logger.info(f"  Checkpoint step: {self.checkpoint_step}")
+            self.logger.info(f"  Best validation loss: {self.best_val_loss}")
+            
+            # Check if config matches
+            if 'config' in checkpoint:
+                checkpoint_config = checkpoint['config']
+                current_model_config = self.config['model']
+                checkpoint_model_config = checkpoint_config.get('model', {})
+                
+                # Compare key model parameters
+                key_params = ['d_model', 'n_heads', 'n_layers', 'volume_size', 'region_size']
+                for param in key_params:
+                    current_val = current_model_config.get(param)
+                    checkpoint_val = checkpoint_model_config.get(param)
+                    if current_val != checkpoint_val:
+                        self.logger.warning(f"Config mismatch for {param}: current={current_val}, checkpoint={checkpoint_val}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load GBM checkpoint: {e}")
+            raise ValueError(f"Could not load GBM checkpoint from {checkpoint_path}: {e}")
+    
+    def load_optimizer_states(self):
+        """
+        Load optimizer and scheduler states from the stored checkpoint data.
+        This should be called after the optimizer and scheduler are built.
+        """
+        if not self.checkpoint_data:
+            self.logger.warning("No checkpoint data available for loading optimizer states")
+            return
+        
+        # Check if training state should be reset
+        reset_training_state = self.config['model'].get('reset_training_state', False)
+        if reset_training_state:
+            self.logger.info("Training state reset requested - using fresh optimizer/scheduler/scaler states")
+            return
+        
+        try:
+            # Load optimizer state
+            if 'optimizer_state_dict' in self.checkpoint_data:
+                self.optimizer.load_state_dict(self.checkpoint_data['optimizer_state_dict'])
+                self.logger.info("Loaded optimizer state from checkpoint")
+            else:
+                self.logger.info("No optimizer state found in checkpoint - using fresh optimizer")
+            
+            # Load scheduler state
+            if self.scheduler and 'scheduler_state_dict' in self.checkpoint_data:
+                self.scheduler.load_state_dict(self.checkpoint_data['scheduler_state_dict'])
+                self.logger.info("Loaded scheduler state from checkpoint")
+            elif self.scheduler:
+                self.logger.info("No scheduler state found in checkpoint - using fresh scheduler")
+            
+            # Load scaler state
+            if self.scaler and 'scaler_state_dict' in self.checkpoint_data:
+                self.scaler.load_state_dict(self.checkpoint_data['scaler_state_dict'])
+                self.logger.info("Loaded mixed precision scaler state from checkpoint")
+            elif self.scaler:
+                self.logger.info("No scaler state found in checkpoint - using fresh scaler")
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to load optimizer/scheduler states from checkpoint: {e}")
+            self.logger.warning("Continuing with fresh optimizer/scheduler states")
     
     def build_optimizer(self):
         """Build optimizer and scheduler."""
@@ -812,6 +993,10 @@ class GBMTrainer:
             self.scaler = GradScaler()
             self.logger.info("Mixed precision training enabled")
         
+        # Load optimizer and scheduler states from checkpoint if available
+        if self.loaded_from_checkpoint:
+            self.load_optimizer_states()
+        
         self.logger.info(f"Optimizer: {self.optimizer.__class__.__name__}")
         self.logger.info(f"Scheduler: {scheduler_type}")
     
@@ -836,7 +1021,21 @@ class GBMTrainer:
                 raise ValueError("Could not determine volume_size from data directory and it is not specified in model config.")
             self.logger.info(f"Using volume_size from model config: {self.config['model']['volume_size']}")
 
+        # Check if Two-Step Rollout Loss is enabled and adjust sequence length accordingly
+        use_two_step_rollout = self.config['loss'].get('use_two_step_rollout', False)
+        original_sequence_length = self.config['training']['sequence_length']
+        
+        if use_two_step_rollout:
+            # Request one extra timestep for two-step rollout loss
+            self.config['training']['sequence_length'] = original_sequence_length + 1
+            self.logger.info(f"Two-Step Rollout Loss enabled: requesting {original_sequence_length + 1} timesteps (original: {original_sequence_length})")
+        
         self.train_loader, self.test_loader = create_dataloaders(self.config)
+        
+        # Restore original sequence length for model processing
+        if use_two_step_rollout:
+            self.config['training']['sequence_length'] = original_sequence_length
+            
         self.logger.info(f"Train loader: {len(self.train_loader.dataset)} samples")
         self.logger.info(f"Test loader: {len(self.test_loader.dataset)} samples")
     
@@ -855,38 +1054,99 @@ class GBMTrainer:
         else:
             raise ValueError(f"Unknown loss function: {loss_type}")
     
-    def prepare_seq2seq_data(self, sequences):
+    def get_two_step_alpha(self, global_step: int, total_steps: int) -> float:
+        """
+        Calculate the alpha weight for two-step rollout loss with curriculum learning.
+        
+        Args:
+            global_step: Current global training step (0-indexed)
+            total_steps: Total training steps across all epochs
+            
+        Returns:
+            Alpha weight for L2 loss component
+        """
+        loss_config = self.config['loss']
+        
+        if not loss_config.get('two_step_curriculum', False):
+            # Fixed alpha value
+            return loss_config.get('two_step_alpha', 0.5)
+        
+        # Curriculum learning: ramp alpha from start to end value during training
+        alpha_start = loss_config.get('two_step_alpha_start', 0.1)
+        alpha_end = loss_config.get('two_step_alpha_end', 1.0)
+        
+        # Get the fraction of training steps to use for ramping (default: 50%)
+        ramp_fraction = loss_config.get('two_step_ramp_fraction', 0.5)
+        ramp_steps = int(total_steps * ramp_fraction)
+        
+        if global_step < ramp_steps:
+            # Linear interpolation from start to end during ramp period
+            progress = global_step / max(1, ramp_steps - 1)
+            alpha = alpha_start + progress * (alpha_end - alpha_start)
+        else:
+            # Use final alpha value after ramp period
+            alpha = alpha_end
+            
+        return alpha
+    
+    def prepare_seq2seq_data(self, sequences, two_step_rollout=False):
         """
         Prepare input and target sequences for seq2seq training.
         
         Args:
             sequences: Tensor of shape (B, T, X, Y, Z)
+            two_step_rollout: If True, prepare data for two-step rollout loss
             
         Returns:
-            Tuple of (input_sequences, target_sequences)
-            - input_sequences: (B, T-1, X, Y, Z) - sequences[0:T-1]
-            - target_sequences: (B, T-1, X, Y, Z) - sequences[1:T]
+            If two_step_rollout=False:
+                Tuple of (input_sequences, target_sequences)
+                - input_sequences: (B, T-1, X, Y, Z) - sequences[0:T-1]
+                - target_sequences: (B, T-1, X, Y, Z) - sequences[1:T]
+            If two_step_rollout=True:
+                Tuple of (input_sequences, target_sequences, second_step_target)
+                - input_sequences: (B, T-2, X, Y, Z) - sequences[0:T-2]
+                - target_sequences: (B, T-2, X, Y, Z) - sequences[1:T-1]  
+                - second_step_target: (B, T-2, X, Y, Z) - sequences[2:T]
         """
         B, T, X, Y, Z = sequences.shape
         
-        if T < 2:
-            raise ValueError(f"Sequence length must be at least 2 for seq2seq training, got {T}")
-        
-        # Input: all timesteps except the last
-        input_seq = sequences[:, :-1, :, :, :]  # (B, T-1, X, Y, Z)
-        
-        # Target: all timesteps except the first  
-        target_seq = sequences[:, 1:, :, :, :]   # (B, T-1, X, Y, Z)
-        
-        return input_seq, target_seq
+        if not two_step_rollout:
+            # Standard seq2seq preparation
+            if T < 2:
+                raise ValueError(f"Sequence length must be at least 2 for seq2seq training, got {T}")
+            
+            # Input: all timesteps except the last
+            input_seq = sequences[:, :-1, :, :, :]  # (B, T-1, X, Y, Z)
+            
+            # Target: all timesteps except the first  
+            target_seq = sequences[:, 1:, :, :, :]   # (B, T-1, X, Y, Z)
+            
+            return input_seq, target_seq
+        else:
+            # Two-step rollout preparation  
+            if T < 3:
+                raise ValueError(f"Sequence length must be at least 3 for two-step rollout training, got {T}")
+            
+            # Input: all timesteps except the last two
+            input_seq = sequences[:, :-2, :, :, :]  # (B, T-2, X, Y, Z)
+            
+            # Target for first step: timesteps 1 to T-2  
+            target_seq = sequences[:, 1:-1, :, :, :]   # (B, T-2, X, Y, Z)
+            
+            # Target for second step: timesteps 2 to T-1
+            second_step_target = sequences[:, 2:, :, :, :]   # (B, T-2, X, Y, Z)
+            
+            return input_seq, target_seq, second_step_target
 
-    def run_validation(self, epoch: int, batch_idx: int):
+    def run_validation(self, epoch: int, batch_idx: int, global_step: int, total_steps: int):
         """
         Run validation on entire test dataset and log metrics using the metrics tracker.
         
         Args:
             epoch: Current epoch number
             batch_idx: Current batch index within epoch
+            global_step: Current global training step
+            total_steps: Total training steps across all epochs
         """
         self.logger.info(f"Running validation at epoch {epoch}, batch {batch_idx}")
         
@@ -917,20 +1177,52 @@ class GBMTrainer:
                 
                 val_sequences = val_sequences.to(self.device, non_blocking=True)
                 
+                # Check if two-step rollout loss is enabled
+                use_two_step_rollout = self.config['loss'].get('use_two_step_rollout', False)
+                
                 # Prepare seq2seq data
-                val_input, val_target = self.prepare_seq2seq_data(val_sequences)
+                if use_two_step_rollout:
+                    val_input, val_target, val_second_step_target = self.prepare_seq2seq_data(val_sequences, two_step_rollout=True)
+                else:
+                    val_input, val_target = self.prepare_seq2seq_data(val_sequences, two_step_rollout=False)
                 
                 # Forward pass
                 with autocast(enabled=self.scaler is not None):
                     # Get predicted next volumes
                     val_output = self.model(val_input, get_logits=True)
-                    val_loss = loss_fn(val_output, val_target)
+                    val_l1_loss = loss_fn(val_output, val_target)
+                    
+                    if use_two_step_rollout:
+                        # Two-step rollout validation loss
+                        # Get current alpha weight
+                        alpha = self.get_two_step_alpha(global_step, total_steps)
+                        
+                        # Detach the first step predictions
+                        val_first_step_pred = torch.sigmoid(val_output.detach())
+                        
+                        # Create second step input
+                        B, T_minus_2, X, Y, Z = val_input.shape
+                        val_second_step_input = torch.cat([
+                            val_input[:, 1:, :, :, :],  # (B, T-3, X, Y, Z)
+                            val_first_step_pred[:, -1:, :, :, :]  # (B, 1, X, Y, Z)
+                        ], dim=1)  # (B, T-2, X, Y, Z)
+                        
+                        # Forward pass for second step
+                        val_second_step_output = self.model(val_second_step_input, get_logits=True)
+                        val_l2_loss = loss_fn(val_second_step_output, val_second_step_target)
+                        
+                        # Combined validation loss
+                        val_loss = val_l1_loss + alpha * val_l2_loss
+                        
+                        # Use first step predictions for metrics calculation
+                        val_probabilities = torch.sigmoid(val_output)
+                    else:
+                        # Standard validation loss
+                        val_loss = val_l1_loss
+                        val_probabilities = torch.sigmoid(val_output)
                 
                 total_val_loss += val_loss.item()
                 num_batches += 1
-                
-                # Convert logits to probabilities for metrics calculation
-                val_probabilities = torch.sigmoid(val_output)
                 
                 # Flatten predictions and targets
                 batch_preds = val_probabilities.flatten()
@@ -1020,11 +1312,20 @@ class GBMTrainer:
         
         num_epochs = self.config['training']['num_epochs']
         total_batches = len(self.train_loader)
+        total_steps = num_epochs * total_batches
         
+        # Set starting epoch and step based on checkpoint loading
+        if self.loaded_from_checkpoint:
+            start_epoch = self.checkpoint_epoch + 1
+            global_step = self.checkpoint_step
+            self.logger.info(f"Resuming training from epoch {start_epoch} (loaded from checkpoint)")
+        else:
+            start_epoch = 1
+            global_step = 0
+            
         self.current_epoch = 0
-        global_step = 0
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(start_epoch, num_epochs + 1):
             self.current_epoch = epoch
             self.model.train()
             
@@ -1047,8 +1348,14 @@ class GBMTrainer:
                 
                 sequences = sequences.to(self.device, non_blocking=True)
                 
+                # Check if two-step rollout loss is enabled
+                use_two_step_rollout = self.config['loss'].get('use_two_step_rollout', False)
+                
                 # Prepare seq2seq data
-                input_seq, target_seq = self.prepare_seq2seq_data(sequences)
+                if use_two_step_rollout:
+                    input_seq, target_seq, second_step_target = self.prepare_seq2seq_data(sequences, two_step_rollout=True)
+                else:
+                    input_seq, target_seq = self.prepare_seq2seq_data(sequences, two_step_rollout=False)
                 
                 # Get gradient accumulation settings
                 grad_accum_steps = self.config['training'].get('gradient_accumulation_steps')
@@ -1059,9 +1366,43 @@ class GBMTrainer:
                     self.optimizer.zero_grad()
                 
                 with autocast(enabled=self.scaler is not None):
-                    # Predict next volumes
+                    # Predict next volumes (L1 loss)
                     output_seq = self.model(input_seq, get_logits=True)
-                    loss = self.get_loss_function()(output_seq, target_seq)
+                    loss_fn = self.get_loss_function()
+                    l1_loss = loss_fn(output_seq, target_seq)
+                    
+                    if use_two_step_rollout:
+                        # Two-step rollout loss implementation
+                        # Get current alpha weight for curriculum learning
+                        alpha = self.get_two_step_alpha(global_step, total_steps)
+                        
+                        # Detach the first step predictions to stop gradients
+                        first_step_pred = torch.sigmoid(output_seq.detach())
+                        
+                        # Create input for second step: concatenate true input sequence with detached prediction
+                        # input_seq: (B, T-2, X, Y, Z), first_step_pred: (B, T-2, X, Y, Z)
+                        # We need to take the last timestep from first_step_pred and use it as the next input
+                        B, T_minus_2, X, Y, Z = input_seq.shape
+                        
+                        # Create second step input by taking original input[1:] and appending detached prediction[-1:]
+                        second_step_input = torch.cat([
+                            input_seq[:, 1:, :, :, :],  # (B, T-3, X, Y, Z) - shift input by 1
+                            first_step_pred[:, -1:, :, :, :]  # (B, 1, X, Y, Z) - last prediction as input
+                        ], dim=1)  # (B, T-2, X, Y, Z)
+                        
+                        # Forward pass for second step
+                        second_step_output = self.model(second_step_input, get_logits=True)
+                        l2_loss = loss_fn(second_step_output, second_step_target)
+                        
+                        # Combined loss: L = L1 + α * L2
+                        loss = l1_loss + alpha * l2_loss
+                        
+                        # Log alpha value periodically
+                        if batch_idx % self.config['logging']['log_frequency'] == 0:
+                            self.logger.debug(f"Two-step rollout: α={alpha:.3f}, L1={l1_loss.item():.6f}, L2={l2_loss.item():.6f}")
+                    else:
+                        # Standard single-step loss
+                        loss = l1_loss
                     
                     # Scale loss by accumulation steps for proper averaging
                     if use_grad_accum:
@@ -1125,7 +1466,7 @@ class GBMTrainer:
                 
                 # Run validation at specified frequency
                 if (batch_idx + 1) % validation_interval == 0 or batch_idx == total_batches - 1:
-                    self.run_validation(epoch, batch_idx + 1)
+                    self.run_validation(epoch, batch_idx + 1, global_step, total_steps)
                 # Free GPU tensors for this batch
                 del sequences, input_seq, target_seq, output_seq, loss
 
@@ -1133,9 +1474,8 @@ class GBMTrainer:
             if self.scheduler and self.config['training']['scheduler'] not in ['linear_warmup', 'warmup_cosine', 'warmup_lineardecay']:
                 self.scheduler.step()
         
-            # Save checkpoint at end of epoch
-            if epoch % self.config['logging']['save_checkpoint_frequency'] == 0:
-                self.save_checkpoint(epoch, global_step)
+            # Save checkpoint at end of every epoch
+            self.save_checkpoint(epoch, global_step)
         
         self.logger.info("GBM training completed!")
         

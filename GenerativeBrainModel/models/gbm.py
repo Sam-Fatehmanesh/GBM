@@ -103,6 +103,8 @@ class GBM(nn.Module):
 
         self.final_spatial_mixer = SpatialModel(d_model, n_heads, self.n_regions)
 
+        self.first_norm = RMSNorm(d_model)
+
         # initialize the autoencoder which has frozen weights
         self.autoencoder = ConvNormEncoder(
             hidden_channels=d_model,
@@ -152,9 +154,13 @@ class GBM(nn.Module):
 
 
         # Encode the regions
+        jump_res = x
         x = self.autoencoder.encode(x, apply_norm=False) # (B, T, hidden_channels, n_blocks_x, n_blocks_y, n_blocks_z)
         # Move hidden_channels to the end, then flatten spatial dims to n_regions
         x = x.permute(0, 1, 3, 4, 5, 2).reshape(B, T, self.n_regions, self.d_model) # (B, T, n_regions, d_model)
+
+        x = self.first_norm(x)
+
 
         for i, layer in enumerate(self.layers):
             x = layer(x, apply_last_norm = True)# i != len(self.layers) - 1) # (B, T, n_regions, d_model)
@@ -163,16 +169,22 @@ class GBM(nn.Module):
 
         # Reshape n_regions back to (n_blocks_x, n_blocks_y, n_blocks_z, d_model)
         x = x.view(B, T, self.n_blocks_x, self.n_blocks_y, self.n_blocks_z, self.d_model)  # (B, T, n_blocks_x, n_blocks_y, n_blocks_z, d_model)
+
         # Move d_model to channel position for decoder: (B, T, d_model, n_blocks_x, n_blocks_y, n_blocks_z)
         x = x.permute(0, 1, 5, 2, 3, 4)
 
         # Decode the regions
-        x = self.autoencoder.decode(x, get_logits=get_logits, apply_norm=True)
+        x = self.autoencoder.decode(x, get_logits=True, apply_norm=True)
 
         # Reshape back to original volume shape: (B, T, X, Y, Z)
         x = x.reshape(B, T, vol_x, vol_y, vol_z)
 
-        return x
+        x = x + torch.logit(jump_res, eps=1e-7)
+
+        if get_logits:
+            return x
+
+        return torch.sigmoid(x)
 
     def autoregress(self, init_x, n_steps, context_len=12):
         # init_x: (B, T, X, Y, Z)
@@ -191,7 +203,7 @@ class GBM(nn.Module):
             # get the context from the current sequence
             context = current_sequence[:, -context_len:]
             # generate the next step
-            next_step = self.forward(context)[:, -1:]  # (B, 1, X, Y, Z)
+            next_step = self.forward(context, get_logits=False)[:, -1:]  # (B, 1, X, Y, Z)
             # append the next step to the current sequence
             current_sequence = torch.cat([current_sequence, next_step], dim=1)
 

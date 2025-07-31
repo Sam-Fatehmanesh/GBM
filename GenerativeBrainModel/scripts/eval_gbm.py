@@ -34,6 +34,7 @@ import seaborn as sns
 import pandas as pd
 from collections import defaultdict
 from mpl_toolkits.mplot3d import Axes3D
+import cv2
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -562,10 +563,21 @@ class GBMEvaluator:
         if not test_files:
             raise ValueError("No valid test subject files found")
         
+        # Determine sequence length for evaluation
+        sequence_length = data_config['sequence_length']
+        enable_autoregression = self.config['evaluation_params'].get('enable_autoregression', False)
+        
+        if enable_autoregression:
+            # Request sequences of double length for autoregression
+            eval_sequence_length = 2 * sequence_length
+            self.logger.info(f"Autoregression enabled: requesting sequences of length {eval_sequence_length}")
+        else:
+            eval_sequence_length = sequence_length
+        
         # Create dataset
         test_dataset = VolumeDataset(
             data_files=test_files,
-            sequence_length=data_config['sequence_length'],
+            sequence_length=eval_sequence_length,
             stride=data_config['stride'],
             max_timepoints_per_subject=data_config.get('max_timepoints_per_subject'),
             use_cache=False  # Don't cache for evaluation to save memory
@@ -604,6 +616,228 @@ class GBMEvaluator:
         target_seq = sequences[:, 1:, :, :, :]   # (B, T-1, X, Y, Z)
         
         return input_seq, target_seq
+    
+    def prepare_autoregression_data(self, sequences: torch.Tensor, sequence_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Prepare data for autoregression evaluation.
+        
+        Args:
+            sequences: Tensor of shape (B, T, X, Y, Z) where T = 2 * sequence_length
+            sequence_length: Length of sequence to use for both context and generation
+            
+        Returns:
+            Tuple of (init_x, target_seq) where:
+            - init_x: First half of sequence (B, sequence_length, X, Y, Z)
+            - target_seq: Second half of sequence (B, sequence_length, X, Y, Z)
+        """
+        B, T, X, Y, Z = sequences.shape
+        
+        if T != 2 * sequence_length:
+            raise ValueError(f"Sequence length must be exactly 2 * sequence_length ({2 * sequence_length}) for autoregression evaluation, got {T}")
+        
+        # First half as initial context
+        init_x = sequences[:, :sequence_length, :, :, :]  # (B, sequence_length, X, Y, Z)
+        
+        # Second half as target  
+        target_seq = sequences[:, sequence_length:, :, :, :]   # (B, sequence_length, X, Y, Z)
+        
+        return init_x, target_seq
+    
+    def tensor_to_uint8(self, tensor: torch.Tensor, clip_percentile: float = 99.5) -> np.ndarray:
+        """
+        Convert tensor to uint8 numpy array for video encoding.
+        
+        Args:
+            tensor: Input tensor with values typically in [0, 1] range
+            clip_percentile: Percentile for clipping outliers
+            
+        Returns:
+            Numpy array with values in [0, 255] range
+        """
+        # Move to CPU and convert to numpy
+        if tensor.is_cuda:
+            tensor = tensor.cpu()
+        array = tensor.numpy()
+        
+        # Clip outliers for better visualization
+        lower_bound = np.percentile(array, 100 - clip_percentile)
+        upper_bound = np.percentile(array, clip_percentile)
+        array = np.clip(array, lower_bound, upper_bound)
+        
+        # Normalize to [0, 1] range
+        if upper_bound > lower_bound:
+            array = (array - lower_bound) / (upper_bound - lower_bound)
+        else:
+            array = np.zeros_like(array)
+        
+        # Convert to uint8 [0, 255]
+        return (array * 255).astype(np.uint8)
+    
+    def create_side_by_side_frame(self, original: np.ndarray, predicted: np.ndarray, 
+                                 frame_idx: int, mode: str = "autoregression") -> np.ndarray:
+        """
+        Create a side-by-side comparison frame.
+        
+        Args:
+            original: Original 2D slice (H, W) as uint8
+            predicted: Predicted 2D slice (H, W) as uint8
+            frame_idx: Frame index for labeling
+            mode: Evaluation mode ("forward" or "autoregression")
+            
+        Returns:
+            Side-by-side frame (H, W*2) as uint8, converted to BGR for OpenCV
+        """
+        H, W = original.shape
+        
+        # Create side-by-side frame
+        frame = np.zeros((H, W * 2), dtype=np.uint8)
+        frame[:, :W] = original
+        frame[:, W:] = predicted
+        
+        # Convert grayscale to BGR for OpenCV
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        
+        # Add text labels
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.4
+        color = (255, 255, 255)  # White text
+        thickness = 1
+        
+        # Add "Original" label
+        cv2.putText(frame_bgr, "True", (10, 30), font, font_scale, color, thickness)
+        
+        # Add "Predicted" label
+        pred_label = f"{mode.title()} Pred"
+        cv2.putText(frame_bgr, pred_label, (W + 10, 30), font, font_scale, color, thickness)
+        
+        # Add frame index
+        cv2.putText(frame_bgr, f"Timepoint {frame_idx}", (10, H - 10), font, font_scale, color, thickness)
+        
+        return frame_bgr
+    
+    def generate_autoregression_video(self, original_volumes: torch.Tensor, 
+                                    predicted_volumes: torch.Tensor,
+                                    video_name: str = "autoregression_comparison.mp4",
+                                    fps: int = 2) -> Path:
+        """
+        Generate a comparison video from autoregression results.
+        
+        Args:
+            original_volumes: True second half volumes tensor (B, T, X, Y, Z)
+            predicted_volumes: Autoregressed volumes tensor (B, T, X, Y, Z) 
+            video_name: Name of the output video file
+            fps: Frames per second for the output video
+            
+        Returns:
+            Path to the saved video file
+        """
+        self.logger.info(f"Generating autoregression comparison video: {video_name}")
+        
+        # Ensure tensors are on CPU
+        if original_volumes.is_cuda:
+            original_volumes = original_volumes.cpu()
+        if predicted_volumes.is_cuda:
+            predicted_volumes = predicted_volumes.cpu()
+            
+        # Get dimensions
+        B, T, X, Y, Z = original_volumes.shape
+        middle_z = Z // 2  # Middle z slice
+        
+        self.logger.info(f"Processing {B * T} frames from volumes of shape {original_volumes.shape}")
+        self.logger.info(f"Using middle z slice: {middle_z} (out of {Z})")
+        
+        # Setup video writer
+        video_path = self.current_plots_dir / video_name
+        frame_height, frame_width = Y, X * 2  # Side-by-side doubles the width
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(
+            str(video_path), 
+            fourcc, 
+            fps, 
+            (frame_width, frame_height)
+        )
+        
+        if not video_writer.isOpened():
+            raise RuntimeError(f"Failed to open video writer for {video_path}")
+        
+        frame_count = 0
+        
+        try:
+            # Process each volume
+            for b in tqdm(range(B), desc="Processing autoregression video frames"):
+                for t in range(T):
+                    # Extract middle z slice: (X, Y, Z) -> (Y, X) for display
+                    orig_slice = original_volumes[b, t, :, :, middle_z].transpose(0, 1)  # (Y, X)
+                    pred_slice = predicted_volumes[b, t, :, :, middle_z].transpose(0, 1)  # (Y, X)
+                    
+                    # Convert to uint8
+                    orig_uint8 = self.tensor_to_uint8(orig_slice)
+                    pred_uint8 = self.tensor_to_uint8(pred_slice)
+                    
+                    # Create side-by-side frame
+                    frame = self.create_side_by_side_frame(orig_uint8, pred_uint8, t, "autoregression")
+                    
+                    # Write frame to video
+                    video_writer.write(frame)
+                    frame_count += 1
+                    
+        finally:
+            video_writer.release()
+        
+        self.logger.info(f"Autoregression video saved: {video_path} ({frame_count} frames)")
+        return video_path
+    
+    def process_batch_metrics(self, pred_logits: torch.Tensor, target_seq: torch.Tensor, 
+                            mode: str, batch_idx: int):
+        """
+        Process metrics for a batch in either 'forward' or 'autoregression' mode.
+        
+        Args:
+            pred_logits: Model predictions
+            target_seq: Ground truth targets
+            mode: Either 'forward' or 'autoregression'
+            batch_idx: Current batch index
+        """
+        # Compute metrics for whole volume (averaged over batch)
+        whole_volume_metrics = self.compute_volume_metrics(pred_logits, target_seq)
+        self.results[mode]['whole_volume'].append(whole_volume_metrics)
+        
+        # Compute timepoint-specific metrics for whole volume
+        if self.config['metrics']['compute_per_timepoint']:
+            timepoint_metrics = self.compute_timepoint_metrics(pred_logits, target_seq)
+            
+            # Store metrics per timepoint index, averaging over batch dimension
+            for t_idx, t_metrics_dict in enumerate(timepoint_metrics):
+                # t_metrics_dict is a dictionary like {'bce_loss': 0.1, 'f1_score': 0.8, ...}
+                for metric_name, metric_value in t_metrics_dict.items():
+                    if metric_name not in self.results[mode]['timepoint_metrics']['whole_volume']:
+                        self.results[mode]['timepoint_metrics']['whole_volume'][metric_name] = defaultdict(list)
+                    self.results[mode]['timepoint_metrics']['whole_volume'][metric_name][t_idx].append(metric_value)
+        
+        # Compute metrics for each brain region
+        for region_name in self.region_names:
+            try:
+                mask = self.mask_loader.get_mask(region_name)
+                
+                # Region metrics (averaged over time and batch)
+                region_metrics = self.compute_volume_metrics(pred_logits, target_seq, mask)
+                self.results[mode]['regions'][region_name].append(region_metrics)
+                
+                # Timepoint-specific region metrics
+                if self.config['metrics']['compute_per_timepoint']:
+                    region_timepoint_metrics = self.compute_timepoint_metrics(
+                        pred_logits, target_seq, mask
+                    )
+                    # Store metrics per timepoint index, averaging over batch dimension
+                    for t_idx, t_metrics_dict in enumerate(region_timepoint_metrics):
+                        for metric_name, metric_value in t_metrics_dict.items():
+                            if metric_name not in self.results[mode]['timepoint_metrics']['regions'][region_name]:
+                                self.results[mode]['timepoint_metrics']['regions'][region_name][metric_name] = defaultdict(list)
+                            self.results[mode]['timepoint_metrics']['regions'][region_name][metric_name][t_idx].append(metric_value)
+            
+            except Exception as e:
+                self.logger.warning(f"Error computing metrics for region {region_name} in {mode} mode: {e}")
     
     def compute_volume_metrics(self, predictions: torch.Tensor, targets: torch.Tensor, 
                              mask: Optional[torch.Tensor] = None) -> Dict[str, float]:
@@ -850,13 +1084,23 @@ class GBMEvaluator:
         self.load_masks()
         self.create_test_dataloader()
         
-        # Initialize results storage
+        # Initialize results storage for both forward and autoregression modes
         self.results = {
-            'whole_volume': [],
-            'regions': {region: [] for region in self.region_names},
-            'timepoint_metrics': {
-                'whole_volume': {},  # metric_name -> {timepoint_idx -> [list of values across batches]}
-                'regions': {region: {} for region in self.region_names}  # region -> metric_name -> {timepoint_idx -> [list of values]}
+            'forward': {
+                'whole_volume': [],
+                'regions': {region: [] for region in self.region_names},
+                'timepoint_metrics': {
+                    'whole_volume': {},  # metric_name -> {timepoint_idx -> [list of values across batches]}
+                    'regions': {region: {} for region in self.region_names}  # region -> metric_name -> {timepoint_idx -> [list of values]}
+                }
+            },
+            'autoregression': {
+                'whole_volume': [],
+                'regions': {region: [] for region in self.region_names},
+                'timepoint_metrics': {
+                    'whole_volume': {},  # metric_name -> {timepoint_idx -> [list of values across batches]}
+                    'regions': {region: {} for region in self.region_names}  # region -> metric_name -> {timepoint_idx -> [list of values]}
+                }
             }
         }
         
@@ -870,6 +1114,13 @@ class GBMEvaluator:
         
         # Flag to create debug visualizations after first forward pass
         debug_visualizations_created = False
+        
+        # Storage for video generation (collect first few batches)
+        autoregression_video_data = {
+            'original_volumes': [],
+            'predicted_volumes': []
+        }
+        max_video_batches = 3  # Limit to first 3 batches for video generation
         
         with torch.no_grad():
             pbar = tqdm(enumerate(self.test_loader), total=total_batches, desc="Evaluating")
@@ -885,119 +1136,191 @@ class GBMEvaluator:
                     sequences = batch_data
                 
                 sequences = sequences.to(self.device)
+                B, T = sequences.shape[:2]
+                sequence_length = self.config['data']['sequence_length']
                 
-                # Prepare seq2seq data
-                input_seq, target_seq = self.prepare_seq2seq_data(sequences)
+                # Check if we have enough timesteps for autoregression (need 2 * sequence_length)
+                enable_autoregression = (
+                    self.config['evaluation_params'].get('enable_autoregression', False) and 
+                    T >= 2 * sequence_length
+                )
                 
-                # Model forward pass
-                pred_logits = self.model(input_seq, get_logits=True)
-                
-                # Create debug visualizations after first forward pass
-                if not debug_visualizations_created:
-                    debug_visualizations_created = True
+                # === FORWARD PASS EVALUATION ===
+                if T >= 2:  # Need at least 2 timesteps for seq2seq
+                    # Prepare seq2seq data (use first part if T > sequence_length + 1)
+                    if T > sequence_length + 1:
+                        # Truncate to sequence_length + 1 for forward evaluation
+                        forward_sequences = sequences[:, :sequence_length + 1]
+                        input_seq, target_seq = self.prepare_seq2seq_data(forward_sequences)
+                    else:
+                        input_seq, target_seq = self.prepare_seq2seq_data(sequences)
                     
-                    # Create time-averaged volume from target data
-                    time_averaged_volume = target_seq.mean(dim=(0, 1))  # Average over batch and time: (X, Y, Z)
+                    # Model forward pass
+                    pred_logits = self.model(input_seq, get_logits=True)
                     
-                    # Get whole_brain mask if available
-                    try:
-                        whole_brain_mask = self.mask_loader.get_mask('whole_brain')
-                        self.create_3d_debug_visualizations(
-                            time_averaged_volume, 
-                            whole_brain_mask,
-                            "Time-Averaged Volume (from targets)", 
-                            "Whole Brain Mask"
-                        )
-                    except KeyError:
-                        self.logger.warning("whole_brain mask not found, skipping debug visualization")
-                        # Try with any available mask for debugging
-                        if self.region_names:
-                            first_mask = self.mask_loader.get_mask(self.region_names[0])
+                    # Create debug visualizations after first forward pass
+                    if not debug_visualizations_created:
+                        debug_visualizations_created = True
+                        
+                        # Create time-averaged volume from target data
+                        time_averaged_volume = target_seq.mean(dim=(0, 1))  # Average over batch and time: (X, Y, Z)
+                        
+                        # Get whole_brain mask if available
+                        try:
+                            whole_brain_mask = self.mask_loader.get_mask('whole_brain')
                             self.create_3d_debug_visualizations(
-                                time_averaged_volume,
-                                first_mask, 
-                                "Time-Averaged Volume (from targets)",
-                                f"First Available Mask ({self.region_names[0]})"
+                                time_averaged_volume, 
+                                whole_brain_mask,
+                                "Time-Averaged Volume (from targets)", 
+                                "Whole Brain Mask"
                             )
-                    except Exception as e:
-                        self.logger.warning(f"Could not create debug visualizations: {e}")
-                
-                # Compute metrics for whole volume (averaged over batch)
-                whole_volume_metrics = self.compute_volume_metrics(pred_logits, target_seq)
-                self.results['whole_volume'].append(whole_volume_metrics)
-                
-                # Compute timepoint-specific metrics for whole volume
-                if self.config['metrics']['compute_per_timepoint']:
-                    timepoint_metrics = self.compute_timepoint_metrics(pred_logits, target_seq)
-                    # Store metrics per timepoint index, averaging over batch dimension
-                    for t_idx, t_metrics_dict in enumerate(timepoint_metrics):
-                        # t_metrics_dict is a dictionary like {'bce_loss': 0.1, 'f1_score': 0.8, ...}
-                        for metric_name, metric_value in t_metrics_dict.items():
-                            if metric_name not in self.results['timepoint_metrics']['whole_volume']:
-                                self.results['timepoint_metrics']['whole_volume'][metric_name] = defaultdict(list)
-                            self.results['timepoint_metrics']['whole_volume'][metric_name][t_idx].append(metric_value)
-                
-                # Compute metrics for each brain region
-                for region_name in self.region_names:
-                    try:
-                        mask = self.mask_loader.get_mask(region_name)
-                        
-                        # Region metrics (averaged over time and batch)
-                        region_metrics = self.compute_volume_metrics(pred_logits, target_seq, mask)
-                        self.results['regions'][region_name].append(region_metrics)
-                        
-                        # Timepoint-specific region metrics
-                        if self.config['metrics']['compute_per_timepoint']:
-                            region_timepoint_metrics = self.compute_timepoint_metrics(
-                                pred_logits, target_seq, mask
-                            )
-                            # Store metrics per timepoint index, averaging over batch dimension
-                            for t_idx, t_metrics_dict in enumerate(region_timepoint_metrics):
-                                for metric_name, metric_value in t_metrics_dict.items():
-                                    if metric_name not in self.results['timepoint_metrics']['regions'][region_name]:
-                                        self.results['timepoint_metrics']['regions'][region_name][metric_name] = defaultdict(list)
-                                    self.results['timepoint_metrics']['regions'][region_name][metric_name][t_idx].append(metric_value)
+                        except KeyError:
+                            self.logger.warning("whole_brain mask not found, skipping debug visualization")
+                            # Try with any available mask for debugging
+                            if self.region_names:
+                                first_mask = self.mask_loader.get_mask(self.region_names[0])
+                                self.create_3d_debug_visualizations(
+                                    time_averaged_volume,
+                                    first_mask, 
+                                    "Time-Averaged Volume (from targets)",
+                                    f"First Available Mask ({self.region_names[0]})"
+                                )
+                        except Exception as e:
+                            self.logger.warning(f"Could not create debug visualizations: {e}")
                     
-                    except Exception as e:
-                        self.logger.warning(f"Error computing metrics for region {region_name}: {e}")
+                    # Process forward pass metrics
+                    self.process_batch_metrics(pred_logits, target_seq, 'forward', batch_idx)
+                    
+                    # Clean up forward pass tensors
+                    del input_seq, target_seq, pred_logits
+                
+                # === AUTOREGRESSION EVALUATION ===
+                if enable_autoregression:
+                    # Prepare autoregression data
+                    init_x, autoregress_target = self.prepare_autoregression_data(sequences, sequence_length)
+                    
+                    # Autoregressive generation
+                    autoregress_output = self.model.autoregress(
+                        init_x, 
+                        n_steps=sequence_length, 
+                        context_len=sequence_length
+                    )
+                    
+                    # Extract generated part (remove the initial context)
+                    autoregress_pred = autoregress_output[:, sequence_length:, :, :, :]  # (B, sequence_length, X, Y, Z)
+                    
+                    # Store data for video generation (first few batches only)
+                    if batch_idx < max_video_batches:
+                        autoregression_video_data['original_volumes'].append(autoregress_target.cpu())
+                        autoregression_video_data['predicted_volumes'].append(autoregress_pred.cpu())
+                    
+                    # Process autoregression metrics
+                    self.process_batch_metrics(autoregress_pred, autoregress_target, 'autoregression', batch_idx)
+                    
+                    # Clean up autoregression tensors
+                    del init_x, autoregress_target, autoregress_output, autoregress_pred
                 
                 # Update progress bar
-                if self.results['whole_volume']:
-                    latest_loss = self.results['whole_volume'][-1].get('bce_loss', 0)
-                    pbar.set_postfix({'BCE Loss': f'{latest_loss:.4f}'})
+                forward_loss = None
+                autoregress_loss = None
+                
+                if self.results['forward']['whole_volume']:
+                    forward_loss = self.results['forward']['whole_volume'][-1].get('bce_loss', 0)
+                if enable_autoregression and self.results['autoregression']['whole_volume']:
+                    autoregress_loss = self.results['autoregression']['whole_volume'][-1].get('bce_loss', 0)
+                
+                postfix = {}
+                if forward_loss is not None:
+                    postfix['Forward BCE'] = f'{forward_loss:.4f}'
+                if autoregress_loss is not None:
+                    postfix['Autoregress BCE'] = f'{autoregress_loss:.4f}'
+                
+                if postfix:
+                    pbar.set_postfix(postfix)
                 
                 # Clean up GPU memory
-                del sequences, input_seq, target_seq, pred_logits
+                del sequences
                 torch.cuda.empty_cache()
         
         self.logger.info("Evaluation completed!")
         
-        # Generate results and visualizations
-        self.compute_summary_statistics()
-        if self.config['visualization']['create_heatmaps']:
-            self.create_heatmaps()
-        if self.config['output']['save_summary_csv']:
-            self.save_results_to_csv()
-        if self.config['output']['create_report']:
-            self.create_evaluation_report()
+        # Generate autoregression comparison video if enabled and we have data
+        if (self.config['visualization'].get('create_autoregression_video', False) and
+            autoregression_video_data['original_volumes'] and 
+            autoregression_video_data['predicted_volumes']):
+            
+            self.logger.info("Generating autoregression comparison video...")
+            
+            # Concatenate all collected batches
+            original_volumes = torch.cat(autoregression_video_data['original_volumes'], dim=0)
+            predicted_volumes = torch.cat(autoregression_video_data['predicted_volumes'], dim=0)
+            
+            # Create videos directory if it doesn't exist
+            videos_dir = self.output_dir / "videos" 
+            videos_dir.mkdir(exist_ok=True)
+            
+            # Temporarily set current_plots_dir to videos directory for video generation
+            original_plots_dir = self.current_plots_dir if hasattr(self, 'current_plots_dir') else None
+            self.current_plots_dir = videos_dir
+            
+            try:
+                video_path = self.generate_autoregression_video(
+                    original_volumes=original_volumes,
+                    predicted_volumes=predicted_volumes,
+                    video_name="autoregression_comparison.mp4",
+                    fps=2
+                )
+                self.logger.info(f"Autoregression video saved: {video_path}")
+            except Exception as e:
+                self.logger.error(f"Failed to generate autoregression video: {e}")
+            finally:
+                # Restore original plots directory
+                if original_plots_dir is not None:
+                    self.current_plots_dir = original_plots_dir
+        
+        # Generate results and visualizations for each mode
+        for mode in ['forward', 'autoregression']:
+            if self.results[mode]['whole_volume']:  # Only process if we have results for this mode
+                self.logger.info(f"Processing results for {mode} mode...")
+                
+                # Create mode-specific output directories
+                mode_plots_dir = self.plots_dir / mode
+                mode_plots_dir.mkdir(exist_ok=True)
+                
+                # Update current mode for processing methods
+                self.current_mode = mode
+                self.current_plots_dir = mode_plots_dir
+                
+                self.compute_summary_statistics()
+                if self.config['visualization']['create_heatmaps']:
+                    self.create_heatmaps()
+                if self.config['metrics']['compute_time_averaged']:
+                    self.create_time_averaged_visualizations()
+                if self.config['output']['save_summary_csv']:
+                    self.save_results_to_csv()
+                if self.config['output']['create_report']:
+                    self.create_evaluation_report()
     
     def compute_summary_statistics(self):
-        """Compute summary statistics from evaluation results."""
-        self.logger.info("Computing summary statistics...")
+        """Compute summary statistics from evaluation results for current mode."""
+        self.logger.info(f"Computing summary statistics for {self.current_mode} mode...")
         
-        self.summary_stats = {}
+        # Initialize mode-specific summary stats
+        if not hasattr(self, 'summary_stats'):
+            self.summary_stats = {}
+        self.summary_stats[self.current_mode] = {}
         
         # Whole volume statistics
-        if self.results['whole_volume']:
-            whole_vol_data = self.results['whole_volume']
-            self.summary_stats['whole_volume'] = self._compute_stats_for_data(whole_vol_data)
+        if self.results[self.current_mode]['whole_volume']:
+            whole_vol_data = self.results[self.current_mode]['whole_volume']
+            self.summary_stats[self.current_mode]['whole_volume'] = self._compute_stats_for_data(whole_vol_data)
         
         # Region statistics  
-        self.summary_stats['regions'] = {}
+        self.summary_stats[self.current_mode]['regions'] = {}
         for region_name in self.region_names:
-            if self.results['regions'][region_name]:
-                region_data = self.results['regions'][region_name]
-                self.summary_stats['regions'][region_name] = self._compute_stats_for_data(region_data)
+            if self.results[self.current_mode]['regions'][region_name]:
+                region_data = self.results[self.current_mode]['regions'][region_name]
+                self.summary_stats[self.current_mode]['regions'][region_name] = self._compute_stats_for_data(region_data)
     
     def _compute_stats_for_data(self, data_list: List[Dict[str, float]]) -> Dict[str, Dict[str, float]]:
         """Compute statistics (mean, std, min, max) for a list of metric dictionaries."""
@@ -1029,9 +1352,35 @@ class GBMEvaluator:
         
         return stats
     
+    def _compute_time_averaged_statistics(self) -> Dict[str, Dict[str, float]]:
+        """Compute time-averaged statistics (averaged over both time and batch dimensions) for current mode."""
+        time_avg_stats = {'whole_volume': {}, 'regions': {}}
+        
+        # Whole volume time-averaged metrics
+        if self.results[self.current_mode]['timepoint_metrics']['whole_volume']:
+            for metric_name, timepoint_data in self.results[self.current_mode]['timepoint_metrics']['whole_volume'].items():
+                all_values = []
+                for timepoint_values in timepoint_data.values():
+                    all_values.extend(timepoint_values)
+                if all_values:
+                    time_avg_stats['whole_volume'][metric_name] = np.mean(all_values)
+        
+        # Region time-averaged metrics
+        for region in self.region_names:
+            if self.results[self.current_mode]['timepoint_metrics']['regions'][region]:
+                time_avg_stats['regions'][region] = {}
+                for metric_name, timepoint_data in self.results[self.current_mode]['timepoint_metrics']['regions'][region].items():
+                    all_values = []
+                    for timepoint_values in timepoint_data.values():
+                        all_values.extend(timepoint_values)
+                    if all_values:
+                        time_avg_stats['regions'][region][metric_name] = np.mean(all_values)
+        
+        return time_avg_stats
+    
     def create_heatmaps(self):
-        """Create time-series heatmaps for metrics visualization."""
-        self.logger.info("Creating heatmaps...")
+        """Create time-series heatmaps for metrics visualization for current mode."""
+        self.logger.info(f"Creating heatmaps for {self.current_mode} mode...")
         
         if not self.config['metrics']['compute_per_timepoint']:
             self.logger.warning("Per-timepoint metrics not computed - skipping heatmaps")
@@ -1058,26 +1407,123 @@ class GBMEvaluator:
             except Exception as e:
                 self.logger.warning(f"Failed to create heatmap for {metric_name}: {e}")
     
+    def create_time_averaged_visualizations(self):
+        """Create visualizations for time-averaged metrics (averaged over both time and batch) for current mode."""
+        self.logger.info(f"Creating time-averaged metric visualizations for {self.current_mode} mode...")
+        
+        if not self.config['metrics']['compute_per_timepoint']:
+            self.logger.warning("Per-timepoint metrics not computed - skipping time-averaged visualizations")
+            return
+        
+        viz_config = self.config['visualization']
+        figsize = tuple(viz_config['heatmap_figsize'])
+        
+        metrics_to_plot = []
+        if self.config['metrics']['compute_bce_loss']:
+            metrics_to_plot.append('bce_loss')
+        if self.config['metrics']['compute_magnitude_error']:
+            metrics_to_plot.append('magnitude_error')
+        if self.config['metrics']['compute_f1_scores']:
+            metrics_to_plot.append('f1_score')
+        
+        for metric_name in metrics_to_plot:
+            try:
+                self._create_time_averaged_bar_plot(metric_name, figsize)
+            except Exception as e:
+                self.logger.warning(f"Failed to create time-averaged plot for {metric_name}: {e}")
+    
+    def _create_time_averaged_bar_plot(self, metric_name: str, figsize: Tuple[int, int]):
+        """Create a bar plot showing time-averaged metrics for each region."""
+        # Collect time-averaged data for each region
+        region_data = []
+        region_names = []
+        
+        # Whole volume time-averaged metric
+        if metric_name in self.results[self.current_mode]['timepoint_metrics']['whole_volume']:
+            whole_vol_metric_data = self.results[self.current_mode]['timepoint_metrics']['whole_volume'][metric_name]
+            all_values = []
+            for timepoint_values in whole_vol_metric_data.values():
+                all_values.extend(timepoint_values)
+            if all_values:
+                region_data.append(np.mean(all_values))
+                region_names.append('Whole Volume')
+        
+        # Region time-averaged metrics
+        for region in self.region_names:
+            if metric_name in self.results[self.current_mode]['timepoint_metrics']['regions'][region]:
+                region_metric_data = self.results[self.current_mode]['timepoint_metrics']['regions'][region][metric_name]
+                all_values = []
+                for timepoint_values in region_metric_data.values():
+                    all_values.extend(timepoint_values)
+                if all_values:
+                    region_data.append(np.mean(all_values))
+                    region_names.append(region)
+        
+        if not region_data:
+            self.logger.warning(f"No data available for time-averaged {metric_name} plot")
+            return
+        
+        # Create bar plot
+        plt.figure(figsize=figsize)
+        
+        # Sort by metric value for better visualization
+        sorted_data = sorted(zip(region_names, region_data), key=lambda x: x[1], reverse=(metric_name == 'f1_score'))
+        sorted_names, sorted_values = zip(*sorted_data)
+        
+        # Use appropriate colors based on metric
+        if metric_name == 'bce_loss':
+            colors = plt.cm.Reds(np.linspace(0.3, 0.9, len(sorted_values)))
+        elif metric_name == 'magnitude_error':
+            colors = plt.cm.RdBu_r(np.linspace(0.1, 0.9, len(sorted_values)))
+        elif metric_name == 'f1_score':
+            colors = plt.cm.Greens(np.linspace(0.3, 0.9, len(sorted_values)))
+        else:
+            colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(sorted_values)))
+        
+        bars = plt.barh(range(len(sorted_names)), sorted_values, color=colors)
+        plt.yticks(range(len(sorted_names)), sorted_names)
+        plt.xlabel(metric_name.replace('_', ' ').title())
+        plt.title(f'Time-Averaged {metric_name.replace("_", " ").title()} by Brain Region')
+        
+        # Add value labels on bars
+        for i, (bar, value) in enumerate(zip(bars, sorted_values)):
+            plt.text(value + max(sorted_values) * 0.01, i, f'{value:.3f}', 
+                    va='center', ha='left', fontsize=8)
+        
+        plt.tight_layout()
+        
+        # Save plot
+        if self.config['visualization']['save_plots']:
+            plot_path = self.current_plots_dir / f'{metric_name}_time_averaged_bar.png'
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            self.logger.info(f"Saved time-averaged bar plot: {plot_path}")
+        
+        # Show plot if requested
+        if self.config['visualization']['show_plots']:
+            plt.show()
+        else:
+            plt.close()
+    
     def _create_metric_heatmap(self, metric_name: str, region_names: List[str], figsize: Tuple[int, int]):
         """Create a heatmap for a specific metric."""
         # Collect timepoint data for each region
         heatmap_data = []
         row_labels = ['Whole Volume'] + region_names
         
-        # Check if metric data exists
-        if metric_name not in self.results['timepoint_metrics']['whole_volume']:
-            self.logger.warning(f"No {metric_name} data available for heatmap")
+        # Check if metric data exists for current mode
+        if metric_name not in self.results[self.current_mode]['timepoint_metrics']['whole_volume']:
+            self.logger.warning(f"No {metric_name} data available for {self.current_mode} heatmap")
             return
         
         # Determine number of timepoints from the data
         max_timepoints = 0
-        whole_vol_metric_data = self.results['timepoint_metrics']['whole_volume'][metric_name]
+        whole_vol_metric_data = self.results[self.current_mode]['timepoint_metrics']['whole_volume'][metric_name]
         if whole_vol_metric_data:
             max_timepoints = max(max_timepoints, max(whole_vol_metric_data.keys()))
         
         for region in region_names:
-            if metric_name in self.results['timepoint_metrics']['regions'][region]:
-                region_metric_data = self.results['timepoint_metrics']['regions'][region][metric_name]
+            if metric_name in self.results[self.current_mode]['timepoint_metrics']['regions'][region]:
+                region_metric_data = self.results[self.current_mode]['timepoint_metrics']['regions'][region][metric_name]
                 if region_metric_data:
                     max_timepoints = max(max_timepoints, max(region_metric_data.keys()))
         
@@ -1086,6 +1532,17 @@ class GBMEvaluator:
             return
         
         num_timepoints = max_timepoints + 1  # 0-indexed
+        
+        # Debug logging
+        self.logger.info(f"Creating heatmap for {metric_name} with {num_timepoints} timepoints")
+        
+        # Debug: Check if timepoint data actually varies
+        if whole_vol_metric_data:
+            sample_values = []
+            for t in range(min(5, num_timepoints)):  # Check first 5 timepoints
+                if t in whole_vol_metric_data and whole_vol_metric_data[t]:
+                    sample_values.append(np.mean(whole_vol_metric_data[t]))
+            self.logger.info(f"Sample whole volume {metric_name} values for first timepoints: {sample_values}")
         
         # Whole volume data - average across batches for each timepoint
         whole_vol_values = []
@@ -1098,13 +1555,14 @@ class GBMEvaluator:
                     whole_vol_values.append(np.nan)
             else:
                 whole_vol_values.append(np.nan)
+        
         heatmap_data.append(whole_vol_values)
         
         # Region data - average across batches for each timepoint
         for region in region_names:
             region_values = []
-            if metric_name in self.results['timepoint_metrics']['regions'][region]:
-                region_metric_data = self.results['timepoint_metrics']['regions'][region][metric_name]
+            if metric_name in self.results[self.current_mode]['timepoint_metrics']['regions'][region]:
+                region_metric_data = self.results[self.current_mode]['timepoint_metrics']['regions'][region][metric_name]
                 for t in range(num_timepoints):
                     if t in region_metric_data:
                         metric_values = region_metric_data[t]  # List of values across batches
@@ -1122,41 +1580,80 @@ class GBMEvaluator:
         # Convert to numpy array
         heatmap_array = np.array(heatmap_data)
         
+        # Debug: Check heatmap array shape and sample values
+        self.logger.info(f"Heatmap array shape: {heatmap_array.shape}")
+        if heatmap_array.size > 0:
+            # Remove NaN values for min/max calculation
+            valid_data = heatmap_array[~np.isnan(heatmap_array)]
+            if len(valid_data) > 0:
+                self.logger.info(f"Heatmap array data range: min={valid_data.min():.6f}, max={valid_data.max():.6f}")
+                self.logger.info(f"Heatmap array std: {valid_data.std():.6f}")
+            
+            self.logger.info(f"Heatmap array sample (first row, first 5 cols): {heatmap_array[0, :5] if heatmap_array.shape[1] >= 5 else heatmap_array[0, :]}")
+            if heatmap_array.shape[0] > 1:
+                self.logger.info(f"Heatmap array sample (second row, first 5 cols): {heatmap_array[1, :5] if heatmap_array.shape[1] >= 5 else heatmap_array[1, :]}")
+        
+        # Create raw heatmap for all metrics
+        self._create_raw_heatmap(heatmap_array, row_labels, metric_name, figsize, num_timepoints)
+        
+        # Create normalized heatmap for magnitude_error and bce_loss to show time variation
+        if metric_name in ['magnitude_error', 'bce_loss']:
+            self._create_row_normalized_heatmap(heatmap_array, row_labels, metric_name, figsize, num_timepoints)
+    
+    def _create_raw_heatmap(self, heatmap_array, row_labels, metric_name, figsize, num_timepoints):
+        """Create the standard heatmap with absolute values."""
         # Create heatmap
         plt.figure(figsize=figsize)
         
         # Use appropriate colormap based on metric
         if metric_name == 'bce_loss':
             cmap = 'Reds'
-            vmin, vmax = None, None
+            # Use actual data range to show variation better
+            valid_data = heatmap_array[~np.isnan(heatmap_array)]
+            if len(valid_data) > 0:
+                vmin = np.min(valid_data)
+                vmax = np.max(valid_data)
+            else:
+                vmin, vmax = None, None
         elif metric_name == 'magnitude_error':
             cmap = 'RdBu_r'
             vmin, vmax = -1, 1  # Center around 0
         elif metric_name == 'f1_score':
             cmap = 'Greens'
-            vmin, vmax = 0, 1
+            # Use actual data range to show variation better
+            valid_data = heatmap_array[~np.isnan(heatmap_array)]
+            if len(valid_data) > 0:
+                vmin = np.min(valid_data)
+                vmax = np.max(valid_data)
+            else:
+                vmin, vmax = 0, 1
         else:
             cmap = 'viridis'
             vmin, vmax = None, None
         
+        # Create x-axis labels for timepoints
+        timepoint_labels = [f"T{i}" for i in range(num_timepoints)]
+        
         sns.heatmap(
             heatmap_array,
+            xticklabels=timepoint_labels,
             yticklabels=row_labels,
             cmap=cmap,
             cbar_kws={'label': metric_name.replace('_', ' ').title()},
             vmin=vmin,
             vmax=vmax,
+            annot=False,  # Don't annotate individual cells to avoid clutter
             fmt='.3f' if metric_name != 'f1_score' else '.2f'
         )
         
-        plt.title(f'{metric_name.replace("_", " ").title()} Across Time and Brain Regions')
+        plt.title(f'{metric_name.replace("_", " ").title()} Across Time and Brain Regions (Absolute Values)')
         plt.xlabel('Timepoint')
         plt.ylabel('Brain Region')
         plt.tight_layout()
         
         # Save plot
         if self.config['visualization']['save_plots']:
-            plot_path = self.plots_dir / f'{metric_name}_heatmap.png'
+            plot_path = self.current_plots_dir / f'{metric_name}_heatmap.png'
             plt.savefig(plot_path, dpi=300, bbox_inches='tight')
             self.logger.info(f"Saved heatmap: {plot_path}")
         
@@ -1166,32 +1663,90 @@ class GBMEvaluator:
         else:
             plt.close()
     
+    def _create_row_normalized_heatmap(self, heatmap_array, row_labels, metric_name, figsize, num_timepoints):
+        """Create a row-normalized heatmap to highlight timepoint variation within each region."""
+        # Normalize each row (region) to highlight temporal variation
+        normalized_array = np.zeros_like(heatmap_array)
+        
+        for i in range(heatmap_array.shape[0]):
+            row = heatmap_array[i, :]
+            valid_mask = ~np.isnan(row)
+            
+            if np.sum(valid_mask) > 1:  # Need at least 2 valid values
+                valid_values = row[valid_mask]
+                if np.std(valid_values) > 1e-8:  # Avoid division by zero
+                    # Z-score normalization: (x - mean) / std
+                    normalized_row = (row - np.mean(valid_values)) / np.std(valid_values)
+                    normalized_array[i, :] = normalized_row
+                else:
+                    # If std is zero, all values are the same, set to zero
+                    normalized_array[i, :] = 0.0
+            else:
+                # Not enough valid values, keep as NaN
+                normalized_array[i, :] = np.nan
+        
+        # Create heatmap
+        plt.figure(figsize=figsize)
+        
+        # Create x-axis labels for timepoints
+        timepoint_labels = [f"T{i}" for i in range(num_timepoints)]
+        
+        sns.heatmap(
+            normalized_array,
+            xticklabels=timepoint_labels,
+            yticklabels=row_labels,
+            cmap='RdBu_r',  # Diverging colormap centered at 0
+            cbar_kws={'label': f'{metric_name.replace("_", " ").title()} (Z-score)'},
+            center=0,  # Center the colormap at 0
+            annot=False,
+            fmt='.2f'
+        )
+        
+        plt.title(f'{metric_name.replace("_", " ").title()} Across Time and Brain Regions (Row-Normalized)')
+        plt.xlabel('Timepoint')
+        plt.ylabel('Brain Region')
+        plt.tight_layout()
+        
+        # Save plot
+        if self.config['visualization']['save_plots']:
+            plot_path = self.current_plots_dir / f'{metric_name}_heatmap_normalized.png'
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            self.logger.info(f"Saved normalized heatmap: {plot_path}")
+        
+        # Show plot if requested
+        if self.config['visualization']['show_plots']:
+            plt.show()
+        else:
+            plt.close()
+    
     def save_results_to_csv(self):
-        """Save summary results to CSV files."""
-        self.logger.info("Saving results to CSV...")
+        """Save summary results to CSV files for current mode."""
+        self.logger.info(f"Saving results to CSV for {self.current_mode} mode...")
         
         # Summary statistics CSV
         summary_data = []
         
         # Whole volume row
-        if 'whole_volume' in self.summary_stats:
-            whole_vol_stats = self.summary_stats['whole_volume']
+        if 'whole_volume' in self.summary_stats[self.current_mode]:
+            whole_vol_stats = self.summary_stats[self.current_mode]['whole_volume']
             for metric, stats in whole_vol_stats.items():
                 row = {
                     'region': 'whole_volume',
                     'metric': metric,
+                    'mode': self.current_mode,
                     **stats
                 }
                 summary_data.append(row)
         
         # Region rows
         for region_name in self.region_names:
-            if region_name in self.summary_stats['regions']:
-                region_stats = self.summary_stats['regions'][region_name]
+            if region_name in self.summary_stats[self.current_mode]['regions']:
+                region_stats = self.summary_stats[self.current_mode]['regions'][region_name]
                 for metric, stats in region_stats.items():
                     row = {
                         'region': region_name,
                         'metric': metric,
+                        'mode': self.current_mode,
                         **stats
                     }
                     summary_data.append(row)
@@ -1199,7 +1754,7 @@ class GBMEvaluator:
         # Save to CSV
         if summary_data:
             summary_df = pd.DataFrame(summary_data)
-            summary_csv_path = self.output_dir / 'evaluation_summary.csv'
+            summary_csv_path = self.output_dir / f'evaluation_summary_{self.current_mode}.csv'
             summary_df.to_csv(summary_csv_path, index=False)
             self.logger.info(f"Saved summary results: {summary_csv_path}")
     
@@ -1233,9 +1788,33 @@ class GBMEvaluator:
                     f.write(f"  Max:  {stats['max']:.6f}\n")
                     f.write(f"  Count: {stats['count']}\n\n")
             
-            # Best and worst performing regions
-            f.write("REGION PERFORMANCE SUMMARY\n")
-            f.write("-" * 30 + "\n")
+            # Time-averaged metrics (averaged over both time and batch)
+            f.write("TIME-AVERAGED METRICS (Averaged over Time and Batch)\n")
+            f.write("-" * 55 + "\n")
+            if self.config['metrics']['compute_per_timepoint']:
+                time_avg_stats = self._compute_time_averaged_statistics()
+                if time_avg_stats:
+                    f.write("WHOLE VOLUME (Time-Averaged):\n")
+                    if 'whole_volume' in time_avg_stats:
+                        for metric, value in time_avg_stats['whole_volume'].items():
+                            f.write(f"  {metric.upper()}: {value:.6f}\n")
+                    f.write("\n")
+                    
+                    f.write("TOP 10 REGIONS BY TIME-AVERAGED F1 SCORE:\n")
+                    if 'regions' in time_avg_stats:
+                        region_f1_scores = []
+                        for region, metrics in time_avg_stats['regions'].items():
+                            if 'f1_score' in metrics:
+                                region_f1_scores.append((region, metrics['f1_score']))
+                        
+                        region_f1_scores.sort(key=lambda x: x[1], reverse=True)
+                        for i, (region, f1_score) in enumerate(region_f1_scores[:10]):
+                            f.write(f"  {i+1}. {region}: {f1_score:.4f}\n")
+                    f.write("\n")
+            
+            # Best and worst performing regions (from regular time-averaged metrics)
+            f.write("REGION PERFORMANCE SUMMARY (Batch-Averaged per Timepoint)\n")
+            f.write("-" * 55 + "\n")
             
             if self.summary_stats.get('regions'):
                 # Sort regions by F1 score if available
