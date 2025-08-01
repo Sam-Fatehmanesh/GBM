@@ -12,7 +12,6 @@ Features:
 - Batch-based evaluation on test subjects
 - Time-series heatmaps for metrics visualization
 - Per-region and whole-volume metrics computation
-- Support for both single models and ensembles
 """
 
 import os
@@ -41,7 +40,7 @@ project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
 # Import project modules
-from GenerativeBrainModel.models.gbm import GBM, EnsembleGBM
+from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.volume_dataloader import VolumeDataset
 from torch.utils.data import DataLoader
 
@@ -243,8 +242,7 @@ def create_default_eval_config() -> Dict[str, Any]:
             'name': 'gbm_evaluation',
             'description': 'Comprehensive evaluation of trained GBM models on test data',
             'model_path': None,  # Path to trained model checkpoint - REQUIRED
-            'model_type': 'single',  # 'single' or 'ensemble'
-            'ensemble_paths': [],  # List of paths for ensemble models
+            'model_type': 'single',  # 'single' 
         },
         
         'data': {
@@ -253,6 +251,8 @@ def create_default_eval_config() -> Dict[str, Any]:
             'max_timepoints_per_subject': None,  # Limit timepoints per subject (None = all)
             'sequence_length': 8,  # Must match training sequence length
             'stride': 2,  # Must match training stride
+            'temporal_start_fraction': 0.0,  # Start fraction of temporal data (0.0 = start)
+            'temporal_end_fraction': 1.0,   # End fraction of temporal data (1.0 = end)
         },
         
         'masks': {
@@ -464,35 +464,6 @@ class GBMEvaluator:
             self.model.load_state_dict(cleaned_state_dict)
             self.logger.info(f"Loaded single model from: {model_path}")
             
-        elif model_type == 'ensemble':
-            ensemble_paths = model_config.get('ensemble_paths', [])
-            if not ensemble_paths:
-                raise ValueError("Ensemble paths must be provided for ensemble evaluation")
-            
-            # Load first checkpoint to get model configuration
-            first_checkpoint = torch.load(ensemble_paths[0], map_location=self.device)
-            if 'config' not in first_checkpoint:
-                raise ValueError("Checkpoint must contain model configuration")
-            
-            model_config_from_ckpt = first_checkpoint['config']['model']
-            ensemble_size = len(ensemble_paths)
-            
-            # Create ensemble model
-            self.model = EnsembleGBM(
-                n_models=ensemble_size,
-                d_model=model_config_from_ckpt['d_model'],
-                n_heads=model_config_from_ckpt['n_heads'],
-                n_layers=model_config_from_ckpt['n_layers'],
-                autoencoder_path=model_config_from_ckpt.get('autoencoder_path'),
-                volume_size=tuple(model_config_from_ckpt['volume_size']),
-                region_size=tuple(model_config_from_ckpt['region_size']),
-                different_seeds=model_config_from_ckpt.get('different_seeds', True)
-            )
-            
-            # Load weights for each model in ensemble
-            self.model.load_ensemble_weights(ensemble_paths)
-            self.logger.info(f"Loaded ensemble with {ensemble_size} models")
-        
         else:
             raise ValueError(f"Unknown model type: {model_type}")
         
@@ -542,7 +513,7 @@ class GBMEvaluator:
         self.logger.info(f"Region names: {self.region_names[:5]}..." if len(self.region_names) > 5 else f"Region names: {self.region_names}")
     
     def create_test_dataloader(self):
-        """Create test data loader."""
+        """Create test data loader with temporal fraction support."""
         self.logger.info("Creating test data loader...")
         
         data_config = self.config['data']
@@ -574,14 +545,72 @@ class GBMEvaluator:
         else:
             eval_sequence_length = sequence_length
         
-        # Create dataset
+        # Handle temporal fraction selection
+        temporal_start_fraction = data_config.get('temporal_start_fraction', 0.0)
+        temporal_end_fraction = data_config.get('temporal_end_fraction', 1.0)
+        
+        self.logger.info(f"Temporal fraction selection: {temporal_start_fraction} to {temporal_end_fraction}")
+        
+        # Create dataset with temporal fraction support
         test_dataset = VolumeDataset(
             data_files=test_files,
             sequence_length=eval_sequence_length,
             stride=data_config['stride'],
             max_timepoints_per_subject=data_config.get('max_timepoints_per_subject'),
-            use_cache=False  # Don't cache for evaluation to save memory
+            use_cache=False,  # Don't cache for evaluation to save memory
+            start_timepoint=None,  # Will be determined per file
+            end_timepoint=None     # Will be determined per file
         )
+        
+        # If temporal fractions are specified, we need to rebuild the dataset with specific timepoints
+        if temporal_start_fraction != 0.0 or temporal_end_fraction != 1.0:
+            self.logger.info("Rebuilding dataset with temporal fraction constraints...")
+            # Clear existing sequences
+            test_dataset.sequences = []
+            
+            # Rebuild sequence index with temporal constraints
+            for file_path in test_files:
+                with h5py.File(file_path, 'r') as f:
+                    volumes = f['volumes']
+                    total_timepoints = volumes.shape[0]
+                    
+                    # Calculate start and end points based on fractions
+                    start_point = int(total_timepoints * temporal_start_fraction)
+                    end_point = int(total_timepoints * temporal_end_fraction)
+                    
+                    # Ensure we have enough timepoints for the sequence length
+                    if end_point - start_point < eval_sequence_length:
+                        self.logger.warning(f"Not enough timepoints in {Path(file_path).name} for specified temporal fraction and sequence length")
+                        continue
+                    
+                    self.logger.info(f"File {Path(file_path).name}: using timepoints {start_point} to {end_point} (out of {total_timepoints})")
+                    
+                    # Apply the same zero-volume skipping logic as in the original implementation
+                    first_nonzero = start_point
+                    while first_nonzero < end_point and np.all(volumes[first_nonzero] == 0):
+                        first_nonzero += 1
+
+                    if first_nonzero == end_point:
+                        self.logger.warning(f"Warning: All volumes in temporal range for {Path(file_path).name} are zero – skipping file.")
+                        continue
+
+                    last_nonzero = end_point - 1
+                    while last_nonzero >= first_nonzero and np.all(volumes[last_nonzero] == 0):
+                        last_nonzero -= 1
+
+                    if last_nonzero < first_nonzero:
+                        self.logger.warning(f"Warning: No non-zero volumes found in temporal range for {Path(file_path).name} – skipping file.")
+                        continue
+
+                    # Build sequence index within non-zero window
+                    max_start_idx = last_nonzero - eval_sequence_length + 1
+                    if max_start_idx >= first_nonzero:
+                        for start_idx in range(first_nonzero, max_start_idx + 1, data_config['stride']):
+                            test_dataset.sequences.append({'file_path': file_path, 'start_idx': start_idx})
+            
+            self.logger.info(f"Rebuilt test dataset with {len(test_dataset.sequences)} sequences from {len(test_files)} subjects")
+        else:
+            self.logger.info(f"Test dataset: {len(test_dataset)} sequences from {len(test_files)} subjects")
         
         # Create data loader
         self.test_loader = DataLoader(
@@ -592,7 +621,7 @@ class GBMEvaluator:
             pin_memory=False
         )
         
-        self.logger.info(f"Test dataset: {len(test_dataset)} sequences from {len(test_files)} subjects")
+        self.logger.info(f"Final test dataset size: {len(test_dataset)} sequences")
     
     def prepare_seq2seq_data(self, sequences: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1891,10 +1920,6 @@ def main():
         print("Error: model_path is required for single model evaluation")
         return
     
-    if config['evaluation']['model_type'] == 'ensemble' and not config['evaluation']['ensemble_paths']:
-        print("Error: ensemble_paths is required for ensemble evaluation")
-        return
-    
     # Run evaluation
     try:
         evaluator = GBMEvaluator(config)
@@ -1906,4 +1931,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main() 
+    main()

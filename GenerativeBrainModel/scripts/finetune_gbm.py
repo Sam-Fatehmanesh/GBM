@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Main training script for GBM (Generative Brain Model) with seq2seq training.
+Fine-tuning script for GBM (Generative Brain Model) with temporal data splitting.
+
+This script fine-tunes a pretrained GBM model on the first half of a subject's 
+temporal data and validates on the second half.
 """
 
 import os
@@ -19,6 +22,7 @@ import yaml
 from typing import Dict, Optional, Tuple, Any
 from tqdm import tqdm
 import pdb
+import h5py
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -26,33 +30,31 @@ sys.path.append(str(project_root))
 
 # Import our modules
 from GenerativeBrainModel.models.gbm import GBM
-from GenerativeBrainModel.dataloaders.volume_dataloader import create_dataloaders, get_volume_info
+from GenerativeBrainModel.dataloaders.volume_dataloader import create_dataloaders, get_volume_info, VolumeDataset
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_validation_video
 
 
 # Configuration utilities embedded in this script
-def create_default_config() -> Dict[str, Any]:
+def create_default_finetune_config() -> Dict[str, Any]:
     """
-    Create default configuration dictionary for GBM training.
+    Create default configuration dictionary for GBM fine-tuning.
     
     Returns:
         Dictionary with all configuration parameters
     """
     return {
         'experiment': {
-            'name': 'gbm_training',
-            'description': 'GBM (Generative Brain Model) sequence-to-sequence training on 3D volumetric spike data',
-            'tags': ['gbm', 'seq2seq', '3d-volumes', 'spike-data', 'temporal-modeling']
+            'name': 'gbm_finetuning',
+            'description': 'GBM (Generative Brain Model) fine-tuning on temporal split data',
+            'tags': ['gbm', 'finetuning', 'seq2seq', '3d-volumes', 'spike-data', 'temporal-modeling']
         },
         
         'data': {
             'data_dir': 'processed_spike_voxels_2018',
-            'test_subjects': [
-                'subject_1',
-                'subject_4', 
-                'subject_5'
-            ],
+            'finetune_subject': 'subject_1',  # Subject to fine-tune on
+            'temporal_start_fraction': 0.0,  # Start fraction of temporal data (0.0 = start)
+            'temporal_end_fraction': 0.5,   # End fraction of temporal data (0.5 = halfway)
             'use_cache': False  # Test performance with caching disabled
         },
         
@@ -60,26 +62,25 @@ def create_default_config() -> Dict[str, Any]:
             'd_model': 256,
             'n_heads': 8,
             'n_layers': 4,
-            'autoencoder_path': None,  # Path to pretrained autoencoder checkpoint
-            'gbm_checkpoint_path': None,  # Path to complete GBM checkpoint for continued training
-            'reset_training_state': False,  # If True, reset epoch/step counters when loading GBM checkpoint
+            'gbm_checkpoint_path': None,  # Path to pretrained GBM checkpoint - REQUIRED
+            'reset_training_state': True,  # Reset epoch/step counters for fine-tuning
             'volume_size': [256, 128, 30],
             'region_size': [32, 16, 2],
         },
         
         'training': {
             'volumes_per_batch': 4,  # Number of sequences per batch
-            'num_epochs': 100,
-            'learning_rate': 0.0005,  # Lower LR for fine-tuning
+            'num_epochs': 20,  # Fewer epochs for fine-tuning
+            'learning_rate': 0.0001,  # Lower LR for fine-tuning
             'weight_decay': 1e-4,
             'optimizer': 'adamw',  # Optimizer type: 'adamw' or 'muon'
             # Muon-specific settings (used when optimizer='muon')
-            'muon_lr': 0.02,  # Learning rate for Muon (hidden weights)
+            'muon_lr': 0.005,  # Lower learning rate for Muon fine-tuning
             'muon_momentum': 0.95,  # Momentum for Muon
             'muon_nesterov': True,  # Use Nesterov momentum for Muon
             'muon_ns_steps': 5,  # Number of steps for Muon
             # AdamW settings for non-hidden params when using Muon
-            'adamw_lr': 3e-4,  # Learning rate for AdamW params (when using Muon)
+            'adamw_lr': 1e-4,  # Lower learning rate for AdamW params (when using Muon)
             'adamw_betas': [0.9, 0.95],  # Beta values for AdamW
             'adamw_eps': 1e-8,           # Epsilon for AdamW
             # Muon-specific hyperparameters
@@ -87,10 +88,10 @@ def create_default_config() -> Dict[str, Any]:
             'muon_eps': 1e-8,             # Epsilon for Muon optimizer
             'scheduler': 'warmup_cosine',  # Linear warmup + cosine annealing
             # Available schedulers: 'linear_warmup', 'warmup_cosine', 'warmup_lineardecay', 'cosine', 'step', or None
-            'min_lr_ratio': 0.01,  # Minimum LR as ratio of initial LR (for warmup_cosine and warmup_lineardecay)
+            'min_lr_ratio': 0.1,  # Minimum LR as ratio of initial LR (for warmup_cosine and warmup_lineardecay)
             'gradient_clip_norm': 1.0,
             'gradient_accumulation_steps': None,  # Number of batches to accumulate gradients over (None/0 = disabled)
-            'validation_frequency': 8,  # Number of times to run validation per epoch
+            'validation_frequency': 4,  # Number of times to run validation per epoch
             
             # Sequence parameters for GBM (seq2seq training)
             'sequence_length': 8,  # Length of input sequences (longer for temporal modeling)
@@ -126,7 +127,7 @@ def create_default_config() -> Dict[str, Any]:
         },
         
         'paths': {
-            'output_base_dir': 'experiments/gbm',
+            'output_base_dir': 'experiments/gbm_finetuning',
             'checkpoint_dir': None,  # Will be set automatically
             'log_dir': None,  # Will be set automatically
             'plot_dir': None  # Will be set automatically
@@ -142,7 +143,7 @@ def generate_config_file(output_path: str, overrides: Dict = None) -> None:
         output_path: Path to save the config file
         overrides: Dictionary of config overrides
     """
-    config = create_default_config()
+    config = create_default_finetune_config()
     
     # Apply overrides if provided
     if overrides:
@@ -173,7 +174,7 @@ def load_config(config_path: str) -> Dict[str, Any]:
     with open(config_path, 'r') as f:
         user_config = yaml.safe_load(f)
     # Merge with defaults to fill missing keys
-    default_config = create_default_config()
+    default_config = create_default_finetune_config()
     config = deep_update(default_config, user_config)
     # Validate and set automatic paths
     config = setup_experiment_paths(config)
@@ -230,15 +231,12 @@ def validate_config(config: Dict[str, Any]) -> None:
     if not h5_files:
         raise ValueError(f"No H5 files found in data directory: {data_dir}")
     
-    # Validate test subjects exist
-    test_subjects = config['data'].get('test_subjects', [])
-    if test_subjects:
-        missing_subjects = []
-        for subject in test_subjects:
-            if not (data_dir / f"{subject}.h5").exists():
-                missing_subjects.append(subject)
-        if missing_subjects:
-            print(f"Warning: Test subjects not found: {missing_subjects}")
+    # Validate fine-tune subject exists
+    finetune_subject = config['data'].get('finetune_subject')
+    if finetune_subject:
+        subject_file = data_dir / f"{finetune_subject}.h5"
+        if not subject_file.exists():
+            raise ValueError(f"Fine-tune subject file not found: {subject_file}")
     
     # Validate volume/region size compatibility
     model_config = config['model']
@@ -252,14 +250,11 @@ def validate_config(config: Dict[str, Any]) -> None:
                 f"at dimension {i}"
             )
     
-    # Check autoencoder path if provided
-    autoencoder_path = model_config.get('autoencoder_path')
-    if autoencoder_path and not Path(autoencoder_path).exists():
-        raise ValueError(f"Autoencoder checkpoint not found: {autoencoder_path}")
-    
     # Check GBM checkpoint path if provided
     gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
-    if gbm_checkpoint_path and not Path(gbm_checkpoint_path).exists():
+    if not gbm_checkpoint_path:
+        raise ValueError("GBM checkpoint path is required for fine-tuning")
+    if not Path(gbm_checkpoint_path).exists():
         raise ValueError(f"GBM checkpoint not found: {gbm_checkpoint_path}")
     
     # Validate sequence length
@@ -271,18 +266,18 @@ def validate_config(config: Dict[str, Any]) -> None:
     print(f"GBM Model: d_model={model_config['d_model']}, n_heads={model_config['n_heads']}, n_layers={model_config['n_layers']}")
     print(f"Sequence length: {seq_len}")
     
-    # Show checkpoint/autoencoder loading info
+    # Show checkpoint loading info
     gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
-    autoencoder_path = model_config.get('autoencoder_path')
-    reset_training_state = model_config.get('reset_training_state', False)
+    reset_training_state = model_config.get('reset_training_state', True)
     
-    if gbm_checkpoint_path:
-        reset_msg = " (with training state reset)" if reset_training_state else " (continuing from checkpoint)"
-        print(f"Will load complete GBM checkpoint: {gbm_checkpoint_path}{reset_msg}")
-    elif autoencoder_path:
-        print(f"Will load pretrained autoencoder: {autoencoder_path}")
-    else:
-        print("Will use randomly initialized model")
+    reset_msg = " (with training state reset)" if reset_training_state else " (continuing from checkpoint)"
+    print(f"Will load GBM checkpoint: {gbm_checkpoint_path}{reset_msg}")
+    
+    # Show fine-tuning subject
+    finetune_subject = config['data'].get('finetune_subject')
+    split_ratio = config['data'].get('temporal_split_ratio', 0.5)
+    print(f"Fine-tuning on subject: {finetune_subject}")
+    print(f"Temporal split ratio: {split_ratio} (first {split_ratio*100}% for training)")
 
 
 def deep_update(base_dict: Dict, update_dict: Dict) -> Dict:
@@ -319,14 +314,14 @@ def save_config(config: Dict[str, Any], save_path: str) -> None:
         yaml.dump(config, f, default_flow_style=False, indent=2, sort_keys=False)
 
 
-class GBMTrainer:
+class GBMFinetuner:
     """
-    Comprehensive GBM trainer with sequence-to-sequence training.
+    GBM fine-tuner with temporal data splitting.
     """
     
     def __init__(self, config: Dict):
         """
-        Initialize trainer with configuration.
+        Initialize fine-tuner with configuration.
         
         Args:
             config: Configuration dictionary
@@ -368,7 +363,7 @@ class GBMTrainer:
     def setup_logging(self):
         """Set up logging configuration."""
         log_dir = Path(self.config['paths']['log_dir'])
-        log_file = log_dir / 'training.log'
+        log_file = log_dir / 'finetuning.log'
         
         logging.basicConfig(
             level=getattr(logging, self.config['logging']['log_level']),
@@ -409,11 +404,29 @@ class GBMTrainer:
         self.logger.info(f"Random seed set to: {seed}")
     
     def build_model(self):
-        """Build and initialize the GBM model."""
+        """Build and initialize the GBM model from pretrained checkpoint."""
         model_config = self.config['model']
         
+        # Load pretrained model from checkpoint
+        gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
+        if not gbm_checkpoint_path or not Path(gbm_checkpoint_path).exists():
+            raise ValueError(f"GBM checkpoint not found: {gbm_checkpoint_path}")
         
-        # Create single GBM model
+        self.logger.info(f"Loading pretrained GBM model from: {gbm_checkpoint_path}")
+        
+        # Load checkpoint to get model configuration
+        checkpoint = torch.load(gbm_checkpoint_path, map_location='cpu')
+        
+        # Extract model configuration from checkpoint if available
+        if 'config' in checkpoint and 'model' in checkpoint['config']:
+            checkpoint_model_config = checkpoint['config']['model']
+            # Override with current config values if they exist
+            for key, value in model_config.items():
+                if value is not None:
+                    checkpoint_model_config[key] = value
+            model_config = checkpoint_model_config
+        
+        # Create GBM model with configuration from checkpoint
         self.model = GBM(
             d_model=model_config['d_model'],
             n_heads=model_config['n_heads'],
@@ -422,26 +435,29 @@ class GBMTrainer:
             volume_size=tuple(model_config['volume_size']),
             region_size=tuple(model_config['region_size'])
         )
-        self.logger.info("Created single GBM model")
         
-        autoencoder_path = model_config.get('autoencoder_path')
-        gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
+        self.logger.info("Created GBM model")
         
-        if gbm_checkpoint_path and autoencoder_path:
-            self.logger.info(f"Both GBM checkpoint and autoencoder path provided - GBM checkpoint takes precedence")
-        elif autoencoder_path and not gbm_checkpoint_path:
-            self.logger.info(f"Loaded pretrained autoencoder from: {autoencoder_path}")
-        elif not autoencoder_path and not gbm_checkpoint_path:
-            self.logger.warning("No autoencoder path or GBM checkpoint provided - using randomly initialized autoencoder")
+        # Load model state from checkpoint
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
         
-        self.logger.info(f"Model volume size: {model_config['volume_size']}, region size: {model_config['region_size']}")
+        # Handle torch.compile() prefixes (_orig_mod.) in state dict keys
+        cleaned_state_dict = {}
+        for key, value in state_dict.items():
+            # Remove _orig_mod. prefix if present (from torch.compile)
+            if key.startswith('_orig_mod.'):
+                cleaned_key = key[len('_orig_mod.'):]
+            else:
+                cleaned_key = key
+            cleaned_state_dict[cleaned_key] = value
+        
+        self.model.load_state_dict(cleaned_state_dict)
+        self.logger.info(f"Loaded pretrained GBM model state from: {gbm_checkpoint_path}")
         
         self.model.to(self.device)
-        
-        # Load complete GBM checkpoint if provided (takes precedence over autoencoder_path)
-        gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
-        if gbm_checkpoint_path:
-            self.load_gbm_checkpoint(gbm_checkpoint_path)
         
         # Compile model if requested (PyTorch 2.0+)
         if self.config['training'].get('compile_model', False):
@@ -487,7 +503,7 @@ class GBMTrainer:
         
         with open(architecture_file, 'w') as f:
             f.write("=" * 80 + "\n")
-            f.write("GBM MODEL ARCHITECTURE SUMMARY\n")
+            f.write("GBM MODEL ARCHITECTURE SUMMARY (FINE-TUNING)\n")
             f.write("=" * 80 + "\n\n")
             
             # Basic model info
@@ -537,7 +553,7 @@ class GBMTrainer:
             f.write("\n\n")
             
             # Training configuration
-            f.write("TRAINING CONFIGURATION:\n")
+            f.write("FINE-TUNING CONFIGURATION:\n")
             f.write("-" * 40 + "\n")
             training_config = self.config['training']
             for key, value in training_config.items():
@@ -559,117 +575,6 @@ class GBMTrainer:
             f.write("\n" + "=" * 80 + "\n")
         
         self.logger.info(f"Model architecture saved to: {architecture_file}")
-    
-    def load_gbm_checkpoint(self, checkpoint_path: str):
-        """
-        Load a complete GBM checkpoint for continued training.
-        
-        Args:
-            checkpoint_path: Path to the GBM checkpoint file
-        """
-        checkpoint_path = Path(checkpoint_path)
-        self.logger.info(f"Loading GBM checkpoint from: {checkpoint_path}")
-        
-        try:
-            # Load checkpoint
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            
-            # Handle torch.compile() prefixes (_orig_mod.) in state dict keys
-            model_state_dict = checkpoint['model_state_dict']
-            cleaned_state_dict = {}
-            for key, value in model_state_dict.items():
-                # Remove _orig_mod. prefix if present (from torch.compile)
-                if key.startswith('_orig_mod.'):
-                    cleaned_key = key[len('_orig_mod.'):]
-                else:
-                    cleaned_key = key
-                cleaned_state_dict[cleaned_key] = value
-            
-            # Load model state
-            self.model.load_state_dict(cleaned_state_dict)
-            
-            # Load training state (unless reset is requested)
-            reset_training_state = self.config['model'].get('reset_training_state', False)
-            if reset_training_state:
-                self.checkpoint_epoch = 0
-                self.checkpoint_step = 0
-                self.best_val_loss = float('inf')
-                self.logger.info("Training state reset - will start training from epoch 1")
-            else:
-                self.checkpoint_epoch = checkpoint.get('epoch', 0)
-                self.checkpoint_step = checkpoint.get('step', 0)
-                self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-                
-                # If this was the best model, update best_model_path
-                if 'validation_loss' in checkpoint:
-                    self.best_val_loss = checkpoint['validation_loss']
-            
-            self.loaded_from_checkpoint = True
-            self.checkpoint_data = checkpoint  # Store for optimizer/scheduler loading
-            
-            self.logger.info(f"Successfully loaded GBM checkpoint:")
-            self.logger.info(f"  Checkpoint epoch: {self.checkpoint_epoch}")
-            self.logger.info(f"  Checkpoint step: {self.checkpoint_step}")
-            self.logger.info(f"  Best validation loss: {self.best_val_loss}")
-            
-            # Check if config matches
-            if 'config' in checkpoint:
-                checkpoint_config = checkpoint['config']
-                current_model_config = self.config['model']
-                checkpoint_model_config = checkpoint_config.get('model', {})
-                
-                # Compare key model parameters
-                key_params = ['d_model', 'n_heads', 'n_layers', 'volume_size', 'region_size']
-                for param in key_params:
-                    current_val = current_model_config.get(param)
-                    checkpoint_val = checkpoint_model_config.get(param)
-                    if current_val != checkpoint_val:
-                        self.logger.warning(f"Config mismatch for {param}: current={current_val}, checkpoint={checkpoint_val}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to load GBM checkpoint: {e}")
-            raise ValueError(f"Could not load GBM checkpoint from {checkpoint_path}: {e}")
-    
-    def load_optimizer_states(self):
-        """
-        Load optimizer and scheduler states from the stored checkpoint data.
-        This should be called after the optimizer and scheduler are built.
-        """
-        if not self.checkpoint_data:
-            self.logger.warning("No checkpoint data available for loading optimizer states")
-            return
-        
-        # Check if training state should be reset
-        reset_training_state = self.config['model'].get('reset_training_state', False)
-        if reset_training_state:
-            self.logger.info("Training state reset requested - using fresh optimizer/scheduler/scaler states")
-            return
-        
-        try:
-            # Load optimizer state
-            if 'optimizer_state_dict' in self.checkpoint_data:
-                self.optimizer.load_state_dict(self.checkpoint_data['optimizer_state_dict'])
-                self.logger.info("Loaded optimizer state from checkpoint")
-            else:
-                self.logger.info("No optimizer state found in checkpoint - using fresh optimizer")
-            
-            # Load scheduler state
-            if self.scheduler and 'scheduler_state_dict' in self.checkpoint_data:
-                self.scheduler.load_state_dict(self.checkpoint_data['scheduler_state_dict'])
-                self.logger.info("Loaded scheduler state from checkpoint")
-            elif self.scheduler:
-                self.logger.info("No scheduler state found in checkpoint - using fresh scheduler")
-            
-            # Load scaler state
-            if self.scaler and 'scaler_state_dict' in self.checkpoint_data:
-                self.scaler.load_state_dict(self.checkpoint_data['scaler_state_dict'])
-                self.logger.info("Loaded mixed precision scaler state from checkpoint")
-            elif self.scaler:
-                self.logger.info("No scaler state found in checkpoint - using fresh scaler")
-                
-        except Exception as e:
-            self.logger.warning(f"Failed to load optimizer/scheduler states from checkpoint: {e}")
-            self.logger.warning("Continuing with fresh optimizer/scheduler states")
     
     def build_optimizer(self):
         """Build optimizer and scheduler."""
@@ -714,13 +619,13 @@ class GBMTrainer:
                     hidden_gains_biases.append(param)
             
             # Get optimizer settings
-            muon_lr = training_config.get('muon_lr', 0.02)
+            muon_lr = training_config.get('muon_lr', 0.005)
             muon_momentum = training_config.get('muon_momentum', 0.95)
             muon_nesterov = training_config.get('muon_nesterov', True)
             muon_ns_steps = training_config.get('muon_ns_steps', 5)
             
             # AdamW optimizer for non-hidden parameters
-            adamw_lr = training_config.get('adamw_lr', 3e-4)
+            adamw_lr = training_config.get('adamw_lr', 1e-4)
             adamw_betas = training_config.get('adamw_betas', [0.9, 0.95])
             
             # Create parameter groups for MuonWithAuxAdam
@@ -764,8 +669,8 @@ class GBMTrainer:
         
         # For Muon optimizer, we need to handle multiple parameter groups with different base LRs
         if optimizer_type == 'muon':
-            base_muon_lr = training_config.get('muon_lr', 0.02)
-            base_adamw_lr = training_config.get('adamw_lr', 3e-4)
+            base_muon_lr = training_config.get('muon_lr', 0.005)
+            base_adamw_lr = training_config.get('adamw_lr', 1e-4)
         else:
             base_lr = training_config['learning_rate']
         
@@ -802,8 +707,8 @@ class GBMTrainer:
             total_batches = training_config['num_epochs'] * len(self.train_loader)
             cosine_batches = total_batches - warmup_batches  # Remaining batches for cosine annealing
             
-            # Get minimum learning rate (default to 1% of initial LR)
-            min_lr_ratio = training_config.get('min_lr_ratio', 0.01)
+            # Get minimum learning rate (default to 10% of initial LR for fine-tuning)
+            min_lr_ratio = training_config.get('min_lr_ratio', 0.1)
             if optimizer_type == 'muon':
                 # Different lambda functions for different parameter groups
                 min_muon_lr = base_muon_lr * min_lr_ratio
@@ -861,8 +766,8 @@ class GBMTrainer:
             total_batches = training_config['num_epochs'] * len(self.train_loader)
             decay_batches = total_batches - warmup_batches  # Remaining batches for linear decay
             
-            # Get minimum learning rate (default to 1% of initial LR)
-            min_lr_ratio = training_config.get('min_lr_ratio', 0.01)
+            # Get minimum learning rate (default to 10% of initial LR)
+            min_lr_ratio = training_config.get('min_lr_ratio', 0.1)
             if optimizer_type == 'muon':
                 # Different lambda functions for different parameter groups
                 min_muon_lr = base_muon_lr * min_lr_ratio
@@ -918,7 +823,7 @@ class GBMTrainer:
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
                 T_max=training_config['num_epochs'],
-                eta_min=training_config['learning_rate'] * 0.01
+                eta_min=training_config['learning_rate'] * 0.1
             )
             self.logger.info("Using Cosine Annealing scheduler.")
             
@@ -939,16 +844,12 @@ class GBMTrainer:
             self.scaler = GradScaler()
             self.logger.info("Mixed precision training enabled")
         
-        # Load optimizer and scheduler states from checkpoint if available
-        if self.loaded_from_checkpoint:
-            self.load_optimizer_states()
-        
         self.logger.info(f"Optimizer: {self.optimizer.__class__.__name__}")
         self.logger.info(f"Scheduler: {scheduler_type}")
     
     def build_dataloaders(self):
-        """Build training and validation dataloaders."""
-        self.logger.info("Building dataloaders...")
+        """Build training and validation dataloaders with temporal splitting."""
+        self.logger.info("Building dataloaders with temporal splitting...")
         
         # Get data info to determine volume size
         try:
@@ -967,8 +868,82 @@ class GBMTrainer:
                 raise ValueError("Could not determine volume_size from data directory and it is not specified in model config.")
             self.logger.info(f"Using volume_size from model config: {self.config['model']['volume_size']}")
 
-        self.train_loader, self.test_loader = create_dataloaders(self.config)
-            
+        # Create custom datasets with temporal splitting
+        data_config = self.config['data']
+        training_config = self.config['training']
+        
+        data_dir = Path(data_config['data_dir'])
+        finetune_subject = data_config['finetune_subject']
+        
+        finetune_file = str(data_dir / f"{finetune_subject}.h5")
+        if not Path(finetune_file).exists():
+            raise ValueError(f"Fine-tune subject file not found: {finetune_file}")
+        
+        # Get total timepoints for the subject
+        with h5py.File(finetune_file, 'r') as f:
+            total_timepoints = f['volumes'].shape[0]
+        
+        # Calculate start and end points based on fractions
+        start_fraction = data_config.get('temporal_start_fraction', 0.0)
+        end_fraction = data_config.get('temporal_end_fraction', 0.5)
+        
+        start_point = int(total_timepoints * start_fraction)
+        end_point = int(total_timepoints * end_fraction)
+        
+        self.logger.info(f"Temporal range: {start_point}-{end_point}/{total_timepoints} timepoints for fine-tuning")
+        
+        # Get parameters from config
+        sequence_length = training_config.get('sequence_length', 1)
+        stride = training_config.get('stride', 1)
+        max_timepoints_per_subject = training_config.get('max_timepoints_per_subject', None)
+        use_cache = data_config.get('use_cache', True)
+        
+        # Create training dataset (based on temporal fractions)
+        train_dataset = VolumeDataset(
+            [finetune_file], 
+            sequence_length=sequence_length,
+            stride=stride,
+            max_timepoints_per_subject=max_timepoints_per_subject,
+            use_cache=use_cache,
+            start_timepoint=start_point,
+            end_timepoint=end_point
+        )
+        
+        # Create validation dataset (second half temporally)
+        val_start_point = int(total_timepoints * 0.5)
+        val_end_point = total_timepoints
+        
+        test_dataset = VolumeDataset(
+            [finetune_file],
+            sequence_length=sequence_length,
+            stride=stride,
+            max_timepoints_per_subject=max_timepoints_per_subject,
+            use_cache=use_cache,
+            start_timepoint=val_start_point,
+            end_timepoint=val_end_point
+        )
+        
+        # Use safer defaults for DataLoader memory usage. Users can override via config.
+        dl_kwargs = {
+            'batch_size': training_config.get('volumes_per_batch', 4),
+            'num_workers': training_config.get('num_workers', 2),
+            'pin_memory': training_config.get('pin_memory', False),  # Pinning large 3-D volumes quickly exhausts shared memory
+            'persistent_workers': training_config.get('persistent_workers', False),
+            'prefetch_factor': training_config.get('prefetch_factor', 2),
+        }
+
+        self.train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            shuffle=True,
+            **dl_kwargs
+        )
+
+        self.test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            shuffle=False,
+            **dl_kwargs
+        )
+        
         self.logger.info(f"Train loader: {len(self.train_loader.dataset)} samples")
         self.logger.info(f"Test loader: {len(self.test_loader.dataset)} samples")
     
@@ -1126,8 +1101,8 @@ class GBMTrainer:
         return avg_val_loss
 
     def train(self):
-        """Main training loop."""
-        self.logger.info("Starting GBM training...")
+        """Main fine-tuning loop."""
+        self.logger.info("Starting GBM fine-tuning...")
         # If not in distributed mode, ensure Muon optimizer sees world size = 1 and stub all_gather
         try:
             import torch.distributed as dist
@@ -1156,13 +1131,8 @@ class GBMTrainer:
         total_steps = num_epochs * total_batches
         
         # Set starting epoch and step based on checkpoint loading
-        if self.loaded_from_checkpoint:
-            start_epoch = self.checkpoint_epoch + 1
-            global_step = self.checkpoint_step
-            self.logger.info(f"Resuming training from epoch {start_epoch} (loaded from checkpoint)")
-        else:
-            start_epoch = 1
-            global_step = 0
+        start_epoch = 1
+        global_step = 0
             
         self.current_epoch = 0
 
@@ -1174,7 +1144,7 @@ class GBMTrainer:
             pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{num_epochs}', leave=True)
             
             # Calculate validation frequency for this epoch
-            validation_frequency = self.config['training'].get('validation_frequency', 8)
+            validation_frequency = self.config['training'].get('validation_frequency', 4)
             total_batches = len(self.train_loader)
             validation_interval = max(1, total_batches // validation_frequency)
 
@@ -1279,7 +1249,7 @@ class GBMTrainer:
             # Save checkpoint at end of every epoch
             self.save_checkpoint(epoch, global_step)
         
-        self.logger.info("GBM training completed!")
+        self.logger.info("GBM fine-tuning completed!")
         
         # Load best model for video generation
         try:
@@ -1298,7 +1268,7 @@ class GBMTrainer:
                 validation_loader=self.test_loader,
                 device=self.device,
                 experiment_dir=self.experiment_dir,
-                video_name="gbm_validation_comparison.mp4",
+                video_name="gbm_finetuning_validation_comparison.mp4",
                 seq2seq=True  # GBM is a seq2seq model that predicts next frames
             )
             self.logger.info(f"Validation comparison video saved to: {video_path}")
@@ -1452,7 +1422,7 @@ class GBMTrainer:
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Train GBM on 3D volume sequences.")
+    parser = argparse.ArgumentParser(description="Fine-tune GBM on 3D volume sequences with temporal splitting.")
     
     # Config generation
     parser.add_argument(
@@ -1474,7 +1444,7 @@ def main():
     if args.generate_config:
         try:
             generate_config_file(args.generate_config)
-            print(f"Default GBM config file generated at: {args.generate_config}")
+            print(f"Default GBM fine-tuning config file generated at: {args.generate_config}")
         except Exception as e:
             print(f"Error generating config file: {e}")
         return
@@ -1487,9 +1457,9 @@ def main():
     config = setup_experiment_paths(config)
     validate_config(config)
     
-    # Start training
-    trainer = GBMTrainer(config)
-    trainer.train()
+    # Start fine-tuning
+    finetuner = GBMFinetuner(config)
+    finetuner.train()
 
 if __name__ == '__main__':
     main()

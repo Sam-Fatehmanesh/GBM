@@ -629,7 +629,7 @@ class AutoencoderTrainer:
                 # Forward pass
                 with autocast(enabled=self.scaler is not None):
                     # ConvNormEncoder works directly on volumes - no region extraction needed
-                    val_output_volumes = self.model(val_data)
+                    val_output_volumes = self.model(torch.logit(val_data)
                     val_loss = loss_fn(val_output_volumes, val_target)
                 
                 total_val_loss += val_loss.item()

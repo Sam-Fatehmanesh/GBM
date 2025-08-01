@@ -30,7 +30,8 @@ class VolumeDataset(Dataset):
     """
     
     def __init__(self, data_files: List[str], sequence_length: int = 1, stride: int = 1, 
-                 max_timepoints_per_subject: Optional[int] = None, use_cache: bool = False):
+                 max_timepoints_per_subject: Optional[int] = None, use_cache: bool = False,
+                 start_timepoint: Optional[int] = None, end_timepoint: Optional[int] = None):
         """
         Args:
             data_files: List of H5 file paths.
@@ -38,12 +39,16 @@ class VolumeDataset(Dataset):
             stride: Step size between sequence starts.
             max_timepoints_per_subject: Max timepoints to use per subject file.
             use_cache: If True, loads entire dataset into CPU memory.
+            start_timepoint: Starting timepoint index (for temporal splitting).
+            end_timepoint: Ending timepoint index (for temporal splitting).
         """
         self.data_files = data_files
         self.sequence_length = sequence_length
         self.stride = stride
         self.max_timepoints_per_subject = max_timepoints_per_subject
         self.use_cache = use_cache
+        self.start_timepoint = start_timepoint
+        self.end_timepoint = end_timepoint
         
         self.sequences = []
         self.cached_data = {} if use_cache else None
@@ -61,20 +66,35 @@ class VolumeDataset(Dataset):
                 volumes = f['volumes']
                 total_timepoints = volumes.shape[0]
                 
-                num_timepoints = min(self.max_timepoints_per_subject, total_timepoints) if self.max_timepoints_per_subject is not None else total_timepoints
+                # Determine the actual start and end points
+                if self.start_timepoint is not None:
+                    start_point = self.start_timepoint
+                else:
+                    start_point = 0
+                    
+                if self.end_timepoint is not None:
+                    end_point = min(self.end_timepoint, total_timepoints)
+                else:
+                    end_point = total_timepoints
+                    
+                # Apply max_timepoints_per_subject if specified
+                if self.max_timepoints_per_subject is not None:
+                    end_point = min(end_point, start_point + self.max_timepoints_per_subject)
+                
+                num_timepoints = end_point - start_point
 
                 # ------------------------------------------------------------------
-                # Skip consecutive leading and trailing all-zero volumes
+                # Skip consecutive leading and trailing all-zero volumes within the specified range
                 # ------------------------------------------------------------------
-                first_nonzero = 0
-                while first_nonzero < num_timepoints and np.all(volumes[first_nonzero] == 0):
+                first_nonzero = start_point
+                while first_nonzero < end_point and np.all(volumes[first_nonzero] == 0):
                     first_nonzero += 1
 
-                if first_nonzero == num_timepoints:
+                if first_nonzero == end_point:
                     print(f"Warning: All {num_timepoints} volumes in {Path(file_path).name} are zero – skipping file.")
                     continue  # Entire file is zeros
 
-                last_nonzero = num_timepoints - 1
+                last_nonzero = end_point - 1
                 while last_nonzero >= first_nonzero and np.all(volumes[last_nonzero] == 0):
                     last_nonzero -= 1
 
@@ -84,10 +104,10 @@ class VolumeDataset(Dataset):
                     continue
 
                 # Informational logging
-                if first_nonzero > 0:
-                    print(f"Skipping {first_nonzero} initial zero volumes in {Path(file_path).name} (start at {first_nonzero}).")
-                if last_nonzero < num_timepoints - 1:
-                    skipped_trailing = num_timepoints - 1 - last_nonzero
+                if first_nonzero > start_point:
+                    print(f"Skipping {first_nonzero - start_point} initial zero volumes in {Path(file_path).name} (start at {first_nonzero}).")
+                if last_nonzero < end_point - 1:
+                    skipped_trailing = end_point - 1 - last_nonzero
                     print(f"Skipping {skipped_trailing} trailing zero volumes in {Path(file_path).name} (end at {last_nonzero}).")
 
                 effective_timepoints = last_nonzero - first_nonzero + 1
@@ -259,4 +279,4 @@ def get_volume_info(data_dir: str) -> Dict:
         'all_same_shape': all_same_shape,
         'sample_shapes': shapes,
         'files': [f.name for f in files[:10]]
-    } 
+    }
