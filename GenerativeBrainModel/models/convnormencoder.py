@@ -156,7 +156,7 @@ class ConvNormEncoder(nn.Module):
         """
 
         B, T, vol_x, vol_y, vol_z = x.shape
-
+ 
         # Apply Bernoulli sampling
         # x = torch.bernoulli(torch.clamp(x, min=0.0, max=1.0))
         

@@ -9,56 +9,126 @@ from mamba_ssm import Mamba2 as Mamba
 import pdb
 import os
 
+
+class FFN(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super(FFN, self).__init__()
+        self.linear_1 = nn.Linear(d_model, d_ff)        
+        self.linear_2 = nn.Linear(d_model, d_ff)
+        self.act = nn.SiLU()
+        self.linear_3 = nn.Linear(d_ff, d_model)
+    
+    def forward(self, x):
+        x1 = self.act(self.linear_1(x))
+        x2 = self.linear_2(x)
+        return self.linear_3(x2 * x1)
+
+
 class SpatioTemporalRegionModel(nn.Module):
     def __init__(self, d_model, n_heads, n_regions):
         super(SpatioTemporalRegionModel, self).__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_regions = n_regions
-        self.spatial_model = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.temporal_model = Mamba(d_model=d_model)
+        # Combined spatio-temporal attention model
+        self.spatio_temporal_model = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.norm_1 = RMSNorm(d_model)
         self.norm_2 = RMSNorm(d_model)
-        self.norm_3 = RMSNorm(d_model)
-        self.mlp = MLP(layers_num=1, input_size=d_model, hidden_size=d_model*2, output_size=d_model)
+
+        self.FFN = FFN(d_model, d_model*2)
+        
+        # Initialize RoPE embeddings for temporal modeling
+        rope_embeddings = self._init_rope(d_model)
+        self.register_buffer('rope_embeddings', rope_embeddings)
+        
+    def _init_rope(self, d_model):
+        """Initialize RoPE embeddings for temporal sequences"""
+        # Create fixed position embeddings
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, d_model, 2).float() / d_model))
+        return inv_freq
+        
+    def _apply_rotary_pos_emb(self, x, seq_dim=1):
+        """Apply rotary positional embeddings to input tensor"""
+        # x shape: (batch_size, seq_len, d_model)
+        seq_len = x.shape[seq_dim]
+        
+        # Create position indices
+        position = torch.arange(seq_len, device=x.device).float()
+        
+        # Compute sinusoidal positions
+        sinusoidal_pos = torch.einsum("i,j->ij", position, self.rope_embeddings)
+        sin_pos = torch.sin(sinusoidal_pos)
+        cos_pos = torch.cos(sinusoidal_pos)
+        
+        # Apply rotary embeddings
+        x_rot = x.clone()
+        x_rot[..., 0::2] = x[..., 0::2] * cos_pos - x[..., 1::2] * sin_pos
+        x_rot[..., 1::2] = x[..., 0::2] * sin_pos + x[..., 1::2] * cos_pos
+        
+        return x_rot
+        
+    def _create_spatio_temporal_mask(self, T, N, device):
+        """
+        Create a causal mask for spatio-temporal attention.
+        This mask allows each region to attend to:
+        1. All regions at the same timepoint
+        2. All regions at earlier timepoints
+        But not regions at later timepoints.
+        
+        Args:
+            T: Number of timepoints
+            N: Number of regions
+            device: Device to create the mask on
+            
+        Returns:
+            causal_mask: Boolean mask of shape (T*N, T*N)
+        """
+        # Create a causal mask for timepoints
+        time_causal_mask = torch.triu(torch.ones(T, T, device=device), diagonal=1).bool()
+        
+        # Expand to include all regions within each timepoint
+        # The mask should be (T*N, T*N) where each region can attend to all regions
+        # at the same or earlier timepoints
+        causal_mask = time_causal_mask.repeat_interleave(N, dim=0).repeat_interleave(N, dim=1)
+        
+        return causal_mask
 
     def forward(self, x, apply_last_norm=True):
         # expects x of shape (batch_size, seq_len, n_regions, d_model)
         B, T, N, D = x.shape
 
-        # --- Spatial Attention: operate over regions for each timepoint ---
-        # (B, T, N, D) -> (B*T, N, D)
-        x = x.reshape(B * T, N, D)
+        # Reshape to combine batch and time dimensions for attention
+        # (B, T, N, D) -> (B, T*N, D) where each sequence position contains all regions at that timepoint
+        x = x.contiguous().view(B, T * N, D)
+        
+        # Create combined spatio-temporal causal mask
+        # This mask allows each region to attend to:
+        # 1. All regions at the same timepoint
+        # 2. All regions at earlier timepoints
+        # But not regions at later timepoints
+        causal_mask = self._create_spatio_temporal_mask(T, N, x.device)
+        
         res = x
-        x = self.spatial_model(x, x, x)[0]
-        x = x + res
         x = self.norm_1(x)
-
-        # --- Swap T and N for temporal modeling ---
-        # (B*T, N, D) -> (B, T, N, D)
-        x = x.view(B, T, N, D)
-        # Swap T and N: (B, T, N, D) -> (B, N, T, D)
-        x = x.permute(0, 2, 1, 3).contiguous()
-        # (B, N, T, D) -> (B*N, T, D)
-        x = x.view(B * N, T, D)
-
-        res = x
-        x = self.temporal_model(x)
+        
+        # Apply RoPE embeddings to inform attention about relative time locations
+        x_rope = self._apply_rotary_pos_emb(x, seq_dim=1)
+        
+        # Apply combined spatio-temporal attention
+        x = self.spatio_temporal_model(x_rope, x_rope, x, attn_mask=causal_mask)[0]
         x = x + res
+
+        # Reshape back to original dimensions
+        # (B, T*N, D) -> (B, T, N, D)
+        x = x.contiguous().view(B, T, N, D)
+        
+        res = x
         x = self.norm_2(x)
-
-        # --- Restore original axes ---
-        # (B*N, T, D) -> (B, N, T, D)
-        x = x.view(B, N, T, D)
-        # Swap back: (B, N, T, D) -> (B, T, N, D)
-        x = x.permute(0, 2, 1, 3).contiguous()
-
-        # --- MLP block ---
-        res = x
-        x = self.mlp(x)
+        
+        # Apply FFN
+        x = self.FFN(x)
         x = x + res
-        if apply_last_norm:
-            x = self.norm_3(x)
+        
         # Output shape: (B, T, N, D)
         return x
 
@@ -69,12 +139,14 @@ class SpatialModel(nn.Module):
         self.n_heads = n_heads
         self.n_regions = n_regions
         self.spatial_model = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm = RMSNorm(d_model)
 
     def forward(self, x):
         # expects x of shape (batch_size, seq_len, n_regions, d_model)
         B, T, N, D = x.shape
         x = x.reshape(B * T, N, D)
         res = x
+        x = self.norm(x)
         x = self.spatial_model(x, x, x)[0]
         x = x + res
         # Output shape: (B, T, N, D)
@@ -103,7 +175,6 @@ class GBM(nn.Module):
 
         self.final_spatial_mixer = SpatialModel(d_model, n_heads, self.n_regions)
 
-        self.first_norm = RMSNorm(d_model)
 
         # initialize the autoencoder which has frozen weights
         self.autoencoder = ConvNormEncoder(
@@ -137,7 +208,7 @@ class GBM(nn.Module):
             self.autoencoder.load_state_dict(cleaned_state_dict)
 
 
-    def forward(self, x, get_logits=True):
+    def forward(self, x, get_logits=True,):
         # Takes as input sequences of shape (batch_size, seq_len, volume_size**)
         # Returns sequences of shape (batch_size, seq_len, volume_size**)
         B, T, *vol_size = x.shape
@@ -159,16 +230,16 @@ class GBM(nn.Module):
         # Move hidden_channels to the end, then flatten spatial dims to n_regions
         x = x.permute(0, 1, 3, 4, 5, 2).reshape(B, T, self.n_regions, self.d_model) # (B, T, n_regions, d_model)
 
-        x = self.first_norm(x)
-
+        
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, apply_last_norm = True)# i != len(self.layers) - 1) # (B, T, n_regions, d_model)
+            x = layer(x)
+
 
         x = self.final_spatial_mixer(x)
 
         # Reshape n_regions back to (n_blocks_x, n_blocks_y, n_blocks_z, d_model)
-        x = x.view(B, T, self.n_blocks_x, self.n_blocks_y, self.n_blocks_z, self.d_model)  # (B, T, n_blocks_x, n_blocks_y, n_blocks_z, d_model)
+        x = x.contiguous().view(B, T, self.n_blocks_x, self.n_blocks_y, self.n_blocks_z, self.d_model)  # (B, T, n_blocks_x, n_blocks_y, n_blocks_z, d_model)
 
         # Move d_model to channel position for decoder: (B, T, d_model, n_blocks_x, n_blocks_y, n_blocks_z)
         x = x.permute(0, 1, 5, 2, 3, 4)
@@ -177,9 +248,9 @@ class GBM(nn.Module):
         x = self.autoencoder.decode(x, get_logits=True, apply_norm=True)
 
         # Reshape back to original volume shape: (B, T, X, Y, Z)
-        x = x.reshape(B, T, vol_x, vol_y, vol_z)
+        x = x.contiguous().reshape(B, T, vol_x, vol_y, vol_z)
 
-        x = x + torch.logit(jump_res, eps=1e-5)
+        x = x + torch.logit(jump_res, eps=1e-4)
 
         if get_logits:
             return x
@@ -209,6 +280,3 @@ class GBM(nn.Module):
 
         # Return the full sequence including the original init_x and the generated steps
         return current_sequence
-
-
-    
