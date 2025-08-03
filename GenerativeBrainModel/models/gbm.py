@@ -14,14 +14,15 @@ class FFN(nn.Module):
     def __init__(self, d_model, d_ff):
         super(FFN, self).__init__()
         self.linear_1 = nn.Linear(d_model, d_ff)        
-        self.linear_2 = nn.Linear(d_model, d_ff)
+        self.linear_2 = nn.Linear(d_ff, d_model)
         self.act = nn.SiLU()
         self.linear_3 = nn.Linear(d_ff, d_model)
     
     def forward(self, x):
         x1 = self.act(self.linear_1(x))
         x2 = self.linear_2(x)
-        return self.linear_3(x2 * x1)
+        x = self.linear_3(x2 * x1)
+        return x
 
 
 class SpatioTemporalRegionModel(nn.Module):
@@ -30,10 +31,11 @@ class SpatioTemporalRegionModel(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_regions = n_regions
-        # Combined spatio-temporal attention model
-        self.spatio_temporal_model = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.spatial_model = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.temporal_model = nn.MultiheadAttention(d_model, n_heads, batch_first=True)#Mamba(d_model=d_model)
         self.norm_1 = RMSNorm(d_model)
         self.norm_2 = RMSNorm(d_model)
+        self.norm_3 = RMSNorm(d_model)
 
         self.FFN = FFN(d_model, d_model*2)
         
@@ -66,69 +68,63 @@ class SpatioTemporalRegionModel(nn.Module):
         x_rot[..., 1::2] = x[..., 0::2] * sin_pos + x[..., 1::2] * cos_pos
         
         return x_rot
-        
-    def _create_spatio_temporal_mask(self, T, N, device):
-        """
-        Create a causal mask for spatio-temporal attention.
-        This mask allows each region to attend to:
-        1. All regions at the same timepoint
-        2. All regions at earlier timepoints
-        But not regions at later timepoints.
-        
-        Args:
-            T: Number of timepoints
-            N: Number of regions
-            device: Device to create the mask on
-            
-        Returns:
-            causal_mask: Boolean mask of shape (T*N, T*N)
-        """
-        # Create a causal mask for timepoints
-        time_causal_mask = torch.triu(torch.ones(T, T, device=device), diagonal=1).bool()
-        
-        # Expand to include all regions within each timepoint
-        # The mask should be (T*N, T*N) where each region can attend to all regions
-        # at the same or earlier timepoints
-        causal_mask = time_causal_mask.repeat_interleave(N, dim=0).repeat_interleave(N, dim=1)
-        
-        return causal_mask
 
     def forward(self, x, apply_last_norm=True):
         # expects x of shape (batch_size, seq_len, n_regions, d_model)
         B, T, N, D = x.shape
 
-        # Reshape to combine batch and time dimensions for attention
-        # (B, T, N, D) -> (B, T*N, D) where each sequence position contains all regions at that timepoint
-        x = x.contiguous().view(B, T * N, D)
+        # --- Spatial Attention: operate over regions for each timepoint ---
+        # (B, T, N, D) -> (B*T, N, D)
         
-        # Create combined spatio-temporal causal mask
-        # This mask allows each region to attend to:
-        # 1. All regions at the same timepoint
-        # 2. All regions at earlier timepoints
-        # But not regions at later timepoints
-        causal_mask = self._create_spatio_temporal_mask(T, N, x.device)
+        x = x.reshape(B * T, N, D)
+
+        res = x
+        x = self.norm_3(x)
+
+        x = self.spatial_model(x, x, x)[0]
+        x = x + res
         
+
+        # --- Swap T and N for temporal modeling ---
+        # (B*T, N, D) -> (B, T, N, D)
+        x = x.view(B, T, N, D)
+        # Swap T and N: (B, T, N, D) -> (B, N, T, D)
+        x = x.permute(0, 2, 1, 3).contiguous()
+        # (B, N, T, D) -> (B*N, T, D)
+        x = x.view(B * N, T, D)
+
         res = x
         x = self.norm_1(x)
-        
-        # Apply RoPE embeddings to inform attention about relative time locations
+
+        # Apply RoPE embeddings to temporal modeling
         x_rope = self._apply_rotary_pos_emb(x, seq_dim=1)
         
-        # Apply combined spatio-temporal attention
-        x = self.spatio_temporal_model(x_rope, x_rope, x, attn_mask=causal_mask)[0]
+        # Create causal attention mask for temporal modeling
+        T_temporal = x.shape[1]
+        causal_mask = torch.triu(torch.ones(T_temporal, T_temporal, device=x.device), diagonal=1).bool()
+        x = self.temporal_model(x_rope, x_rope, x, attn_mask=causal_mask)[0]
         x = x + res
+        
+        
 
-        # Reshape back to original dimensions
-        # (B, T*N, D) -> (B, T, N, D)
-        x = x.contiguous().view(B, T, N, D)
-        
+        # --- Restore original axes ---
+        # (B*N, T, D) -> (B, N, T, D)
+        x = x.view(B, N, T, D)
+        # Swap back: (B, N, T, D) -> (B, T, N, D)
+        x = x.permute(0, 2, 1, 3).contiguous()
+
         res = x
+
         x = self.norm_2(x)
+
+        # --- MLP block ---
         
-        # Apply FFN
+
         x = self.FFN(x)
-        x = x + res
+
         
+        x = x + res
+            
         # Output shape: (B, T, N, D)
         return x
 
@@ -239,7 +235,7 @@ class GBM(nn.Module):
         x = self.final_spatial_mixer(x)
 
         # Reshape n_regions back to (n_blocks_x, n_blocks_y, n_blocks_z, d_model)
-        x = x.contiguous().view(B, T, self.n_blocks_x, self.n_blocks_y, self.n_blocks_z, self.d_model)  # (B, T, n_blocks_x, n_blocks_y, n_blocks_z, d_model)
+        x = x.view(B, T, self.n_blocks_x, self.n_blocks_y, self.n_blocks_z, self.d_model)  # (B, T, n_blocks_x, n_blocks_y, n_blocks_z, d_model)
 
         # Move d_model to channel position for decoder: (B, T, d_model, n_blocks_x, n_blocks_y, n_blocks_z)
         x = x.permute(0, 1, 5, 2, 3, 4)
@@ -248,7 +244,7 @@ class GBM(nn.Module):
         x = self.autoencoder.decode(x, get_logits=True, apply_norm=True)
 
         # Reshape back to original volume shape: (B, T, X, Y, Z)
-        x = x.contiguous().reshape(B, T, vol_x, vol_y, vol_z)
+        x = x.reshape(B, T, vol_x, vol_y, vol_z)
 
         x = x + torch.logit(jump_res, eps=1e-4)
 
