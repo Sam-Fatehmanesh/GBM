@@ -14,7 +14,7 @@ class FFN(nn.Module):
     def __init__(self, d_model, d_ff):
         super(FFN, self).__init__()
         self.linear_1 = nn.Linear(d_model, d_ff)        
-        self.linear_2 = nn.Linear(d_ff, d_model)
+        self.linear_2 = nn.Linear(d_model, d_ff)
         self.act = nn.SiLU()
         self.linear_3 = nn.Linear(d_ff, d_model)
     
