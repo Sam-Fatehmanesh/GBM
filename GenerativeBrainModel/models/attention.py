@@ -12,7 +12,7 @@ from mamba_ssm import Mamba2 as Mamba
 
 class SpatialRegionAttention(nn.Module):
     def __init__(self, d_model, n_heads, n_regions):
-        super(SpatialModel, self).__init__()
+        super(SpatialRegionAttention, self).__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_regions = n_regions
@@ -34,7 +34,7 @@ class SpatialRegionAttention(nn.Module):
 
 class TemporalRegionAttention(nn.Module):
     def __init__(self, d_model, n_heads, n_regions):
-        super(TemporalModel, self).__init__()
+        super(TemporalRegionAttention, self).__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_regions = n_regions
@@ -110,7 +110,7 @@ class VoxelAttention(nn.Module):
         ----
         dim : number of channels C
         """
-        super().__init__()
+        super(VoxelAttention, self).__init__()
         self.norm   = Conv4dRMSNorm(dim)
         self.to_qkv = nn.Conv3d(dim, dim * 3, kernel_size=1, bias=False)
         self.proj   = nn.Conv3d(dim, dim,     kernel_size=1, bias=False)

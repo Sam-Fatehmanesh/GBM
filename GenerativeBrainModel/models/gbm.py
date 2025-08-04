@@ -11,7 +11,6 @@ import pdb
 import os
 
 
-
 class GBM(nn.Module):
     def __init__(self, d_model, n_heads, n_layers, autoencoder_path=None, volume_size=(256, 128, 30), region_size=(32, 16, 2)):
         super(GBM, self).__init__()
@@ -66,7 +65,7 @@ class GBM(nn.Module):
             self.autoencoder.load_state_dict(cleaned_state_dict)
 
 
-    def forward(self, x, get_logits=True,):
+    def forward(self, x, get_logits=True):
         # Takes as input sequences of shape (batch_size, seq_len, volume_size**)
         # Returns sequences of shape (batch_size, seq_len, volume_size**)
         B, T, *vol_size = x.shape

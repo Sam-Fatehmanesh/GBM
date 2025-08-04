@@ -18,7 +18,7 @@ class MLP(nn.Module):
                 nn.GELU(),
             )
             self.hidden_layers.append(layer)
-
+    
         self.output_layer = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
