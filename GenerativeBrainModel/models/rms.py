@@ -43,3 +43,41 @@ class RMSNorm(nn.Module):
             return self.scale * x_normed + self.offset
 
         return self.scale * x_normed
+
+class Conv3dRMSNorm(nn.Module):
+    """
+    RMSNorm wrapper for 3D convolution tensors.
+    
+    Handles the dimension reshaping needed to apply RMSNorm to conv3d output tensors
+    where the channel dimension is at index 1 instead of the last dimension.
+    """
+    
+    def __init__(self, hidden_channels: int):
+        super(Conv3dRMSNorm, self).__init__()
+        self.rms_norm = RMSNorm(hidden_channels)
+        
+    def forward(self, x):
+        """
+        Apply RMSNorm to conv3d tensor.
+        
+        Args:
+            x: Input tensor of shape (B, C, D, H, W) where C is the channel dimension
+            
+        Returns:
+            RMS normalized tensor of same shape
+        """
+        # Input shape: (B, C, D, H, W)
+        B, C, D, H, W = x.shape
+        
+        # Reshape to (B*D*H*W, C) so channel dimension is last
+        x_reshaped = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, D, H, W, C)
+        x_reshaped = x_reshaped.view(-1, C)  # (B*D*H*W, C)
+        
+        # Apply RMSNorm
+        x_normed = self.rms_norm(x_reshaped)  # (B*D*H*W, C)
+        
+        # Reshape back to original shape
+        x_normed = x_normed.view(B, D, H, W, C)  # (B, D, H, W, C)
+        x_normed = x_normed.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, D, H, W)
+        
+        return x_normed
