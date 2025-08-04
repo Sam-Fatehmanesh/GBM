@@ -218,7 +218,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     
     # Use safer defaults for DataLoader memory usage. Users can override via config.
     dl_kwargs = {
-        'batch_size': training_config.get('volumes_per_batch', 4),
+        'batch_size': training_config.get('batch_size', 4),
         'num_workers': training_config.get('num_workers', 2),
         'pin_memory': training_config.get('pin_memory', False),  # Pinning large 3-D volumes quickly exhausts shared memory
         'persistent_workers': training_config.get('persistent_workers', False),
