@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+
 class RMSNorm(nn.Module):
     def __init__(self, d, p=-1., eps=1e-8, bias=False):
         """
@@ -61,23 +62,61 @@ class Conv3dRMSNorm(nn.Module):
         Apply RMSNorm to conv3d tensor.
         
         Args:
-            x: Input tensor of shape (B, C, D, H, W) where C is the channel dimension
+            x: Input tensor of shape (B, C, W, H, D) where C is the channel dimension
             
         Returns:
             RMS normalized tensor of same shape
         """
-        # Input shape: (B, C, D, H, W)
-        B, C, D, H, W = x.shape
+        # Input shape: (B, C, W, H, D)
+        B, C, W, H, D = x.shape
         
         # Reshape to (B*D*H*W, C) so channel dimension is last
-        x_reshaped = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, D, H, W, C)
+        x_reshaped = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, W, H, D, C)
         x_reshaped = x_reshaped.view(-1, C)  # (B*D*H*W, C)
         
         # Apply RMSNorm
         x_normed = self.rms_norm(x_reshaped)  # (B*D*H*W, C)
         
         # Reshape back to original shape
-        x_normed = x_normed.view(B, D, H, W, C)  # (B, D, H, W, C)
-        x_normed = x_normed.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, D, H, W)
+        x_normed = x_normed.view(B, W, H, D, C)  # (B, W, H, D, C)
+        x_normed = x_normed.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, W, H, D)
+        
+        return x_normed
+
+class Conv4dRMSNorm(nn.Module):
+    """
+    RMSNorm wrapper for 4D convolution tensors with time dimension.
+    
+    Handles the dimension reshaping needed to apply RMSNorm to conv4d output tensors
+    where input has shape (B, T, C, W, H, D) and we normalize over channel dimension.
+    """
+    
+    def __init__(self, hidden_channels: int):
+        super(Conv4dRMSNorm, self).__init__()
+        self.rms_norm = RMSNorm(hidden_channels)
+        
+    def forward(self, x):
+        """
+        Apply RMSNorm to conv4d tensor.
+        
+        Args:
+            x: Input tensor of shape (B, T, C, W, H, D) where C is the channel dimension
+            
+        Returns:
+            RMS normalized tensor of same shape
+        """
+        # Input shape: (B, T, C, W, H, D)
+        B, T, C, W, H, D = x.shape
+        
+        # Reshape to (B*T*W*H*D, C) so channel dimension is last
+        x_reshaped = x.permute(0, 1, 3, 4, 5, 2).contiguous()  # (B, T, W, H, D, C)
+        x_reshaped = x_reshaped.view(-1, C)  # (B*T*W*H*D, C)
+        
+        # Apply RMSNorm
+        x_normed = self.rms_norm(x_reshaped)  # (B*T*W*H*D, C)
+        
+        # Reshape back to original shape
+        x_normed = x_normed.view(B, T, W, H, D, C)  # (B, T, W, H, D, C)
+        x_normed = x_normed.permute(0, 1, 5, 2, 3, 4).contiguous()  # (B, T, C, W, H, D)
         
         return x_normed

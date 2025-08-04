@@ -5,9 +5,6 @@ from GenerativeBrainModel.models.posencode import RandomFourier3DEncoding
 from GenerativeBrainModel.models.rms import RMSNorm, Conv3dRMSNorm
 
 
-
-
-
 class ConvNormEncoder(nn.Module):
     """
     Convolutional autoencoder with RMS normalization and 3D positional encoding.

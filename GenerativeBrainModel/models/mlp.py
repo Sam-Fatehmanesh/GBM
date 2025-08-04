@@ -37,3 +37,21 @@ class MLP(nn.Module):
         x = self.output_layer(x)
 
         return x
+
+class FFN(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super(FFN, self).__init__()
+        self.linear_1 = nn.Linear(d_model, d_ff)        
+        self.linear_2 = nn.Linear(d_model, d_ff)
+        self.act = nn.SiLU()
+        self.linear_3 = nn.Linear(d_ff, d_model)
+        self.norm = RMSNorm(d_model)
+    
+    def forward(self, x):
+        res = x
+        x = self.norm(x)
+        x1 = self.act(self.linear_1(x))
+        x2 = self.linear_2(x)
+        x = self.linear_3(x2 * x1)
+        x = x + res
+        return x
