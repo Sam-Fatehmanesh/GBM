@@ -304,32 +304,41 @@ class TrainingMetricsTracker:
     Training metrics tracker with exponential moving average and CSV logging.
     
     Tracks training loss with EMA smoothing and logs to CSV for analysis.
-    Supports both single loss and multi-component loss tracking (e.g., for VAE).
+    Supports both single loss and multi-component loss tracking (e.g., for VAE/VQ-VAE).
     """
     
-    def __init__(self, csv_path: Union[str, Path], ema_alpha: float = 0.1, track_loss_components: bool = False):
+    def __init__(self, csv_path: Union[str, Path], ema_alpha: float = 0.1, track_loss_components: bool = False, loss_component_type: str = 'vae'):
         """
         Initialize training metrics tracker.
         
         Args:
             csv_path: Path to save training metrics CSV
             ema_alpha: EMA smoothing factor for loss tracking
-            track_loss_components: Whether to track separate loss components (total, reconstruction, KL)
+            track_loss_components: Whether to track separate loss components (total, reconstruction, KL/commitment)
+            loss_component_type: Type of loss components to track ('vae' for KL, 'vqvae' for commitment)
         """
         self.logger = logging.getLogger(__name__)
         self.track_loss_components = track_loss_components
+        self.loss_component_type = loss_component_type
         
         # Initialize EMA trackers
         self.loss_ema = ExponentialMovingAverage(alpha=ema_alpha)
         
         if track_loss_components:
             self.recon_loss_ema = ExponentialMovingAverage(alpha=ema_alpha)
-            self.kl_loss_ema = ExponentialMovingAverage(alpha=ema_alpha)
             
-            # Define CSV fields for VAE training metrics
-            fieldnames = ['epoch', 'batch_idx', 'total_loss', 'total_loss_ema', 
-                         'reconstruction_loss', 'reconstruction_loss_ema',
-                         'kl_loss', 'kl_loss_ema', 'beta', 'learning_rate']
+            if loss_component_type == 'vqvae':
+                self.commitment_loss_ema = ExponentialMovingAverage(alpha=ema_alpha)
+                # Define CSV fields for VQ-VAE training metrics
+                fieldnames = ['epoch', 'batch_idx', 'total_loss', 'total_loss_ema', 
+                             'reconstruction_loss', 'reconstruction_loss_ema',
+                             'commitment_loss', 'commitment_loss_ema', 'beta', 'learning_rate']
+            else:
+                self.kl_loss_ema = ExponentialMovingAverage(alpha=ema_alpha)
+                # Define CSV fields for VAE training metrics
+                fieldnames = ['epoch', 'batch_idx', 'total_loss', 'total_loss_ema', 
+                             'reconstruction_loss', 'reconstruction_loss_ema',
+                             'kl_loss', 'kl_loss_ema', 'beta', 'learning_rate']
         else:
             # Define CSV fields for standard training metrics
             fieldnames = ['epoch', 'batch_idx', 'training_loss', 'training_loss_ema', 'learning_rate']
@@ -343,6 +352,7 @@ class TrainingMetricsTracker:
                          learning_rate: float,
                          reconstruction_loss: Optional[float] = None,
                          kl_loss: Optional[float] = None,
+                         commitment_loss: Optional[float] = None,
                          beta: Optional[float] = None):
         """
         Log training step metrics including EMA loss.
@@ -350,33 +360,63 @@ class TrainingMetricsTracker:
         Args:
             epoch: Current epoch number
             batch_idx: Current batch index within epoch
-            loss: Training loss for this batch (total loss for VAE)
+            loss: Training loss for this batch (total loss for VAE/VQ-VAE)
             learning_rate: Current learning rate
-            reconstruction_loss: Reconstruction loss component (VAE only)
+            reconstruction_loss: Reconstruction loss component (VAE/VQ-VAE)
             kl_loss: KL divergence loss component (VAE only)
-            beta: Beta weight for KL loss (VAE only)
+            commitment_loss: Commitment loss component (VQ-VAE only)
+            beta: Beta weight for KL/commitment loss
         """
         # Update EMA for total loss
         ema_loss = self.loss_ema.update(loss)
         
-        if self.track_loss_components and reconstruction_loss is not None and kl_loss is not None:
-            # Update EMAs for loss components
+        if self.track_loss_components and reconstruction_loss is not None:
+            # Update EMA for reconstruction loss
             ema_recon_loss = self.recon_loss_ema.update(reconstruction_loss)
-            ema_kl_loss = self.kl_loss_ema.update(kl_loss)
             
-            # Prepare VAE metrics dictionary
-            metrics = {
-                'epoch': epoch,
-                'batch_idx': batch_idx,
-                'total_loss': loss,
-                'total_loss_ema': ema_loss,
-                'reconstruction_loss': reconstruction_loss,
-                'reconstruction_loss_ema': ema_recon_loss,
-                'kl_loss': kl_loss,
-                'kl_loss_ema': ema_kl_loss,
-                'beta': beta,
-                'learning_rate': learning_rate
-            }
+            if self.loss_component_type == 'vqvae' and commitment_loss is not None:
+                # VQ-VAE mode
+                ema_commitment_loss = self.commitment_loss_ema.update(commitment_loss)
+                
+                # Prepare VQ-VAE metrics dictionary
+                metrics = {
+                    'epoch': epoch,
+                    'batch_idx': batch_idx,
+                    'total_loss': loss,
+                    'total_loss_ema': ema_loss,
+                    'reconstruction_loss': reconstruction_loss,
+                    'reconstruction_loss_ema': ema_recon_loss,
+                    'commitment_loss': commitment_loss,
+                    'commitment_loss_ema': ema_commitment_loss,
+                    'beta': beta,
+                    'learning_rate': learning_rate
+                }
+            elif self.loss_component_type == 'vae' and kl_loss is not None:
+                # VAE mode
+                ema_kl_loss = self.kl_loss_ema.update(kl_loss)
+                
+                # Prepare VAE metrics dictionary
+                metrics = {
+                    'epoch': epoch,
+                    'batch_idx': batch_idx,
+                    'total_loss': loss,
+                    'total_loss_ema': ema_loss,
+                    'reconstruction_loss': reconstruction_loss,
+                    'reconstruction_loss_ema': ema_recon_loss,
+                    'kl_loss': kl_loss,
+                    'kl_loss_ema': ema_kl_loss,
+                    'beta': beta,
+                    'learning_rate': learning_rate
+                }
+            else:
+                # Fallback to standard metrics if component type doesn't match
+                metrics = {
+                    'epoch': epoch,
+                    'batch_idx': batch_idx,
+                    'training_loss': loss,
+                    'training_loss_ema': ema_loss,
+                    'learning_rate': learning_rate
+                }
         else:
             # Prepare standard metrics dictionary
             metrics = {
@@ -395,22 +435,31 @@ class TrainingMetricsTracker:
         return self.loss_ema.get_value()
     
     def get_current_component_emas(self) -> Dict[str, Optional[float]]:
-        """Get current EMA values for all loss components (VAE mode only)."""
+        """Get current EMA values for all loss components (VAE/VQ-VAE mode)."""
         if not self.track_loss_components:
             return {'total_loss_ema': self.loss_ema.get_value()}
         
-        return {
+        emas = {
             'total_loss_ema': self.loss_ema.get_value(),
-            'reconstruction_loss_ema': self.recon_loss_ema.get_value(),
-            'kl_loss_ema': self.kl_loss_ema.get_value()
+            'reconstruction_loss_ema': self.recon_loss_ema.get_value()
         }
+        
+        if self.loss_component_type == 'vqvae':
+            emas['commitment_loss_ema'] = self.commitment_loss_ema.get_value()
+        else:
+            emas['kl_loss_ema'] = self.kl_loss_ema.get_value()
+        
+        return emas
     
     def reset_ema(self):
         """Reset EMA trackers (useful for new epochs or experiments)."""
         self.loss_ema.reset()
         if self.track_loss_components:
             self.recon_loss_ema.reset()
-            self.kl_loss_ema.reset()
+            if self.loss_component_type == 'vqvae':
+                self.commitment_loss_ema.reset()
+            else:
+                self.kl_loss_ema.reset()
 
 
 class PlotGenerator:
@@ -524,10 +573,14 @@ class PlotGenerator:
         if x_val is not None and len(x_val) > 0:
             x_max = max(x_max, x_val.max())
         
-        # Check if we have VAE loss components to determine subplot layout
-        has_loss_components = (not training_df.empty and 
-                              'reconstruction_loss' in training_df.columns and 
-                              'kl_loss' in training_df.columns)
+        # Check if we have VAE or VQ-VAE loss components to determine subplot layout
+        has_vae_components = (not training_df.empty and 
+                             'reconstruction_loss' in training_df.columns and 
+                             'kl_loss' in training_df.columns)
+        has_vqvae_components = (not training_df.empty and 
+                               'reconstruction_loss' in training_df.columns and 
+                               'commitment_loss' in training_df.columns)
+        has_loss_components = has_vae_components or has_vqvae_components
         
         # Create figure with appropriate number of subplots
         if has_loss_components:
@@ -555,7 +608,7 @@ class PlotGenerator:
         ax1.grid(True, alpha=0.3)
         ax1.set_xlim(x_min, x_max)  # Unified x-axis
         
-        # Plot 2: Reconstruction Loss (VAE only)
+        # Plot 2: Reconstruction Loss (VAE/VQ-VAE)
         if has_loss_components:
             ax2 = axes[1]
             if not training_df.empty and x_train is not None:
@@ -571,15 +624,20 @@ class PlotGenerator:
             ax2.grid(True, alpha=0.3)
             ax2.set_xlim(x_min, x_max)
             
-            # Plot 3: KL Divergence Loss (VAE only)
+            # Plot 3: KL Divergence Loss (VAE) or Commitment Loss (VQ-VAE)
             ax3 = axes[2]
             if not training_df.empty and x_train is not None:
-                if 'kl_loss' in training_df.columns:
+                if has_vae_components and 'kl_loss' in training_df.columns:
                     ax3.plot(x_train, training_df['kl_loss'], alpha=0.3, color='orange', label='Batch KL Loss')
                     if 'kl_loss_ema' in training_df.columns:
                         ax3.plot(x_train, training_df['kl_loss_ema'], color='darkorange', label='EMA KL Loss', linewidth=2)
+                    ax3.set_title('KL Divergence Loss')
+                elif has_vqvae_components and 'commitment_loss' in training_df.columns:
+                    ax3.plot(x_train, training_df['commitment_loss'], alpha=0.3, color='purple', label='Batch Commitment Loss')
+                    if 'commitment_loss_ema' in training_df.columns:
+                        ax3.plot(x_train, training_df['commitment_loss_ema'], color='darkviolet', label='EMA Commitment Loss', linewidth=2)
+                    ax3.set_title('Commitment Loss')
             
-            ax3.set_title('KL Divergence Loss')
             ax3.set_ylabel('Loss')
             if ax3.lines:
                 ax3.legend()
@@ -634,7 +692,7 @@ class CombinedMetricsTracker:
     Combined metrics tracker for both training and validation.
     
     Provides a unified interface for tracking all metrics in a training run.
-    Supports both standard training and VAE training with loss components.
+    Supports both standard training and VAE/VQ-VAE training with loss components.
     """
     
     def __init__(self, 
@@ -642,7 +700,8 @@ class CombinedMetricsTracker:
                  validation_threshold: float = 0.5,
                  ema_alpha: float = 0.1,
                  enable_plotting: bool = True,
-                 track_loss_components: bool = False):
+                 track_loss_components: bool = False,
+                 loss_component_type: str = 'vae'):
         """
         Initialize combined metrics tracker.
         
@@ -651,16 +710,19 @@ class CombinedMetricsTracker:
             validation_threshold: Binary classification threshold for validation
             ema_alpha: EMA smoothing factor for training loss
             enable_plotting: Whether to generate plots during training
-            track_loss_components: Whether to track separate loss components (VAE mode)
+            track_loss_components: Whether to track separate loss components (VAE/VQ-VAE mode)
+            loss_component_type: Type of loss components to track ('vae' for KL, 'vqvae' for commitment)
         """
         log_dir = Path(log_dir)
         self.track_loss_components = track_loss_components
+        self.loss_component_type = loss_component_type
         
         # Initialize individual trackers
         self.training_tracker = TrainingMetricsTracker(
             csv_path=log_dir / 'training_metrics.csv',
             ema_alpha=ema_alpha,
-            track_loss_components=track_loss_components
+            track_loss_components=track_loss_components,
+            loss_component_type=loss_component_type
         )
         
         self.validation_tracker = ValidationMetricsTracker(
@@ -681,7 +743,7 @@ class CombinedMetricsTracker:
         self.logger = logging.getLogger(__name__)
         self.logger.info(f"Combined metrics tracker initialized in: {log_dir}")
         if track_loss_components:
-            self.logger.info("VAE loss component tracking enabled")
+            self.logger.info(f"{loss_component_type.upper()} loss component tracking enabled")
         if enable_plotting:
             self.logger.info(f"Plot generation enabled in: {plots_dir}")
     
@@ -692,6 +754,7 @@ class CombinedMetricsTracker:
                          learning_rate: float,
                          reconstruction_loss: Optional[float] = None,
                          kl_loss: Optional[float] = None,
+                         commitment_loss: Optional[float] = None,
                          beta: Optional[float] = None):
         """
         Log training step metrics.
@@ -699,15 +762,16 @@ class CombinedMetricsTracker:
         Args:
             epoch: Current epoch number
             batch_idx: Current batch index within epoch
-            loss: Training loss for this batch (total loss for VAE)
+            loss: Training loss for this batch (total loss for VAE/VQ-VAE)
             learning_rate: Current learning rate
-            reconstruction_loss: Reconstruction loss component (VAE only)
+            reconstruction_loss: Reconstruction loss component (VAE/VQ-VAE)
             kl_loss: KL divergence loss component (VAE only)
-            beta: Beta weight for KL loss (VAE only)
+            commitment_loss: Commitment loss component (VQ-VAE only)
+            beta: Beta weight for KL/commitment loss
         """
         self.training_tracker.log_training_step(
             epoch, batch_idx, loss, learning_rate,
-            reconstruction_loss, kl_loss, beta
+            reconstruction_loss, kl_loss, commitment_loss, beta
         )
     
     def log_validation_step(self, 
