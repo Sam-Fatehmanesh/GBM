@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-3D Volumetric Spike Processing Pipeline
+Spike Probability Processing Pipeline
 
-This script processes calcium traces using CASCADE spike detection and creates
-3D volumetric representations of neural activity. Each timepoint becomes a 
-single 3D volume with continuous probability values.
+This script processes calcium traces using CASCADE spike detection and saves
+spike probabilities as time series data along with cell spatial positions.
+No volumetric conversion is performed - data is saved directly as probability
+time series and 3D position coordinates.
 
 Features:
 - CASCADE-only spike detection (no OASIS or binary spikes)
-- 3D volumetric representation of neural activity
+- Direct spike probability time series output (T, N) format
+- Cell spatial positions preserved as (N, 3) coordinates
 - YAML configuration support
 - Continuous probability values only
-- No augmentations or grid transformations
+- Configurable float16/float32 output data types
 """
 
 import os
@@ -80,13 +82,14 @@ def create_default_config():
             'seed': 42,
             'original_sampling_rate': None,  # Required for CASCADE
             'target_sampling_rate': None,    # Required for CASCADE
+            'return_to_original_rate': False,  # If True, downsample neural data back to original rate after CASCADE
         },
         'cascade': {
             'model_type': 'Global_EXC_2Hz_smoothing500ms',
         },
-        'volumization': {
-            'volume_shape': [64, 64, 32],  # [x, y, z] dimensions
-            'dtype': 'float16',
+        'output': {
+            'dtype': 'float16',  # Data type for probabilities and positions
+            'include_additional_data': True,  # Include anat_stack, stimulus, behavior, eye data
         }
     }
 
@@ -228,106 +231,7 @@ def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_
     
     return prob_data
 
-def create_3d_volumes(prob_data, cell_positions, volume_shape, dtype='float16'):
-    """
-    Convert spike probabilities to 3D volumetric format.
-    
-    Args:
-        prob_data: (N, T) array of spike probabilities
-        cell_positions: (N, 3) array of cell positions
-        volume_shape: [x, y, z] dimensions of output volume
-        dtype: Data type for output volumes
-        
-    Returns:
-        volumes: (T, x, y, z) array of volumetric data
-        metadata: Dictionary containing dataset metadata
-    """
-    N, T = prob_data.shape
-    x_size, y_size, z_size = volume_shape
-    
-    # Handle NaN values in cell positions
-    if np.isnan(cell_positions).any():
-        print("Warning: NaN values found in cell positions, replacing with 0")
-        cell_positions = np.nan_to_num(cell_positions)
-    
-    # Handle NaN values in probability data
-    prob_data = np.nan_to_num(prob_data, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    print(f"Creating 3D volumes with shape {volume_shape} from {N} cells and {T} timepoints")
-    
-    # Normalize cell positions to [0, 1]
-    pos_min = cell_positions.min(axis=0)
-    pos_max = cell_positions.max(axis=0)
-    pos_range = pos_max - pos_min
-    
-    # Handle case where range is 0 (all cells at same position)
-    pos_range[pos_range == 0] = 1
-    
-    normalized_positions = (cell_positions - pos_min) / pos_range
-    
-    # Convert to volume indices
-    volume_x = np.floor(normalized_positions[:, 0] * (x_size - 1)).astype(np.int32)
-    volume_y = np.floor(normalized_positions[:, 1] * (y_size - 1)).astype(np.int32)
-    volume_z = np.floor(normalized_positions[:, 2] * (z_size - 1)).astype(np.int32)
-    
-    # Create volumes
-    volume_dtype = getattr(np, dtype)
-    volumes = np.zeros((T, x_size, y_size, z_size), dtype=volume_dtype)
-    
-    print("Converting probabilities to 3D volumes...")
-    
-    # Vectorized processing using numpy operations
-    # Create flat indices for 3D volume
-    flat_indices = volume_x * (y_size * z_size) + volume_y * z_size + volume_z
-    
-    for t in tqdm(range(T), desc="Processing timepoints"):
-        probs_t = prob_data[:, t]
-        
-        # Find active cells
-        active_mask = probs_t > 1e-6
-        if not np.any(active_mask):
-            continue
-            
-        active_probs = probs_t[active_mask]
-        active_indices = flat_indices[active_mask]
-        
-        # Use numpy's bincount for efficient aggregation
-        # First, sort by indices to group identical voxels
-        sort_order = np.argsort(active_indices)
-        sorted_indices = active_indices[sort_order]
-        sorted_probs = active_probs[sort_order]
-        
-        # Find unique voxel indices and their positions
-        unique_indices, inverse_indices = np.unique(sorted_indices, return_inverse=True)
-        
-        # Compute probability for each unique voxel
-        # Using log-space to avoid underflow: 1 - exp(sum(log(1-p)))
-        log_probs = np.log1p(-np.clip(sorted_probs, 0, 1))
-        
-        # Sum log probabilities for each unique voxel
-        voxel_log_probs = np.zeros(len(unique_indices))
-        np.add.at(voxel_log_probs, inverse_indices, log_probs)
-        
-        # Convert back to probability space
-        voxel_probs = 1.0 - np.exp(voxel_log_probs)
-        
-        # Convert flat indices back to 3D coordinates
-        x_coords = unique_indices // (y_size * z_size)
-        yz_coords = unique_indices % (y_size * z_size)
-        y_coords = yz_coords // z_size
-        z_coords = yz_coords % z_size
-        
-        # Assign probabilities to volume
-        volumes[t, x_coords, y_coords, z_coords] = voxel_probs.astype(volume_dtype)
 
-    # Create metadata
-    metadata = {
-        'num_timepoints': T,
-        'volume_shape': volume_shape,
-        'dtype': dtype
-    }
-    
-    return volumes, metadata
 
 def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path, num_neurons=10):
     """
@@ -398,13 +302,46 @@ def process_subject(subject_dir, config):
         # Load raw data
         print("  → Loading raw data...")
         
-        # Load cell positions
+        # Load cell positions and additional datasets
         mat = loadmat(os.path.join(subject_dir, 'data_full.mat'))
         data0 = mat['data'][0, 0]
         cell_xyz = data0['CellXYZ']
         
         if isinstance(cell_xyz, np.ndarray) and cell_xyz.dtype == np.object_:
             cell_xyz = cell_xyz[0, 0]
+        
+        # Load additional datasets
+        print("  → Loading additional datasets from MATLAB file...")
+        
+        # Anatomical stack
+        anat_stack = data0['anat_stack']
+        if isinstance(anat_stack, np.ndarray) and anat_stack.dtype == np.object_:
+            anat_stack = anat_stack[0, 0]
+        
+        # Sampling rate
+        fpsec = data0['fpsec']
+        if isinstance(fpsec, np.ndarray) and fpsec.dtype == np.object_:
+            fpsec = fpsec[0, 0]
+        fpsec = float(fpsec.item() if hasattr(fpsec, 'item') else fpsec)
+        
+        # Stimulus data
+        stim_full = data0['stim_full']
+        if isinstance(stim_full, np.ndarray) and stim_full.dtype == np.object_:
+            stim_full = stim_full[0, 0]
+        stim_full = np.squeeze(stim_full)  # Remove singleton dimensions
+        
+        # Behavioral data
+        behavior_full = data0['Behavior_full']
+        if isinstance(behavior_full, np.ndarray) and behavior_full.dtype == np.object_:
+            behavior_full = behavior_full[0, 0]
+        
+        # Eye tracking data
+        eye_full = data0['Eye_full']
+        if isinstance(eye_full, np.ndarray) and eye_full.dtype == np.object_:
+            eye_full = eye_full[0, 0]
+        
+        print(f"  → Loaded anat_stack: {anat_stack.shape}, fpsec: {fpsec} Hz")
+        print(f"  → Loaded stim_full: {stim_full.shape}, behavior_full: {behavior_full.shape}, eye_full: {eye_full.shape}")
         
         # Load fluorescence traces
         calcium_dataset = config['data']['calcium_dataset']
@@ -462,11 +399,32 @@ def process_subject(subject_dir, config):
             if 'IX_inval_anat' in data0.dtype.names:
                 inval = data0['IX_inval_anat']
                 if isinstance(inval, np.ndarray) and inval.dtype == np.object_:
-                    inval = inval[0, 0].flatten()
+                    inval = inval[0, 0]
+                
+                # Handle different shapes - flatten if needed
+                if inval.ndim > 1:
+                    inval = inval.flatten()
+                
                 inval_indices = np.array(inval, int) - 1  # Convert to 0-based indexing
-                valid_inval_indices = inval_indices[inval_indices < N_original]
-                if len(valid_inval_indices) > 0:
-                    anatomical_mask[valid_inval_indices] = False
+                
+                # Load the absIX mapping from HDF5 to understand which neurons are which
+                with h5py.File(os.path.join(subject_dir, 'TimeSeries.h5'), 'r') as f_temp:
+                    if 'absIX' in f_temp:
+                        abs_ix = f_temp['absIX'][:].flatten() - 1  # Convert to 0-based
+                        print(f"  → Found absIX mapping: {abs_ix.shape[0]} neurons mapped to full set")
+                        
+                        # Find which of our current neurons (in HDF5) correspond to invalid anatomical indices
+                        invalid_in_current = np.isin(abs_ix, inval_indices)
+                        anatomical_mask = ~invalid_in_current
+                        print(f"  → Marked {np.sum(invalid_in_current)} neurons as anatomically invalid based on absIX mapping")
+                    else:
+                        # Fallback to direct indexing if no absIX available
+                        valid_inval_indices = inval_indices[inval_indices < N_original]
+                        if len(valid_inval_indices) > 0:
+                            anatomical_mask[valid_inval_indices] = False
+                            print(f"  → Marked {len(valid_inval_indices)} neurons as anatomically invalid (direct indexing)")
+            else:
+                print("  → No IX_inval_anat found, keeping all neurons")
             
             # Filter out neurons with invalid coordinates (additional check)
             coordinate_mask = ~np.isnan(cell_xyz).any(axis=1)
@@ -510,36 +468,81 @@ def process_subject(subject_dir, config):
         # Keep a copy of calcium for visualization
         calcium_for_viz = calcium[:, :min(config['processing']['num_neurons_viz'] * 2, N)].copy()
             
-        # Interpolate calcium traces if needed
+        # Interpolate calcium traces and temporal data if needed
         orig_rate = config['processing']['original_sampling_rate']
         target_rate = config['processing']['target_sampling_rate']
+        return_to_original = config['processing'].get('return_to_original_rate', False)
+        
+        # Store original dimensions for potential downsampling later
+        original_T = T
+        upsampled_T = T
         
         if orig_rate is not None and target_rate is not None:
             print(f"  → Interpolating calcium traces from {orig_rate}Hz to {target_rate}Hz...")
                 
             # Create time points
             original_time = np.arange(T) / orig_rate
-            new_T = int(T * target_rate / orig_rate)
-            new_time = np.arange(new_T) / target_rate
+            upsampled_T = int(T * target_rate / orig_rate)
+            new_time = np.arange(upsampled_T) / target_rate
             
             # Interpolate each neuron's trace using PCHIP
             from scipy.interpolate import PchipInterpolator
-            calcium_interpolated = np.zeros((new_T, N), dtype=calcium.dtype)
+            calcium_interpolated = np.zeros((upsampled_T, N), dtype=calcium.dtype)
             
             for n in range(N):
                 interp_func = PchipInterpolator(original_time, calcium[:, n], extrapolate=True)
                 calcium_interpolated[:, n] = interp_func(new_time)
             
             calcium = calcium_interpolated
-            T = new_T
-            print(f"  → Interpolated to {T} timepoints at {target_rate}Hz")
+            T = upsampled_T
+            print(f"  → Interpolated calcium to {T} timepoints at {target_rate}Hz")
+            
+            # Only interpolate non-neural data if we're NOT returning to original rate
+            if not return_to_original:
+                # Interpolate temporal datasets to match using hold interpolation
+                print(f"  → Interpolating temporal datasets with hold interpolation (zero-order hold)...")
+                from scipy.interpolate import interp1d
+                
+                # Hold interpolation for stimulus data (1D) - preserves discrete values
+                if stim_full.shape[0] == len(original_time):
+                    stim_hold_interp = interp1d(original_time, stim_full.astype(float), 
+                                              kind='previous', bounds_error=False, 
+                                              fill_value=(stim_full[0], stim_full[-1]))
+                    stim_full = stim_hold_interp(new_time).astype(stim_full.dtype)
+                
+                # Hold interpolation for behavioral data (2D: behaviors x time)
+                if behavior_full.shape[1] == len(original_time):
+                    behavior_interp = np.zeros((behavior_full.shape[0], upsampled_T), dtype=behavior_full.dtype)
+                    for b in range(behavior_full.shape[0]):
+                        behav_hold_interp = interp1d(original_time, behavior_full[b, :], 
+                                                   kind='previous', bounds_error=False,
+                                                   fill_value=(behavior_full[b, 0], behavior_full[b, -1]))
+                        behavior_interp[b, :] = behav_hold_interp(new_time)
+                    behavior_full = behavior_interp
+                
+                # Hold interpolation for eye tracking data (2D: eye dimensions x time)
+                if eye_full.shape[1] == len(original_time):
+                    eye_interp = np.zeros((eye_full.shape[0], upsampled_T), dtype=eye_full.dtype)
+                    for e in range(eye_full.shape[0]):
+                        eye_hold_interp = interp1d(original_time, eye_full[e, :], 
+                                                 kind='previous', bounds_error=False,
+                                                 fill_value=(eye_full[e, 0], eye_full[e, -1]))
+                        eye_interp[e, :] = eye_hold_interp(new_time)
+                    eye_full = eye_interp
+                
+                print(f"  → Interpolated temporal data: stim_full {stim_full.shape}, behavior_full {behavior_full.shape}, eye_full {eye_full.shape}")
+            else:
+                print(f"  → Keeping temporal data at original rate (will downsample neural data later)")
+        
+        # Use actual sampling rate for further processing
+        effective_sampling_rate = target_rate or orig_rate or fpsec
 
         # Apply baseline correction based on configuration
         processed_calcium = compute_baseline_correction(
             calcium,
             config['data']['window_length'],
             config['data']['baseline_percentile'],
-            target_rate or orig_rate or 2.0,
+            effective_sampling_rate,
             config['data']['is_raw'],
             config['data']['apply_baseline_subtraction']
         )
@@ -553,49 +556,142 @@ def process_subject(subject_dir, config):
             processed_calcium, 
             config['processing']['batch_size'], 
             config['cascade']['model_type'],
-            target_rate or orig_rate or 2.0
+            effective_sampling_rate
                 )
                 
                 # Clean up after CASCADE
         del processed_calcium
         gc.collect()
         
-        # Convert to 3D volumes
-        print("  → Converting to 3D volumetric format...")
-        volumes, metadata = create_3d_volumes(
-            prob_data, 
-            cell_xyz, 
-            config['volumization']['volume_shape'],
-            config['volumization']['dtype']
-        )
+        # Optionally downsample neural data back to original rate
+        if return_to_original and orig_rate is not None and target_rate is not None and orig_rate != target_rate:
+            print(f"  → Downsampling neural data from {target_rate}Hz back to {orig_rate}Hz with anti-aliasing...")
+            from scipy.signal import resample_poly
+            from fractions import Fraction
+            
+            # Calculate the rational resampling factors
+            # We upsampled by target_rate/orig_rate, so we downsample by orig_rate/target_rate
+            rate_ratio = Fraction(orig_rate).limit_denominator() / Fraction(target_rate).limit_denominator()
+            up_factor = rate_ratio.numerator
+            down_factor = rate_ratio.denominator
+            
+            print(f"  → Downsampling with factors: up={up_factor}, down={down_factor}")
+            
+            # Transpose prob_data to (T, N) for processing
+            prob_data_T = prob_data.T  # Shape: (T, N)
+            
+            # Downsample each neuron's probability trace
+            downsampled_prob_data = np.zeros((original_T, N), dtype=prob_data.dtype)
+            
+            for n in tqdm(range(N), desc="Downsampling neurons"):
+                # Use resample_poly with proper anti-aliasing
+                # The function automatically applies appropriate low-pass filtering
+                downsampled_prob_data[:, n] = resample_poly(
+                    prob_data_T[:, n], 
+                    up=up_factor, 
+                    down=down_factor,
+                    axis=0
+                )
+            
+            # Update prob_data back to (N, T) format and dimensions
+            prob_data = downsampled_prob_data.T  # Back to (N, T)
+            T = original_T
+            effective_sampling_rate = orig_rate
+            
+            print(f"  → Downsampled to {T} timepoints at {effective_sampling_rate}Hz")
+            
+            # Clean up
+            del prob_data_T, downsampled_prob_data
+            gc.collect()
+        
+        # Prepare data for saving - transpose probabilities to (T, N) format and convert to configured dtype
+        print("  → Preparing probability data for saving...")
+        output_dtype = getattr(np, config['output']['dtype'])
+        
+        # Handle NaN values in probability data
+        prob_data = np.nan_to_num(prob_data, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Transpose to (T, N) and convert to specified dtype
+        prob_data_transposed = prob_data.T.astype(output_dtype)  # (T, N)
+        
+        # Handle NaN values in cell positions and convert to specified dtype  
+        if np.isnan(cell_xyz).any():
+            print("  → Warning: NaN values found in cell positions, replacing with 0")
+            cell_xyz = np.nan_to_num(cell_xyz)
+        
+        cell_positions = cell_xyz.astype(output_dtype)  # (N, 3)
             
         # Save final data
         print(f"  → Saving final data to {final_file}")
         with h5py.File(final_file, 'w') as f:
-                # Save main datasets
-            f.create_dataset('volumes', 
-                            data=volumes,
-                            chunks=(1, *config['volumization']['volume_shape']),
-                                compression='gzip',
-                                compression_opts=1)
+            # Save main datasets
+            f.create_dataset('spike_probabilities', 
+                            data=prob_data_transposed,
+                            chunks=(min(1000, T), min(100, N)),
+                            compression='gzip',
+                            compression_opts=1)
+            
+            f.create_dataset('cell_positions', 
+                            data=cell_positions,
+                            compression='gzip',
+                            compression_opts=1)
                 
             f.create_dataset('timepoint_indices', 
                             data=np.arange(T, dtype=np.int32))
                 
             # Save metadata as datasets
-            f.create_dataset('num_timepoints', data=metadata['num_timepoints'])
-            f.create_dataset('volume_shape', data=metadata['volume_shape'])
+            f.create_dataset('num_timepoints', data=T)
+            f.create_dataset('num_neurons', data=N)
+            
+            # Sampling rate information (always included)
+            f.create_dataset('original_sampling_rate_hz', data=fpsec)
+            
+            # Save additional datasets if requested
+            if config['output'].get('include_additional_data', True):
+                print(f"  → Saving additional datasets...")
+                
+                # Anatomical reference stack
+                f.create_dataset('anat_stack', 
+                                data=anat_stack,
+                                compression='gzip',
+                                compression_opts=1)
+                
+                # Temporal data (stimulus, behavior, eye tracking)
+                f.create_dataset('stimulus_full', 
+                                data=stim_full,
+                                compression='gzip',
+                                compression_opts=1)
+                
+                f.create_dataset('behavior_full', 
+                                data=behavior_full,
+                                compression='gzip',
+                                compression_opts=1)
+                
+                f.create_dataset('eye_full', 
+                                data=eye_full,
+                                compression='gzip',
+                                compression_opts=1)
+            else:
+                print(f"  → Skipping additional datasets per configuration")
                 
             # Save attributes
             f.attrs['subject'] = subject_name
             f.attrs['data_source'] = 'raw_calcium'
-            f.attrs['dtype'] = metadata['dtype']
+            f.attrs['spike_dtype'] = config['output']['dtype']
+            f.attrs['position_dtype'] = config['output']['dtype']
             f.attrs['cascade_model'] = config['cascade']['model_type']
             f.attrs['calcium_dataset'] = config['data']['calcium_dataset']
             f.attrs['is_raw'] = config['data']['is_raw']
             f.attrs['apply_baseline_subtraction'] = config['data']['apply_baseline_subtraction']
             f.attrs['window_length'] = config['data']['window_length']
             f.attrs['baseline_percentile'] = config['data']['baseline_percentile']
+            f.attrs['original_sampling_rate'] = config['processing'].get('original_sampling_rate', fpsec)
+            f.attrs['target_sampling_rate'] = config['processing'].get('target_sampling_rate', fpsec)
+            f.attrs['effective_sampling_rate'] = effective_sampling_rate
+            f.attrs['matlab_fpsec'] = fpsec
+            f.attrs['includes_additional_data'] = config['output'].get('include_additional_data', True)
+            f.attrs['return_to_original_rate'] = return_to_original
+            f.attrs['final_sampling_rate'] = effective_sampling_rate  # The actual final rate of all data
         
         # Create visualization PDF
         print("  → Creating visualization PDF...")
@@ -603,7 +699,8 @@ def process_subject(subject_dir, config):
                                config['processing']['num_neurons_viz'])
             
             # Clean up memory
-        del calcium_for_viz, prob_data, volumes
+        del calcium_for_viz, prob_data, prob_data_transposed, cell_positions
+        del anat_stack, stim_full, behavior_full, eye_full
         gc.collect()
         
         processing_time = time.time() - start_time
@@ -772,35 +869,76 @@ def analyze_raw_data(config):
                 if num_nan > 0 or num_inf > 0:
                     print(f"      WARNING: Found {num_nan} NaN and {num_inf} inf values in sample")
             
-            # Volumization preview
-            volume_shape = config['volumization']['volume_shape']
-            volume_dtype = config['volumization']['dtype']
+            # Additional MATLAB data analysis  
+            print(f"  Additional MATLAB datasets:")
             
-            print(f"  Volumization settings:")
-            print(f"    Target volume shape: {volume_shape}")
-            print(f"    Data type: {volume_dtype}")
+            # Sampling rate from MATLAB
+            fpsec_val = data0['fpsec']
+            if isinstance(fpsec_val, np.ndarray) and fpsec_val.dtype == np.object_:
+                fpsec_val = fpsec_val[0, 0]
+            fpsec_val = float(fpsec_val.item() if hasattr(fpsec_val, 'item') else fpsec_val)
+            print(f"    MATLAB sampling rate (fpsec): {fpsec_val} Hz")
+            
+            # Anatomical stack
+            anat_stack = data0['anat_stack']
+            if isinstance(anat_stack, np.ndarray) and anat_stack.dtype == np.object_:
+                anat_stack = anat_stack[0, 0]
+            print(f"    Anatomical stack: {anat_stack.shape} ({anat_stack.dtype})")
+            anat_memory_gb = (np.prod(anat_stack.shape) * anat_stack.itemsize) / (1024**3)
+            print(f"      Memory requirement: ~{anat_memory_gb:.3f} GB")
+            
+            # Stimulus data
+            stim_full = data0['stim_full']
+            if isinstance(stim_full, np.ndarray) and stim_full.dtype == np.object_:
+                stim_full = stim_full[0, 0]
+            stim_full = np.squeeze(stim_full)
+            print(f"    Stimulus data: {stim_full.shape} ({stim_full.dtype})")
+            print(f"      Values: {stim_full.min()} to {stim_full.max()}")
+            
+            # Behavioral data
+            behavior_full = data0['Behavior_full']
+            if isinstance(behavior_full, np.ndarray) and behavior_full.dtype == np.object_:
+                behavior_full = behavior_full[0, 0]
+            print(f"    Behavioral data: {behavior_full.shape} ({behavior_full.dtype})")
+            print(f"      {behavior_full.shape[0]} behavioral variables over {behavior_full.shape[1]} timepoints")
+            
+            # Eye tracking data
+            eye_full = data0['Eye_full']
+            if isinstance(eye_full, np.ndarray) and eye_full.dtype == np.object_:
+                eye_full = eye_full[0, 0]
+            print(f"    Eye tracking data: {eye_full.shape} ({eye_full.dtype})")
+            print(f"      {eye_full.shape[0]} eye dimensions over {eye_full.shape[1]} timepoints")
+            
+            # Check temporal alignment
+            if config['output'].get('include_additional_data', True):
+                temporal_datasets = [
+                    ("stimulus", stim_full.shape[0] if stim_full.ndim == 1 else stim_full.shape[1]),
+                    ("behavior", behavior_full.shape[1]),
+                    ("eye", eye_full.shape[1])
+                ]
+                print(f"    Temporal alignment check:")
+                for name, length in temporal_datasets:
+                    print(f"      {name}: {length} timepoints ({'✓' if length == T else '⚠'} vs calcium {T})")
+            
+            # Output format preview
+            output_dtype = config['output']['dtype']
+            
+            print(f"  Output format settings:")
+            print(f"    Data type: {output_dtype}")
             
             if num_valid > 0:
-                # Estimate volume memory requirements
-                vol_memory_gb = (T * np.prod(volume_shape) * (2 if volume_dtype == 'float16' else 4)) / (1024**3)
-                print(f"    Volume memory requirement: ~{vol_memory_gb:.2f} GB")
+                # Estimate spike probability memory requirements - (T, N) format
+                prob_memory_gb = (T * num_valid * (2 if output_dtype == 'float16' else 4)) / (1024**3)
+                print(f"    Spike probabilities memory requirement: ~{prob_memory_gb:.2f} GB")
                 
-                # Estimate spatial resolution
-                if ranges[0] > 0 and ranges[1] > 0 and ranges[2] > 0:
-                    x_res = ranges[0] / volume_shape[0]
-                    y_res = ranges[1] / volume_shape[1]
-                    z_res = ranges[2] / volume_shape[2]
-                    print(f"    Spatial resolution: X={x_res:.2f}, Y={y_res:.2f}, Z={z_res:.2f} units/voxel")
+                # Estimate cell positions memory requirements - (N, 3) format
+                pos_memory_gb = (num_valid * 3 * (2 if output_dtype == 'float16' else 4)) / (1024**3)
+                print(f"    Cell positions memory requirement: ~{pos_memory_gb:.2f} GB")
                 
-                # Estimate neurons per voxel
-                total_voxels = np.prod(volume_shape)
-                neurons_per_voxel = num_valid / total_voxels
-                print(f"    Average neurons per voxel: {neurons_per_voxel:.2f}")
+                total_memory_gb = prob_memory_gb + pos_memory_gb
+                print(f"    Total output memory requirement: ~{total_memory_gb:.2f} GB")
                 
-                if neurons_per_voxel < 0.1:
-                    print(f"    WARNING: Very sparse volume - consider smaller volume dimensions")
-                elif neurons_per_voxel > 10:
-                    print(f"    WARNING: Very dense volume - consider larger volume dimensions")
+                print(f"    Output format: Spike probabilities (T={T}, N={num_valid}), Positions (N={num_valid}, 3)")
             
         except Exception as e:
             print(f"  ERROR: {e}")
@@ -809,7 +947,7 @@ def analyze_raw_data(config):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='3D Volumetric Spike Processing Pipeline'
+        description='Spike Probability Processing Pipeline'
     )
     parser.add_argument('--config', type=str, default=None,
                         help='Path to YAML configuration file')
@@ -893,13 +1031,13 @@ def main():
             print(f"Error processing {subject_dir}: {e}")
         gc.collect()
 
-    print(f"\n3D Volumetric processing complete!")
+    print(f"\nSpike probability processing complete!")
     print(f"Processed {len(processed_subjects)} subjects")
     if config['data'].get('test_run_neurons'):
         print(f"Test mode: Used only {config['data']['test_run_neurons']} randomly selected neurons per subject")
     print(f"Output saved to: {config['data']['output_dir']}")
-    print(f"Volume shape: {config['volumization']['volume_shape']}")
-    print(f"Data type: {config['volumization']['dtype']}")
+    print(f"Output format: Spike probabilities (T, N) and cell positions (N, 3)")
+    print(f"Data type: {config['output']['dtype']}")
 
 if __name__ == '__main__':
     # Set multiprocessing start method

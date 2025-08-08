@@ -1,21 +1,23 @@
-# Data Documentation: 3D Volumetric Spike Processing Pipeline
+# Data Documentation: Spike Probability Processing Pipeline
 
 ## Overview
 
-The `unified_spike_processing.py` script processes calcium imaging data through a complete pipeline that converts raw calcium traces into 3D volumetric representations of neural activity. Each timepoint becomes a single 3D volume with continuous spike probability values derived from CASCADE inference.
+The `unified_spike_processing.py` script processes calcium imaging data through a complete pipeline that converts raw calcium traces into spike probability time series data. The output preserves the original neuron-level resolution by saving spike probabilities as (T, N) time series along with (N, 3) spatial position coordinates for each neuron.
 
 ## Pipeline Summary
 
 ```
-Raw Calcium Traces → Baseline Correction → CASCADE Inference → 3D Volumetric Representation
+Raw Calcium Traces → Baseline Correction → CASCADE Inference → Direct Probability Output
 ```
 
 **Key Features:**
 - CASCADE-only spike detection (no OASIS support)
 - Configurable baseline correction (proper ΔF/F or baseline subtraction)
-- 3D volumetric representation of neural activity
+- Direct probability time series output (T, N) format
+- Cell spatial positions preserved as (N, 3) coordinates
 - YAML configuration system
 - Continuous probability values only
+- Configurable float16/float32 output data types
 - Memory-efficient processing with batch operations
 
 ---
@@ -98,13 +100,14 @@ processing:
   seed: 42                                   # Random seed
   original_sampling_rate: 2.73               # Original sampling rate (Hz)
   target_sampling_rate: 2.5                  # Target sampling rate (Hz)
+  return_to_original_rate: false             # Downsample neural data back to original rate after CASCADE
 
 cascade:
   model_type: 'Global_EXC_2Hz_smoothing500ms'  # CASCADE model
 
-volumization:
-  volume_shape: [64, 64, 32]                 # [X, Y, Z] voxel dimensions
-  dtype: 'float16'                           # Data type for volumes
+output:
+  dtype: 'float16'                           # Data type for spike probabilities and positions
+  include_additional_data: true              # Include anat_stack, stimulus, behavior, eye data
 ```
 
 ### Processing Logic Options
@@ -150,12 +153,19 @@ For each subject found in the input directory, the analysis reports:
 - **Data statistics**: Min/max/mean/std of sample data
 - **Data quality**: Detection of NaN or infinity values
 
-#### Volumization Preview
-- **Target volume shape**: Configured 3D volume dimensions
-- **Volume memory requirements**: Estimated storage size
-- **Spatial resolution**: Physical units per voxel
-- **Neuron density**: Average neurons per voxel
-- **Optimization warnings**: Suggestions for volume dimension adjustments
+#### Additional MATLAB Datasets  
+- **MATLAB sampling rate**: Original fpsec value from data_full.mat
+- **Anatomical stack**: 3D reference brain anatomy with memory requirements
+- **Stimulus data**: Temporal stimulus condition codes with alignment info
+- **Behavioral data**: Multi-variable behavioral measurements over time
+- **Eye tracking data**: Eye position coordinates over time
+- **Temporal alignment**: Verification that all temporal data matches calcium timepoints
+
+#### Output Format Preview
+- **Data type**: Storage format for probabilities and positions
+- **Memory requirements**: Estimated storage size for time series and positions
+- **Output dimensions**: Expected (T, N) and (N, 3) array sizes
+- **Additional data inclusion**: Based on configuration settings
 
 ### Example Output
 
@@ -193,27 +203,47 @@ Subject: subject_001
       Max: 8943.7754
       Mean: 1247.3829
       Std: 891.2456
-  Volumization settings:
-    Target volume shape: [64, 64, 32]
+  Additional MATLAB datasets:
+    MATLAB sampling rate (fpsec): 1.97 Hz
+    Anatomical stack: (2048, 1116, 29) (uint16)
+      Memory requirement: ~0.127 GB
+    Stimulus data: (2880,) (uint8)
+      Values: 0 to 3
+    Behavioral data: (5, 2880) (float64)
+      5 behavioral variables over 2880 timepoints
+    Eye tracking data: (2, 2880) (float64)
+      2 eye dimensions over 2880 timepoints
+    Temporal alignment check:
+      stimulus: 2880 timepoints (✓ vs calcium 2880)
+      behavior: 2880 timepoints (✓ vs calcium 2880)
+      eye: 2880 timepoints (✓ vs calcium 2880)
+  Output format settings:
     Data type: float16
-    Volume memory requirement: ~0.70 GB
-    Spatial resolution: X=7.42, Y=7.87, Z=2.48 units/voxel
-    Average neurons per voxel: 3.44
+    Spike probabilities memory requirement: ~0.65 GB
+    Cell positions memory requirement: ~0.00 GB  
+    Total output memory requirement: ~0.65 GB
+    Output format: Spike probabilities (T=17159, N=44891), Positions (N=44891, 3)
+    Additional data inclusion: true
 ```
 
 ### Optimization Recommendations
 
 Based on the analysis output, you can optimize processing parameters:
 
-**Volume Dimensions:**
-- **Too sparse** (< 0.1 neurons/voxel): Consider smaller volume dimensions
-- **Too dense** (> 10 neurons/voxel): Consider larger volume dimensions
-- **Optimal**: 1-5 neurons per voxel for good spatial resolution
+**Data Type Selection:**
+- **float16**: Recommended for most use cases (50% memory savings, sufficient precision)  
+- **float32**: Use for high-precision requirements or if numerical issues occur
+
+**Sampling Rate Strategy:**
+- **`return_to_original_rate: false`**: Use when you want higher temporal resolution in final output
+- **`return_to_original_rate: true`**: Use when you want to preserve original experimental timing
+- Anti-aliasing downsampling ensures no information loss when returning to original rate
 
 **Memory Management:**
 - Large datasets (> 2 GB): Reduce `batch_size` in configuration
 - Multiple subjects: Process sequentially to avoid memory issues
 - Consider using `test_run_neurons` for initial parameter testing
+- Monitor spike probability memory requirements for very large datasets
 
 **Data Quality:**
 - NaN/inf values: May require data preprocessing
@@ -239,14 +269,22 @@ Based on the analysis output, you can optimize processing parameters:
 
 #### Main Datasets
 
-**`volumes`** - 3D volumetric neural activity data
-- **Shape**: `(T, X, Y, Z)`
+**`spike_probabilities`** - Spike probability time series data
+- **Shape**: `(T, N)`
   - `T` = Number of timepoints
-  - `X, Y, Z` = Volume dimensions from config (e.g., 64×64×32)
+  - `N` = Number of neurons
 - **Data Type**: Configurable (default: `float16`)
 - **Values**: Continuous spike probabilities `[0.0, 1.0]`
 - **Compression**: gzip level 1
-- **Chunking**: `(1, X, Y, Z)` for efficient timepoint access
+- **Chunking**: `(min(1000, T), min(100, N))` for efficient access
+
+**`cell_positions`** - 3D spatial coordinates of neurons
+- **Shape**: `(N, 3)`
+  - `N` = Number of neurons
+  - `3` = X, Y, Z coordinates
+- **Data Type**: Configurable (default: `float16`)
+- **Values**: Spatial coordinates in original units
+- **Compression**: gzip level 1
 
 **`timepoint_indices`** - Sequential timepoint indices
 - **Shape**: `(T,)`
@@ -258,9 +296,39 @@ Based on the analysis output, you can optimize processing parameters:
 **`num_timepoints`** - Total number of timepoints
 - **Type**: Scalar integer
 
-**`volume_shape`** - Volume dimensions
-- **Shape**: `(3,)`
-- **Values**: `[X, Y, Z]` dimensions
+**`num_neurons`** - Total number of neurons
+- **Type**: Scalar integer
+
+**`original_sampling_rate_hz`** - Original sampling rate from MATLAB file
+- **Type**: Scalar float (from fpsec field)
+
+#### Additional Datasets (Optional)
+
+The following datasets are included when `include_additional_data: true` in configuration:
+
+**`anat_stack`** - 3D anatomical reference stack
+- **Shape**: `(2048, 1116, 29)` (typical dimensions)
+- **Data Type**: uint16
+- **Purpose**: 3D brain anatomy reference for spatial context
+- **Compression**: gzip level 1
+
+**`stimulus_full`** - Stimulus condition labels over time
+- **Shape**: `(T,)` - matches calcium timepoints after any interpolation  
+- **Data Type**: uint8
+- **Values**: Stimulus condition codes (typically 0-3)
+- **Compression**: gzip level 1
+
+**`behavior_full`** - Behavioral measurements over time
+- **Shape**: `(5, T)` - 5 behavioral variables × timepoints
+- **Data Type**: float64
+- **Values**: Behavioral metrics (normalized 0-1 range)
+- **Compression**: gzip level 1
+
+**`eye_full`** - Eye tracking data over time
+- **Shape**: `(2, T)` - 2 eye dimensions (X, Y) × timepoints
+- **Data Type**: float64
+- **Values**: Eye position coordinates
+- **Compression**: gzip level 1
 
 #### HDF5 Attributes
 
@@ -269,7 +337,15 @@ Based on the analysis output, you can optimize processing parameters:
 - `data_source`: Always `'raw_calcium'`
 - `cascade_model`: CASCADE model used (string)
 - `calcium_dataset`: Dataset name used from TimeSeries.h5
-- `dtype`: Data type used for volumes
+- `spike_dtype`: Data type used for spike probabilities
+- `position_dtype`: Data type used for cell positions
+- `original_sampling_rate`: Original data sampling rate (Hz) from config
+- `target_sampling_rate`: Target resampled rate (Hz) from config
+- `effective_sampling_rate`: Actual sampling rate used for processing (Hz)
+- `final_sampling_rate`: Final sampling rate of all output data (Hz)
+- `matlab_fpsec`: Original MATLAB sampling rate from fpsec field (Hz)
+- `return_to_original_rate`: Boolean indicating if neural data was downsampled back to original rate
+- `includes_additional_data`: Boolean indicating if additional datasets are included
 
 **Baseline Correction Parameters:**
 - `is_raw`: Whether ΔF/F was computed (boolean)
@@ -290,24 +366,31 @@ Based on the analysis output, you can optimize processing parameters:
 
 ## Data Processing Details
 
-### Spatial Mapping
+### Spatial Data Processing
 
-1. **Cell Position Normalization**
-   - Cell coordinates normalized to `[0, 1]` range
-   - Handles cases where spatial range is zero
-   - Maps to volume indices using floor operation
-
-2. **Volume Element Assignment**
-   - Each cell maps to discrete volume element `[x, y, z]`
-   - Multiple cells mapping to same element have probabilities **summed**
-   - Empty volume elements contain `0.0`
+1. **Cell Position Preservation**
+   - Original spatial coordinates preserved without normalization
+   - NaN values in positions replaced with zeros
+   - No spatial discretization or mapping performed
+   - Full-resolution position data maintained as (N, 3) array
 
 ### Temporal Processing
 
 1. **Sampling Rate Conversion**
-   - Linear interpolation between original and target sampling rates
-   - Maintains temporal relationships
-   - Uses scipy.interpolate.interp1d
+   
+   **Two processing modes based on `return_to_original_rate` setting:**
+   
+   **Mode A: `return_to_original_rate: false` (default)**
+   - **Neural data**: Smooth interpolation (PCHIP) to target sampling rate
+   - **Non-neural data**: Hold interpolation (zero-order hold) to match neural data
+   - Final output: All data at target sampling rate
+   
+   **Mode B: `return_to_original_rate: true`**  
+   - **Neural data**: Upsampled to target rate → CASCADE processing → Anti-aliasing downsampled back to original rate
+   - **Non-neural data**: No interpolation (stays at original rate)
+   - Final output: All data at original sampling rate
+   - Downsampling uses `scipy.signal.resample_poly` with proper anti-aliasing filter
+   - Low-pass cutoff: ≤ 0.9 × (original_rate/2) Hz to prevent aliasing
 
 2. **Baseline Correction**
    - Causal sliding window (past + current frames only)
@@ -351,29 +434,59 @@ import numpy as np
 # Load processed data
 with h5py.File('subject_001.h5', 'r') as f:
     # Main data
-    volumes = f['volumes'][:]  # Shape: (T, X, Y, Z)
-    timepoints = f['timepoint_indices'][:]
+    spike_probs = f['spike_probabilities'][:]  # Shape: (T, N)
+    positions = f['cell_positions'][:]         # Shape: (N, 3)  
+    timepoints = f['timepoint_indices'][:]     # Shape: (T,)
     
     # Metadata
     num_timepoints = f['num_timepoints'][()]
-    volume_shape = f['volume_shape'][:]
+    num_neurons = f['num_neurons'][()]
     
     # Processing info
     subject = f.attrs['subject']
     cascade_model = f.attrs['cascade_model']
     is_raw = f.attrs['is_raw']
 
-# Access specific timepoint
+# Access spike probabilities for specific neuron over time
+neuron_id = 100
+neuron_time_series = spike_probs[:, neuron_id]  # Shape: (T,)
+neuron_position = positions[neuron_id, :]       # Shape: (3,)
+
+# Access all neurons at specific timepoint
 t = 100
-brain_volume_t = volumes[t, :, :, :]  # Shape: (X, Y, Z)
+all_probs_t = spike_probs[t, :]  # Shape: (N,)
 
-# Access specific location over time
-x, y, z = 32, 32, 16
-time_series = volumes[:, x, y, z]  # Shape: (T,)
+# Find active neurons at timepoint
+active_mask = all_probs_t > 0.01  # Threshold for "active"
+active_neurons = np.where(active_mask)[0]
+active_positions = positions[active_neurons, :]
 
-# Find active volume elements at timepoint
-active_mask = volumes[t] > 0.01  # Threshold for "active"
-active_coords = np.where(active_mask)
+# Get spatial bounds of all neurons
+min_coords = positions.min(axis=0)  # [x_min, y_min, z_min]
+max_coords = positions.max(axis=0)  # [x_max, y_max, z_max]
+
+# Access additional datasets (if included)
+if f.attrs.get('includes_additional_data', False):
+    # Anatomical reference
+    anat_stack = f['anat_stack'][:]  # Shape: (2048, 1116, 29) typical
+    
+    # Temporal data aligned with spike probabilities
+    stimulus = f['stimulus_full'][:]      # Shape: (T,)
+    behavior = f['behavior_full'][:]      # Shape: (5, T)
+    eye_data = f['eye_full'][:]           # Shape: (2, T)
+    
+    # Original sampling rate from MATLAB
+    original_rate = f['original_sampling_rate_hz'][()]
+    
+    # Check processing mode
+    return_to_original = f.attrs.get('return_to_original_rate', False)
+    final_rate = f.attrs.get('final_sampling_rate', original_rate)
+    
+    print(f"Processing mode: {'Original rate' if return_to_original else 'Target rate'}")
+    print(f"Final sampling rate: {final_rate} Hz")
+    print(f"Stimulus at timepoint {t}: {stimulus[t]}")
+    print(f"Behavior variables at timepoint {t}: {behavior[:, t]}")
+    print(f"Eye position at timepoint {t}: {eye_data[:, t]}")
 ```
 
 ---
@@ -400,9 +513,9 @@ Options:
    python unified_spike_processing.py --config config.yaml --raw_data_info
    ```
 
-2. **Parameter optimization**: Use raw data analysis to optimize volume dimensions
+2. **Parameter optimization**: Use raw data analysis to check memory requirements and data types
    ```bash
-   # Analyze data to determine optimal volume shape
+   # Analyze data to determine optimal data types and memory usage
    python unified_spike_processing.py --config config.yaml --raw_data_info
    
    # Edit config.yaml based on analysis recommendations
@@ -477,6 +590,10 @@ The script automatically reports:
 
 ## Version History
 
+- **2025-01-18**: Added `return_to_original_rate` configuration option with anti-aliasing downsampling for neural data
+- **2025-01-18**: Changed interpolation for non-neural data (stimulus, behavior, eye) to zero-order hold to preserve discrete values
+- **2025-01-18**: Enhanced neuron filtering using IX_inval_anat with absIX mapping and added support for additional datasets (anat_stack, stimulus_full, behavior_full, eye_full)
+- **2025-01-18**: Removed volumetric processing - now saves spike probabilities as (T, N) time series and cell positions as (N, 3) coordinates directly
 - **2025-07-18**: Initial 3D volumetric processing pipeline
 - **2025-07-18**: Added proper ΔF/F support and reorganized configuration
 - **2025-07-18**: Simplified file structure and merged metadata
