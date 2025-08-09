@@ -1059,8 +1059,16 @@ class GBMTrainer:
                 with autocast(enabled=self.scaler is not None):
                     # Get predicted next volumes
                     val_output = self.model(val_input, get_logits=True)
-                    val_loss = loss_fn(val_output, val_target)
+                    bce_val_loss = loss_fn(val_output, val_target)
                     val_probabilities = torch.sigmoid(val_output)
+                    
+                    # Add mean difference regularization loss (same as training)
+                    mu = val_probabilities.mean() - val_target.mean()
+                    lam = 2.0
+                    mean_diff_val_loss = lam * mu.pow(2)
+                    
+                    # Combine losses
+                    val_loss = bce_val_loss + mean_diff_val_loss
                 
                 total_val_loss += val_loss.item()
                 num_batches += 1
@@ -1204,7 +1212,22 @@ class GBMTrainer:
                     # Predict next volumes (L1 loss)
                     output_seq = self.model(input_seq, get_logits=True)
                     loss_fn = self.get_loss_function()
-                    loss = loss_fn(output_seq, target_seq)
+                    bce_loss = loss_fn(output_seq, target_seq)
+                    
+                    # Add mean difference regularization loss
+                    # Convert logits to predictions with sigmoid
+                    pred_probs = torch.sigmoid(output_seq)
+                    
+                    # Calculate mean difference between predictions and targets
+                    mu = pred_probs.mean() - target_seq.mean()
+                    
+                    # Add regularization term: lambda * mu^2
+                    # Using lambda = 1.0 as specified
+                    lam = 2.0
+                    mean_diff_loss = lam * mu.pow(2)
+                    
+                    # Combine losses
+                    loss = bce_loss + mean_diff_loss
                     
                     # Scale loss by accumulation steps for proper averaging
                     if use_grad_accum:

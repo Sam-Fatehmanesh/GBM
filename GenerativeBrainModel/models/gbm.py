@@ -5,7 +5,7 @@ import numpy as np
 from GenerativeBrainModel.models.rms import RMSNorm
 from GenerativeBrainModel.models.mlp import MLP
 from GenerativeBrainModel.models.convnormencoder import ConvNormEncoder
-from GenerativeBrainModel.models.spatiotemporal import SpatioTemporalModel, SpatialModel
+from GenerativeBrainModel.models.spatiotemporal import SpatioTemporalAttention, SpatialModel
 from mamba_ssm import Mamba2 as Mamba
 import pdb
 import os
@@ -29,7 +29,7 @@ class GBM(nn.Module):
         self.n_blocks_x = volume_size[0] // region_size[0]
         self.n_blocks_y = volume_size[1] // region_size[1]
         self.n_blocks_z = volume_size[2] // region_size[2]
-        self.layers = nn.ModuleList([SpatioTemporalModel(d_model, n_heads, self.n_regions) for _ in range(n_layers)])
+        self.layers = nn.ModuleList([SpatioTemporalAttention(d_model, n_heads, self.n_regions) for _ in range(n_layers)])
 
         self.final_spatial_mixer = SpatialModel(d_model, n_heads, self.n_regions)
 
