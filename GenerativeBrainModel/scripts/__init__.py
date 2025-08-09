@@ -2,6 +2,6 @@
 Scripts package for training and utilities.
 """
 
-# No exports since train_autoencoder is self-contained
- 
-__all__ = [] 
+from .train_gbm import main as train_gbm_main
+
+__all__ = ['train_gbm_main']
