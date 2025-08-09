@@ -259,6 +259,11 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
                 if vb >= val_sample_batches:
                     break
             model.train()
+            # Update plots immediately after frequent validation
+            try:
+                tracker.plot_training()
+            except Exception:
+                pass
 
 
 @torch.no_grad()

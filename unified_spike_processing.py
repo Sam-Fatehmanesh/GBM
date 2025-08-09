@@ -245,9 +245,88 @@ def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path,
         num_neurons: Number of neurons to visualize
     """
     T, N = calcium_data.shape
-    
+
+    # Compute subject-level statistics from prob_data (expected shape: (N, T))
+    per_neuron_mean = None
+    per_neuron_var = None
+    per_frame_mean = None
+    per_frame_var = None
+    try:
+        per_neuron_mean = prob_data.mean(axis=1)
+        per_neuron_var = prob_data.var(axis=1)
+        per_frame_mean = prob_data.mean(axis=0)
+        per_frame_var = prob_data.var(axis=0)
+        global_mean = float(prob_data.mean())
+        global_var = float(prob_data.var())
+        sparsity_frac = float((prob_data < 1e-3).sum()) / float(prob_data.size)
+        active_frac = 1.0 - sparsity_frac
+        frac_active_gt_1pct = float((prob_data > 1e-2).mean())
+        pn_mean_mean = float(per_neuron_mean.mean())
+        pn_mean_median = float(np.median(per_neuron_mean))
+        pn_var_mean = float(per_neuron_var.mean())
+        pf_mean_mean = float(per_frame_mean.mean())
+        pf_var_mean = float(per_frame_var.mean())
+    except Exception:
+        global_mean = global_var = sparsity_frac = active_frac = frac_active_gt_1pct = 0.0
+        pn_mean_mean = pn_mean_median = pn_var_mean = pf_mean_mean = pf_var_mean = 0.0
+
     print(f"  → Writing PDF to {output_path}")
     with PdfPages(output_path) as pdf:
+        # Summary metrics page
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(10, 7))
+            fig.suptitle(f"Subject: {subject_name} — Summary Metrics", fontsize=12)
+
+            # Text panel
+            ax0 = axes[0, 0]
+            ax0.axis('off')
+            lines = [
+                f"Neurons (N): {N}",
+                f"Timepoints (T): {T}",
+                f"Global mean prob: {global_mean:.6f}",
+                f"Global var prob: {global_var:.6f}",
+                f"Sparsity (<1e-3): {sparsity_frac:.4f}",
+                f"Active frac: {active_frac:.4f}",
+                f"Frac >1%: {frac_active_gt_1pct:.4f}",
+                f"Per-neuron mean (mean/median): {pn_mean_mean:.6f} / {pn_mean_median:.6f}",
+                f"Per-neuron var (mean): {pn_var_mean:.6f}",
+                f"Per-frame mean (mean): {pf_mean_mean:.6f}",
+                f"Per-frame var (mean): {pf_var_mean:.6f}",
+            ]
+            ax0.text(0.01, 0.98, "\n".join(lines), va='top', ha='left', fontsize=9)
+
+            # Histogram: per-neuron mean
+            ax1 = axes[0, 1]
+            if per_neuron_mean is not None:
+                ax1.hist(per_neuron_mean, bins=50, color='steelblue', alpha=0.8)
+                ax1.set_title('Histogram: per-neuron mean prob')
+            else:
+                ax1.axis('off')
+
+            # Per-frame mean over time
+            ax2 = axes[1, 0]
+            if per_frame_mean is not None:
+                ax2.plot(per_frame_mean, color='darkmagenta', lw=0.8)
+                ax2.set_title('Per-frame mean prob over time')
+                ax2.set_xlabel('Frame')
+                ax2.set_ylabel('Mean prob')
+            else:
+                ax2.axis('off')
+
+            # Histogram: per-neuron variance
+            ax3 = axes[1, 1]
+            if per_neuron_var is not None:
+                ax3.hist(per_neuron_var, bins=50, color='orange', alpha=0.8)
+                ax3.set_title('Histogram: per-neuron variance')
+            else:
+                ax3.axis('off')
+
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            pdf.savefig(fig)
+            plt.close(fig)
+        except Exception:
+            pass
+
         # Select random neurons to visualize
         sel = np.random.choice(N, min(num_neurons, N), replace=False)
         
@@ -287,16 +366,16 @@ def process_subject(subject_dir, config):
         
     # Create output directory
     os.makedirs(config['data']['output_dir'], exist_ok=True)
-        
-        # Check if already processed
+
+    # Check if already processed
     final_file = os.path.join(config['data']['output_dir'], f'{subject_name}.h5')
     pdf_file = os.path.join(config['data']['output_dir'], f'{subject_name}_visualization.pdf')
-        
+
     if os.path.exists(final_file) and os.path.exists(pdf_file):
         print("  → Already processed; skipping.")
         return final_file
-        
-        start_time = time.time()
+
+    start_time = time.time()
         
     try:
         # Load raw data
@@ -368,114 +447,95 @@ def process_subject(subject_dir, config):
             calcium = f[calcium_dataset][:]
             print(f"  → Using {calcium_dataset} traces")
             
-            # Check dimensions and transpose if needed
-            if calcium.shape[0] == cell_xyz.shape[0]:
-                print(f"  → Calcium data is (N, T) = {calcium.shape}, transposing to (T, N)")
-                calcium = calcium.T
-            elif calcium.shape[1] == cell_xyz.shape[0]:
-                print(f"  → Calcium data is already (T, N) = {calcium.shape}")
-            else:
-                print(f"  → Warning: Calcium shape {calcium.shape} doesn't match cell count {cell_xyz.shape[0]}")
-                # Handle size mismatch by identifying neurons with valid coordinates
-                T, N_calcium = calcium.shape
-                N_positions = cell_xyz.shape[0]
-                
-                # Find neurons with valid (non-NaN) coordinates
-                valid_coord_mask = ~np.isnan(cell_xyz).any(axis=1)
-                valid_coord_indices = np.where(valid_coord_mask)[0]
-                
-                print(f"  → Found {len(valid_coord_indices)} neurons with valid coordinates out of {N_positions}")
-                
-                # Determine which neurons to keep based on the overlap
-                if N_calcium <= N_positions:
-                    # More position data than calcium data
-                    # Keep only the first N_calcium neurons that have valid coordinates
-                    valid_calcium_coords = valid_coord_indices[valid_coord_indices < N_calcium]
-                    print(f"  → Keeping {len(valid_calcium_coords)} neurons that have both calcium traces and valid coordinates")
-                    
-                    # Filter both arrays to match
-                    calcium = calcium[:, valid_calcium_coords]
-                    cell_xyz = cell_xyz[valid_calcium_coords, :]
-                    
+            # Prefer alignment via absIX if available
+            have_abs_ix = 'absIX' in f
+            if have_abs_ix:
+                abs_ix = f['absIX'][:].flatten().astype(int) - 1  # 0-based
+                N_abs = abs_ix.shape[0]
+                # Ensure calcium is (T, N_abs)
+                if calcium.shape[0] == N_abs and calcium.shape[1] != N_abs:
+                    print(f"  → Calcium data is (N, T) = {calcium.shape}, transposing to (T, N)")
+                    calcium = calcium.T
+                elif calcium.shape[1] == N_abs:
+                    print(f"  → Calcium data is already (T, N) = {calcium.shape}")
                 else:
-                    # More calcium data than position data
-                    # Keep only neurons up to N_positions that have valid coordinates
-                    valid_calcium_coords = valid_coord_indices
-                    print(f"  → Keeping {len(valid_calcium_coords)} neurons that have both calcium traces and valid coordinates")
-                    
-                    # Filter both arrays to match
-                    calcium = calcium[:, valid_calcium_coords]
-                    cell_xyz = cell_xyz[valid_calcium_coords, :]
-                
+                    print(f"  → Warning: absIX length {N_abs} does not match calcium shape {calcium.shape}; proceeding with calcium N")
+                    N_abs = calcium.shape[1]
+                    abs_ix = abs_ix[:N_abs]
+                # If IX_inval_anat is provided, filter absIX/calcium consistently
+                if 'IX_inval_anat' in data0.dtype.names:
+                    inval = data0['IX_inval_anat']
+                    try:
+                        if isinstance(inval, np.ndarray) and inval.dtype == np.object_:
+                            inval = inval[0, 0]
+                        inval = np.array(inval).flatten().astype(int) - 1  # to 0-based
+                        keep_mask_cols = ~np.isin(abs_ix, inval)
+                        num_dropped = int((~keep_mask_cols).sum())
+                        if num_dropped > 0:
+                            print(f"  → IX_inval_anat: dropping {num_dropped} neurons from calcium/positions via absIX filter")
+                            calcium = calcium[:, keep_mask_cols]
+                            abs_ix = abs_ix[keep_mask_cols]
+                            N_abs = abs_ix.shape[0]
+                    except Exception as e:
+                        print(f"  → Warning: IX_inval_anat filtering failed ({e}); continuing without it")
+                # Select positions strictly by absIX to preserve index alignment
+                positions_base = cell_xyz_norm if cell_xyz_norm_available else cell_xyz
+                try:
+                    cell_xyz = positions_base[abs_ix, :]
+                except Exception as e:
+                    print(f"  → Error selecting positions by absIX: {e}; falling back to first N positions")
+                    cell_xyz = positions_base[:calcium.shape[1], :]
+                # Optional coordinate sanity: drop NaN positions in lockstep with calcium
+                if np.isnan(cell_xyz).any():
+                    coord_mask = ~np.isnan(cell_xyz).any(axis=1)
+                    num_drop = int((~coord_mask).sum())
+                    if num_drop > 0:
+                        print(f"  → Coordinate sanity: dropping {num_drop} NaN-position neurons")
+                        cell_xyz = cell_xyz[coord_mask]
+                        calcium = calcium[:, coord_mask]
                 print(f"  → Final aligned shapes - calcium: {calcium.shape}, cell_xyz: {cell_xyz.shape}")
-                
-            T, N_original = calcium.shape
-            
-            # Handle invalid anatomical indices
-            anatomical_mask = np.ones(N_original, bool)
-            if 'IX_inval_anat' in data0.dtype.names:
-                inval = data0['IX_inval_anat']
-                if isinstance(inval, np.ndarray) and inval.dtype == np.object_:
-                    inval = inval[0, 0]
-                
-                # Handle different shapes - flatten if needed
-                if inval.ndim > 1:
-                    inval = inval.flatten()
-                
-                inval_indices = np.array(inval, int) - 1  # Convert to 0-based indexing
-                
-                # Load the absIX mapping from HDF5 to understand which neurons are which
-                with h5py.File(os.path.join(subject_dir, 'TimeSeries.h5'), 'r') as f_temp:
-                    if 'absIX' in f_temp:
-                        abs_ix = f_temp['absIX'][:].flatten() - 1  # Convert to 0-based
-                        print(f"  → Found absIX mapping: {abs_ix.shape[0]} neurons mapped to full set")
-                        
-                        # Find which of our current neurons (in HDF5) correspond to invalid anatomical indices
-                        invalid_in_current = np.isin(abs_ix, inval_indices)
-                        anatomical_mask = ~invalid_in_current
-                        print(f"  → Marked {np.sum(invalid_in_current)} neurons as anatomically invalid based on absIX mapping")
-                    else:
-                        # Fallback to direct indexing if no absIX available
-                        valid_inval_indices = inval_indices[inval_indices < N_original]
-                        if len(valid_inval_indices) > 0:
-                            anatomical_mask[valid_inval_indices] = False
-                            print(f"  → Marked {len(valid_inval_indices)} neurons as anatomically invalid (direct indexing)")
+                T, N_original = calcium.shape
             else:
-                print("  → No IX_inval_anat found, keeping all neurons")
+                # Check dimensions and transpose if needed using position count
+                if calcium.shape[0] == cell_xyz.shape[0]:
+                    print(f"  → Calcium data is (N, T) = {calcium.shape}, transposing to (T, N)")
+                    calcium = calcium.T
+                elif calcium.shape[1] == cell_xyz.shape[0]:
+                    print(f"  → Calcium data is already (T, N) = {calcium.shape}")
+                else:
+                    print(f"  → Warning: Calcium shape {calcium.shape} doesn't match cell count {cell_xyz.shape[0]}")
+                    # Fallback: truncate to shared min count to preserve index ordering
+                    T_tmp, N_calcium = calcium.shape
+                    N_positions = cell_xyz.shape[0]
+                    N_shared = min(N_calcium, N_positions)
+                    calcium = calcium[:, :N_shared]
+                    cell_xyz = cell_xyz[:N_shared, :]
+                    print(f"  → Truncated to shared N={N_shared} to maintain index alignment")
+                T, N_original = calcium.shape
             
-            # Filter out neurons with invalid coordinates (additional check)
-            coordinate_mask = ~np.isnan(cell_xyz).any(axis=1)
-            
-            # Combine both masks
-            valid_mask = anatomical_mask & coordinate_mask
-            
-            # Count filtered neurons
-            n_invalid_anatomical = np.sum(~anatomical_mask)
-            n_invalid_coordinates = np.sum(~coordinate_mask)
-            n_total_filtered = np.sum(~valid_mask)
-            
-            if n_invalid_anatomical > 0:
-                print(f"  → Filtering out {n_invalid_anatomical} neurons with invalid anatomical indices")
-            if n_invalid_coordinates > 0:
-                print(f"  → Filtering out {n_invalid_coordinates} neurons with invalid coordinates")
-            if n_total_filtered > 0:
-                print(f"  → Total neurons filtered: {n_total_filtered} out of {N_original} ({n_total_filtered/N_original*100:.1f}%)")
-        
-            # Apply masks
-            cell_xyz = cell_xyz[valid_mask]
-            calcium = calcium[:, valid_mask]
-            
-            T, N = calcium.shape
-            print(f"  → Retained {N} neurons with valid coordinates")
+            # If absIX was used, skip additional masking to preserve index alignment
+            if have_abs_ix:
+                N = calcium.shape[1]
+                print(f"  → Retained {N} neurons (absIX-based alignment)")
+            else:
+                # Fallback simple coordinate NaN filter only if needed
+                coordinate_mask = ~np.isnan(cell_xyz).any(axis=1)
+                if not np.all(coordinate_mask):
+                    calcium = calcium[:, coordinate_mask]
+                    cell_xyz = cell_xyz[coordinate_mask]
+                T, N = calcium.shape
+                print(f"  → Retained {N} neurons after coordinate sanity check")
 
             # Prepare normalized positions (use CellXYZ_norm if available, else CellXYZ)
             # Always normalize to [0, 1] per axis after masking/selection
-            base_positions = None
-            if cell_xyz_norm_available:
-                base_positions = cell_xyz_norm[valid_mask]
+            # Select base positions for normalization preserving index alignment
+            if cell_xyz_norm_available and have_abs_ix:
+                base_positions = cell_xyz  # already selected via absIX and set into cell_xyz
+            elif cell_xyz_norm_available and not have_abs_ix:
+                # cell_xyz corresponds to filtered set; map via retained indices is already applied
+                base_positions = cell_xyz_norm[:cell_xyz.shape[0]] if cell_xyz_norm.shape[0] != cell_xyz.shape[0] else cell_xyz_norm
             else:
                 base_positions = cell_xyz
-                base_positions = base_positions[valid_mask]
             
             # Apply test run neuron selection if specified
             test_run_neurons = config['data'].get('test_run_neurons')
@@ -591,15 +651,15 @@ def process_subject(subject_dir, config):
         del calcium
         gc.collect()
         
-                # Run CASCADE inference
+        # Run CASCADE inference
         prob_data = run_cascade_inference(
-            processed_calcium, 
-            config['processing']['batch_size'], 
+            processed_calcium,
+            config['processing']['batch_size'],
             config['cascade']['model_type'],
             effective_sampling_rate
-                )
-                
-                # Clean up after CASCADE
+        )
+
+        # Clean up after CASCADE
         del processed_calcium
         gc.collect()
         
@@ -647,69 +707,69 @@ def process_subject(subject_dir, config):
         # Prepare data for saving - transpose probabilities to (T, N) format and convert to configured dtype
         print("  → Preparing probability data for saving...")
         output_dtype = getattr(np, config['output']['dtype'])
-        
+
         # Handle NaN values in probability data
         prob_data = np.nan_to_num(prob_data, nan=0.0, posinf=0.0, neginf=0.0)
-        
+
         # Transpose to (T, N) and convert to specified dtype
         prob_data_transposed = prob_data.T.astype(output_dtype)  # (T, N)
-        
+
         # Use normalized positions computed above
         cell_positions = norm_positions.astype(output_dtype)  # (N, 3) in [0, 1]
-            
+
         # Save final data
         print(f"  → Saving final data to {final_file}")
         with h5py.File(final_file, 'w') as f:
             # Save main datasets
-            f.create_dataset('spike_probabilities', 
+            f.create_dataset('spike_probabilities',
                             data=prob_data_transposed,
                             chunks=(min(1000, T), min(100, N)),
                             compression='gzip',
                             compression_opts=1)
-            
-            f.create_dataset('cell_positions', 
-                            data=cell_positions,
-                            compression='gzip',
-                            compression_opts=1)
-                
-            f.create_dataset('timepoint_indices', 
-                            data=np.arange(T, dtype=np.int32))
-                
+
+            f.create_dataset('cell_positions',
+                             data=cell_positions,
+                             compression='gzip',
+                             compression_opts=1)
+
+            f.create_dataset('timepoint_indices',
+                             data=np.arange(T, dtype=np.int32))
+
             # Save metadata as datasets
             f.create_dataset('num_timepoints', data=T)
             f.create_dataset('num_neurons', data=N)
-            
+
             # Sampling rate information (always included)
             f.create_dataset('original_sampling_rate_hz', data=fpsec)
-            
+
             # Save additional datasets if requested
             if config['output'].get('include_additional_data', True):
                 print(f"  → Saving additional datasets...")
-                
+
                 # Anatomical reference stack
-                f.create_dataset('anat_stack', 
-                                data=anat_stack,
-                                compression='gzip',
-                                compression_opts=1)
-                
+                f.create_dataset('anat_stack',
+                                 data=anat_stack,
+                                 compression='gzip',
+                                 compression_opts=1)
+
                 # Temporal data (stimulus, behavior, eye tracking)
-                f.create_dataset('stimulus_full', 
-                                data=stim_full,
-                                compression='gzip',
-                                compression_opts=1)
-                
-                f.create_dataset('behavior_full', 
-                                data=behavior_full,
-                                compression='gzip',
-                                compression_opts=1)
-                
-                f.create_dataset('eye_full', 
-                                data=eye_full,
-                                compression='gzip',
-                                compression_opts=1)
+                f.create_dataset('stimulus_full',
+                                 data=stim_full,
+                                 compression='gzip',
+                                 compression_opts=1)
+
+                f.create_dataset('behavior_full',
+                                 data=behavior_full,
+                                 compression='gzip',
+                                 compression_opts=1)
+
+                f.create_dataset('eye_full',
+                                 data=eye_full,
+                                 compression='gzip',
+                                 compression_opts=1)
             else:
                 print(f"  → Skipping additional datasets per configuration")
-                
+
             # Save attributes
             f.attrs['subject'] = subject_name
             f.attrs['data_source'] = 'raw_calcium'
@@ -738,7 +798,7 @@ def process_subject(subject_dir, config):
         create_visualization_pdf(calcium_for_viz, prob_data, subject_name, pdf_file, 
                                config['processing']['num_neurons_viz'])
             
-            # Clean up memory
+        # Clean up memory
         del calcium_for_viz, prob_data, prob_data_transposed, cell_positions
         del anat_stack, stim_full, behavior_full, eye_full
         gc.collect()
