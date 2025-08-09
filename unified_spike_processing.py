@@ -309,6 +309,23 @@ def process_subject(subject_dir, config):
         
         if isinstance(cell_xyz, np.ndarray) and cell_xyz.dtype == np.object_:
             cell_xyz = cell_xyz[0, 0]
+
+        # Try to load normalized positions if available
+        cell_xyz_norm_available = False
+        cell_xyz_norm = None
+        if 'CellXYZ_norm' in data0.dtype.names:
+            try:
+                cell_xyz_norm = data0['CellXYZ_norm']
+                if isinstance(cell_xyz_norm, np.ndarray) and cell_xyz_norm.dtype == np.object_:
+                    cell_xyz_norm = cell_xyz_norm[0, 0]
+                # Validate shape
+                if isinstance(cell_xyz_norm, np.ndarray) and cell_xyz_norm.shape == cell_xyz.shape:
+                    cell_xyz_norm_available = True
+                    print("  → Found CellXYZ_norm; will use as base for normalization")
+                else:
+                    cell_xyz_norm = None
+            except Exception:
+                cell_xyz_norm = None
         
         # Load additional datasets
         print("  → Loading additional datasets from MATLAB file...")
@@ -450,6 +467,15 @@ def process_subject(subject_dir, config):
             
             T, N = calcium.shape
             print(f"  → Retained {N} neurons with valid coordinates")
+
+            # Prepare normalized positions (use CellXYZ_norm if available, else CellXYZ)
+            # Always normalize to [0, 1] per axis after masking/selection
+            base_positions = None
+            if cell_xyz_norm_available:
+                base_positions = cell_xyz_norm[valid_mask]
+            else:
+                base_positions = cell_xyz
+                base_positions = base_positions[valid_mask]
             
             # Apply test run neuron selection if specified
             test_run_neurons = config['data'].get('test_run_neurons')
@@ -461,9 +487,23 @@ def process_subject(subject_dir, config):
                 
                 calcium = calcium[:, selected_indices]
                 cell_xyz = cell_xyz[selected_indices, :]
+                base_positions = base_positions[selected_indices, :]
                 
                 T, N = calcium.shape
                 print(f"  → Reduced to {N} neurons for testing")
+
+            # Compute normalization stats and normalized positions in [0, 1]
+            # Replace NaNs before normalization
+            if np.isnan(base_positions).any():
+                base_positions = np.nan_to_num(base_positions)
+
+            pos_min = base_positions.min(axis=0)
+            pos_max = base_positions.max(axis=0)
+            pos_range = pos_max - pos_min
+            pos_range[pos_range == 0] = 1.0
+            norm_positions = (base_positions - pos_min) / pos_range
+            # Safety: clip to [0, 1]
+            norm_positions = np.clip(norm_positions, 0.0, 1.0)
             
         # Keep a copy of calcium for visualization
         calcium_for_viz = calcium[:, :min(config['processing']['num_neurons_viz'] * 2, N)].copy()
@@ -614,12 +654,8 @@ def process_subject(subject_dir, config):
         # Transpose to (T, N) and convert to specified dtype
         prob_data_transposed = prob_data.T.astype(output_dtype)  # (T, N)
         
-        # Handle NaN values in cell positions and convert to specified dtype  
-        if np.isnan(cell_xyz).any():
-            print("  → Warning: NaN values found in cell positions, replacing with 0")
-            cell_xyz = np.nan_to_num(cell_xyz)
-        
-        cell_positions = cell_xyz.astype(output_dtype)  # (N, 3)
+        # Use normalized positions computed above
+        cell_positions = norm_positions.astype(output_dtype)  # (N, 3) in [0, 1]
             
         # Save final data
         print(f"  → Saving final data to {final_file}")
@@ -679,6 +715,10 @@ def process_subject(subject_dir, config):
             f.attrs['data_source'] = 'raw_calcium'
             f.attrs['spike_dtype'] = config['output']['dtype']
             f.attrs['position_dtype'] = config['output']['dtype']
+            f.attrs['positions_normalized'] = True
+            f.attrs['positions_source'] = 'CellXYZ_norm' if cell_xyz_norm_available else 'CellXYZ_normalized_runtime'
+            f.attrs['positions_min'] = pos_min.astype(np.float32)
+            f.attrs['positions_max'] = pos_max.astype(np.float32)
             f.attrs['cascade_model'] = config['cascade']['model_type']
             f.attrs['calcium_dataset'] = config['data']['calcium_dataset']
             f.attrs['is_raw'] = config['data']['is_raw']

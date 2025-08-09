@@ -1,1495 +1,378 @@
 #!/usr/bin/env python3
 """
-Main training script for GBM (Generative Brain Model) with seq2seq training.
+Training script for neuron-level GBM with logging, plots, and videos.
+
+Features:
+- Date-time experiment folders with logs, CSVs, and plots
+- Per-epoch validation and comparison videos (next-step + autoregression)
+- Best-checkpoint video generation at the end
 """
 
-import os
-import sys
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
-import numpy as np
-import random
+from __future__ import annotations
+
 import argparse
 import logging
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, Any, Tuple
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
+
+import numpy as np
+import random
 import yaml
-from typing import Dict, Optional, Tuple, Any
 from tqdm import tqdm
-import pdb
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.append(str(project_root))
-
-# Import our modules
 from GenerativeBrainModel.models.gbm import GBM
-from GenerativeBrainModel.dataloaders.volume_dataloader import create_dataloaders, get_volume_info
+from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
-from GenerativeBrainModel.visualizations import create_validation_video
+from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
 
 
-# Configuration utilities embedded in this script
 def create_default_config() -> Dict[str, Any]:
-    """
-    Create default configuration dictionary for GBM training.
-    
-    Returns:
-        Dictionary with all configuration parameters
-    """
     return {
         'experiment': {
-            'name': 'gbm_training',
-            'description': 'GBM (Generative Brain Model) sequence-to-sequence training on 3D volumetric spike data',
-            'tags': ['gbm', 'seq2seq', '3d-volumes', 'spike-data', 'temporal-modeling']
+            'name': 'gbm_neural_training',
+            'description': 'GBM training on neuron-level probabilities with positions',
+            'tags': ['gbm', 'neurons', 'positions', 'seq2seq']
         },
-        
         'data': {
             'data_dir': 'processed_spike_voxels_2018',
-            'test_subjects': [
-                'subject_1',
-                'subject_4', 
-                'subject_5'
-            ],
-            'use_cache': False  # Test performance with caching disabled
+            'test_subjects': [],
+            'sampling_rate': None,  # pick auto group
+            'use_cache': False,
         },
-        
         'model': {
             'd_model': 256,
             'n_heads': 8,
             'n_layers': 4,
-            'autoencoder_path': None,  # Path to pretrained autoencoder checkpoint
-            'gbm_checkpoint_path': None,  # Path to complete GBM checkpoint for continued training
-            'reset_training_state': False,  # If True, reset epoch/step counters when loading GBM checkpoint
-            'volume_size': [256, 128, 30],
-            'region_size': [32, 16, 2],
+            'd_stimuli': 1,  # stimulus is a scalar code per step
         },
-        
         'training': {
-            'volumes_per_batch': 4,  # Number of sequences per batch
-            'num_epochs': 100,
-            'learning_rate': 0.0005,  # Lower LR for fine-tuning
+            'batch_size': 2,
+            'num_epochs': 50,
+            'learning_rate': 5e-4,
             'weight_decay': 1e-4,
-            'optimizer': 'adamw',  # Optimizer type: 'adamw' or 'muon'
-            # Muon-specific settings (used when optimizer='muon')
-            'muon_lr': 0.02,  # Learning rate for Muon (hidden weights)
-            'muon_momentum': 0.95,  # Momentum for Muon
-            'muon_nesterov': True,  # Use Nesterov momentum for Muon
-            'muon_ns_steps': 5,  # Number of steps for Muon
-            # AdamW settings for non-hidden params when using Muon
-            'adamw_lr': 3e-4,  # Learning rate for AdamW params (when using Muon)
-            'adamw_betas': [0.9, 0.95],  # Beta values for AdamW
-            'adamw_eps': 1e-8,           # Epsilon for AdamW
-            # Muon-specific hyperparameters
-            'muon_betas': [0.9, 0.95],    # Beta values for Muon optimizer
-            'muon_eps': 1e-8,             # Epsilon for Muon optimizer
-            'scheduler': 'warmup_cosine',  # Linear warmup + cosine annealing
-            # Available schedulers: 'linear_warmup', 'warmup_cosine', 'warmup_lineardecay', 'cosine', 'step', or None
-            'min_lr_ratio': 0.01,  # Minimum LR as ratio of initial LR (for warmup_cosine and warmup_lineardecay)
-            'gradient_clip_norm': 1.0,
-            'gradient_accumulation_steps': None,  # Number of batches to accumulate gradients over (None/0 = disabled)
-            'validation_frequency': 8,  # Number of times to run validation per epoch
-            
-            # Sequence parameters for GBM (seq2seq training)
-            'sequence_length': 8,  # Length of input sequences (longer for temporal modeling)
-            'stride': 2,  # Stride between sequences (overlap for more training data)
-            'max_timepoints_per_subject': None,  # Max timepoints per subject file (None = use all available)
-            
-            # Hardware settings
-            'use_gpu': True,
-            'pin_memory': False,  # Large 3-D volumes + shared memory → bus errors; default off
-            'persistent_workers': False,  # Safer default; can enable if system SHM is large
-            'prefetch_factor': 2,  # Reduce SHM usage vs default 8
+            'scheduler': 'warmup_cosine',
+            'min_lr_ratio': 0.01,
+            'sequence_length': 12,
+            'stride': 3,
+            'max_timepoints_per_subject': None,
             'num_workers': 2,
+            'pin_memory': False,
+            'persistent_workers': False,
+            'prefetch_factor': 2,
+            'use_gpu': True,
             'mixed_precision': True,
-            'compile_model': False,  # PyTorch 2.0 compile
-            
-            # Random seed
-            'seed': 42
+            'compile_model': False,
+            'seed': 42,
+            'validation_frequency': 8,
+            'gradient_clip_norm': 1.0,
+            'gradient_accumulation_steps': None,
         },
-        
-        'loss': {
-            'loss_function': 'bce',  # BCE for probability prediction
-            'loss_weights': {
-                'reconstruction': 1.0,
-                'regularization': 0.0
-            }
-        },
-        
         'logging': {
             'log_level': 'INFO',
-            'log_frequency': 10,  # Log every N batches
-            'save_checkpoint_frequency': 5,  # Save checkpoint every N epochs
-            'keep_n_checkpoints': 3
         },
-        
-        'paths': {
-            'output_base_dir': 'experiments/gbm',
-            'checkpoint_dir': None,  # Will be set automatically
-            'log_dir': None,  # Will be set automatically
-            'plot_dir': None  # Will be set automatically
-        }
     }
 
 
-def generate_config_file(output_path: str, overrides: Dict = None) -> None:
-    """
-    Generate a YAML configuration file with optional overrides.
-    
-    Args:
-        output_path: Path to save the config file
-        overrides: Dictionary of config overrides
-    """
-    config = create_default_config()
-    
-    # Apply overrides if provided
-    if overrides:
-        config = deep_update(config, overrides)
-    
-    # Create output directory if it doesn't exist
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Save config
-    with open(output_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, indent=2, sort_keys=False)
-    
-    print(f"Configuration file saved to: {output_path}")
-
-
-def load_config(config_path: str) -> Dict[str, Any]:
-    """
-    Load configuration from YAML file.
-    
-    Args:
-        config_path: Path to YAML config file
-        
-    Returns:
-        Configuration dictionary
-    """
-    # Load user config
-    with open(config_path, 'r') as f:
-        user_config = yaml.safe_load(f)
-    # Merge with defaults to fill missing keys
-    default_config = create_default_config()
-    config = deep_update(default_config, user_config)
-    # Validate and set automatic paths
-    config = setup_experiment_paths(config)
-    return config
-
-
-def setup_experiment_paths(config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Set up experiment directory structure and paths.
-    
-    Args:
-        config: Configuration dictionary
-        
-    Returns:
-        Updated configuration with paths set
-    """
-    # Create timestamp for experiment
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_name = config['experiment']['name']
-    
-    # Base experiment directory
-    base_dir = Path(config['paths']['output_base_dir']) / f"{experiment_name}_{timestamp}"
-    
-    # Set all paths
-    config['paths']['checkpoint_dir'] = str(base_dir / 'checkpoints')
-    config['paths']['log_dir'] = str(base_dir / 'logs')
-    config['paths']['plot_dir'] = str(base_dir / 'logs' / 'plots')
-    config['paths']['experiment_dir'] = str(base_dir)
-    
-    # Create directories
-    for path_key in ['checkpoint_dir', 'log_dir', 'plot_dir']:
-        Path(config['paths'][path_key]).mkdir(parents=True, exist_ok=True)
-    
-    return config
-
-
-def validate_config(config: Dict[str, Any]) -> None:
-    """
-    Validate configuration parameters.
-    
-    Args:
-        config: Configuration dictionary
-        
-    Raises:
-        ValueError: If configuration is invalid
-    """
-    # Check data directory exists
-    data_dir = Path(config['data']['data_dir'])
-    if not data_dir.exists():
-        raise ValueError(f"Data directory does not exist: {data_dir}")
-    
-    # Check for H5 files
-    h5_files = list(data_dir.glob("*.h5"))
-    if not h5_files:
-        raise ValueError(f"No H5 files found in data directory: {data_dir}")
-    
-    # Validate test subjects exist
-    test_subjects = config['data'].get('test_subjects', [])
-    if test_subjects:
-        missing_subjects = []
-        for subject in test_subjects:
-            if not (data_dir / f"{subject}.h5").exists():
-                missing_subjects.append(subject)
-        if missing_subjects:
-            print(f"Warning: Test subjects not found: {missing_subjects}")
-    
-    # Validate volume/region size compatibility
-    model_config = config['model']
-    volume_size = model_config['volume_size']
-    region_size = model_config['region_size']
-    
-    for i in range(3):
-        if volume_size[i] % region_size[i] != 0:
-            raise ValueError(
-                f"Volume size {volume_size} not divisible by region size {region_size} "
-                f"at dimension {i}"
-            )
-    
-    # Check autoencoder path if provided
-    autoencoder_path = model_config.get('autoencoder_path')
-    if autoencoder_path and not Path(autoencoder_path).exists():
-        raise ValueError(f"Autoencoder checkpoint not found: {autoencoder_path}")
-    
-    # Check GBM checkpoint path if provided
-    gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
-    if gbm_checkpoint_path and not Path(gbm_checkpoint_path).exists():
-        raise ValueError(f"GBM checkpoint not found: {gbm_checkpoint_path}")
-    
-    # Validate sequence length
-    seq_len = config['training']['sequence_length']
-    if seq_len < 2:
-        raise ValueError(f"Sequence length must be at least 2 for seq2seq training, got {seq_len}")
-    
-    print(f"Configuration validation passed!")
-    print(f"GBM Model: d_model={model_config['d_model']}, n_heads={model_config['n_heads']}, n_layers={model_config['n_layers']}")
-    print(f"Sequence length: {seq_len}")
-    
-    # Show checkpoint/autoencoder loading info
-    gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
-    autoencoder_path = model_config.get('autoencoder_path')
-    reset_training_state = model_config.get('reset_training_state', False)
-    
-    if gbm_checkpoint_path:
-        reset_msg = " (with training state reset)" if reset_training_state else " (continuing from checkpoint)"
-        print(f"Will load complete GBM checkpoint: {gbm_checkpoint_path}{reset_msg}")
-    elif autoencoder_path:
-        print(f"Will load pretrained autoencoder: {autoencoder_path}")
-    else:
-        print("Will use randomly initialized model")
-
-
-def deep_update(base_dict: Dict, update_dict: Dict) -> Dict:
-    """
-    Recursively update nested dictionary.
-    
-    Args:
-        base_dict: Base dictionary
-        update_dict: Dictionary with updates
-        
-    Returns:
-        Updated dictionary
-    """
-    result = base_dict.copy()
-    
-    for key, value in update_dict.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = deep_update(result[key], value)
+def deep_update(base: Dict, updates: Dict) -> Dict:
+    result = base.copy()
+    for k, v in updates.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = deep_update(result[k], v)
         else:
-            result[key] = value
-    
+            result[k] = v
     return result
 
 
-def save_config(config: Dict[str, Any], save_path: str) -> None:
-    """
-    Save configuration to YAML file.
-    
-    Args:
-        config: Configuration dictionary
-        save_path: Path to save config
-    """
-    with open(save_path, 'w') as f:
+def setup_experiment_dirs(base_dir: Path, name: str) -> Dict[str, Path]:
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    exp_dir = base_dir / f"{name}_{ts}"
+    log_dir = exp_dir / 'logs'
+    plots_dir = log_dir / 'plots'
+    videos_dir = exp_dir / 'videos'
+    ckpt_dir = exp_dir / 'checkpoints'
+    for p in [exp_dir, log_dir, plots_dir, videos_dir, ckpt_dir]:
+        p.mkdir(parents=True, exist_ok=True)
+    return {'exp': exp_dir, 'logs': log_dir, 'plots': plots_dir, 'videos': videos_dir, 'ckpt': ckpt_dir}
+
+
+def save_config(config: Dict[str, Any], path: Path) -> None:
+    with open(path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False, indent=2, sort_keys=False)
 
 
-class GBMTrainer:
-    """
-    Comprehensive GBM trainer with sequence-to-sequence training.
-    """
-    
-    def __init__(self, config: Dict):
-        """
-        Initialize trainer with configuration.
-        
-        Args:
-            config: Configuration dictionary
-        """
-        self.config = config
-        self.setup_logging()
-        self.setup_device()
-        self.setup_random_seeds()
-        
-        # Initialize components
-        self.model = None
-        self.optimizer = None
-        self.scheduler = None
-        self.scaler = None
-        self.train_loader = None
-        self.test_loader = None
-        
-        # Training state
-        self.current_epoch = 0
-        self.best_val_loss = float('inf')
-        self.best_model_path = None
-        self.early_stopping_counter = 0
-        self.loaded_from_checkpoint = False
-        self.checkpoint_epoch = 0
-        self.checkpoint_step = 0
-        self.checkpoint_data = None  # Store checkpoint data for optimizer/scheduler loading
-        
-        # Setup experiment directory
-        self.experiment_dir = Path(config['paths']['experiment_dir'])
-        self.checkpoint_dir = Path(config['paths']['checkpoint_dir'])
-        
-        # Initialize metrics tracker
-        self.metrics_tracker = CombinedMetricsTracker(
-            log_dir=config['paths']['log_dir'],
-            validation_threshold=0.5,
-            ema_alpha=0.05  # EMA smoothing factor for training loss
-        )
-        
-    def setup_logging(self):
-        """Set up logging configuration."""
-        log_dir = Path(self.config['paths']['log_dir'])
-        log_file = log_dir / 'training.log'
-        
-        logging.basicConfig(
-            level=getattr(logging, self.config['logging']['log_level']),
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler()
-            ]
-        )
-        
-        self.logger = logging.getLogger(__name__)
-        self.logger.info(f"Logging initialized. Log file: {log_file}")
-    
-    def setup_device(self):
-        """Set up compute device (GPU/CPU)."""
-        if self.config['training']['use_gpu'] and torch.cuda.is_available():
-            self.device = torch.device('cuda')
-            self.logger.info(f"Using GPU: {torch.cuda.get_device_name()}")
-            self.logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+def build_logger(log_dir: Path, level: str = 'INFO') -> logging.Logger:
+    logger = logging.getLogger('train_gbm')
+    logger.setLevel(getattr(logging, level))
+    fh = logging.FileHandler(log_dir / 'training.log')
+    sh = logging.StreamHandler()
+    fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fh.setFormatter(fmt)
+    sh.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+
+def set_seeds(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def build_optimizer(model: GBM, cfg: Dict[str, Any]) -> Tuple[optim.Optimizer, Optional[optim.lr_scheduler._LRScheduler]]:
+    """Build Muon optimizer for hidden weights and AdamW for others, per Muon guidance."""
+    try:
+        from muon import MuonWithAuxAdam
+    except ImportError as e:
+        raise ImportError("Muon optimizer not found. Install: pip install git+https://github.com/KellerJordan/Muon") from e
+
+    # Hidden weights: parameters with ndim >= 2 from the attention body (layers)
+    hidden_weights = [p for p in model.body.parameters() if p.ndim >= 2 and p.requires_grad]
+    # Hidden gains/biases: parameters with ndim < 2 from the body
+    hidden_gains_biases = [p for p in model.body.parameters() if p.ndim < 2 and p.requires_grad]
+    # Non-hidden: embeddings + head
+    nonhidden_params = []
+    for m in model.embed.values():
+        nonhidden_params += [p for p in m.parameters() if p.requires_grad]
+    nonhidden_params += [p for p in model.head.parameters() if p.requires_grad]
+
+    # Construct parameter groups
+    muon_lr = cfg.get('muon_lr', 0.02)
+    muon_weight_decay = cfg.get('weight_decay', 1e-4)
+    adamw_lr = cfg.get('learning_rate', 3e-4)
+    adamw_betas = tuple(cfg.get('adamw_betas', (0.9, 0.95)))
+    adamw_weight_decay = cfg.get('weight_decay', 1e-4)
+
+    param_groups = []
+    if hidden_weights:
+        param_groups.append(dict(params=hidden_weights, use_muon=True, lr=muon_lr, weight_decay=muon_weight_decay))
+    if hidden_gains_biases or nonhidden_params:
+        param_groups.append(dict(params=hidden_gains_biases + nonhidden_params, use_muon=False, lr=adamw_lr, betas=adamw_betas, weight_decay=adamw_weight_decay))
+
+    opt = MuonWithAuxAdam(param_groups)
+
+    sched_type = cfg.get('scheduler', None)
+    scheduler = None
+    if sched_type == 'warmup_cosine':
+        scheduler = 'warmup_cosine_placeholder'
+    elif sched_type == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg['num_epochs'], eta_min=adamw_lr * cfg.get('min_lr_ratio', 0.01))
+    elif sched_type == 'step':
+        scheduler = optim.lr_scheduler.StepLR(opt, step_size=max(1, cfg['num_epochs'] // 3), gamma=0.1)
+    return opt, scheduler
+
+
+def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, optimizer, scheduler, scaler: Optional[GradScaler], tracker: CombinedMetricsTracker, epoch: int, cfg: Dict[str, Any]) -> None:
+    model.train()
+    grad_accum = cfg.get('gradient_accumulation_steps') or 1
+    pbar = tqdm(loader, desc=f"Epoch {epoch}")
+    for batch_idx, batch in enumerate(pbar, 1):
+        spikes = batch['spikes'].to(device)           # (B, L, N)
+        positions = batch['positions'].to(device)     # (B, N, 3)
+        mask = batch['neuron_mask'].to(device)        # (B, N)
+        stim = batch['stimulus'].to(device).float()   # (B, L)
+
+        # Prepare seq2seq (input: 0..L-2, target: 1..L-1)
+        x_in = spikes[:, :-1, :]
+        x_tgt = spikes[:, 1:, :]
+        stim_in = stim[:, :-1].unsqueeze(-1)  # (B, L-1, 1)
+
+        if batch_idx % grad_accum == 1:
+            optimizer.zero_grad()
+
+        with autocast(enabled=scaler is not None):
+            logits = model(x_in, stim_in, positions, mask, get_logits=True)  # (B, L-1, N)
+            loss = nn.BCEWithLogitsLoss()(logits, x_tgt)
+            loss_to_backprop = loss / grad_accum
+
+        if scaler is not None:
+            scaler.scale(loss_to_backprop).backward()
+            if batch_idx % grad_accum == 0:
+                scaler.unscale_(optimizer)
+                if cfg.get('gradient_clip_norm'):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['gradient_clip_norm'])
+                scaler.step(optimizer)
+                scaler.update()
         else:
-            self.device = torch.device('cpu')
-            self.logger.info("Using CPU")
-    
-    def setup_random_seeds(self):
-        """Set random seeds for reproducibility."""
-        seed = self.config['training']['seed']
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-        
-        # Make sure operations are deterministic
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        
-        self.logger.info(f"Random seed set to: {seed}")
-    
-    def build_model(self):
-        """Build and initialize the GBM model."""
-        model_config = self.config['model']
-        
-        
-        # Create single GBM model
-        self.model = GBM(
-            d_model=model_config['d_model'],
-            n_heads=model_config['n_heads'],
-            n_layers=model_config['n_layers'],
-            autoencoder_path=model_config.get('autoencoder_path'),
-            volume_size=tuple(model_config['volume_size']),
-            region_size=tuple(model_config['region_size'])
-        )
-        self.logger.info("Created single GBM model")
-        
-        autoencoder_path = model_config.get('autoencoder_path')
-        gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
-        
-        if gbm_checkpoint_path and autoencoder_path:
-            self.logger.info(f"Both GBM checkpoint and autoencoder path provided - GBM checkpoint takes precedence")
-        elif autoencoder_path and not gbm_checkpoint_path:
-            self.logger.info(f"Loaded pretrained autoencoder from: {autoencoder_path}")
-        elif not autoencoder_path and not gbm_checkpoint_path:
-            self.logger.warning("No autoencoder path or GBM checkpoint provided - using randomly initialized autoencoder")
-        
-        self.logger.info(f"Model volume size: {model_config['volume_size']}, region size: {model_config['region_size']}")
-        
-        self.model.to(self.device)
-        
-        # Load complete GBM checkpoint if provided (takes precedence over autoencoder_path)
-        gbm_checkpoint_path = model_config.get('gbm_checkpoint_path')
-        if gbm_checkpoint_path:
-            self.load_gbm_checkpoint(gbm_checkpoint_path)
-        
-        # Compile model if requested (PyTorch 2.0+)
-        if self.config['training'].get('compile_model', False):
-            # Disable Dynamo compilation for Mamba layers which already ship Triton kernels
-            try:
-                import torch._dynamo as _dynamo
-                from mamba_ssm import Mamba2 as Mamba
+            loss_to_backprop.backward()
+            if batch_idx % grad_accum == 0:
+                if cfg.get('gradient_clip_norm'):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['gradient_clip_norm'])
+                optimizer.step()
 
-                def _disable_mamba(module: torch.nn.Module):
-                    if isinstance(module, Mamba):
-                        module.forward = _dynamo.disable(module.forward)
-                self.model.apply(_disable_mamba)
+        # Per-batch scheduler (warmup_cosine)
+        if scheduler == 'warmup_cosine_placeholder' and 'train_loader_len' in cfg:
+            # Setup on first use
+            if 'scheduler_obj' not in cfg:
+                warm = int(0.1 * cfg['train_loader_len'])
+                total = cfg['num_epochs'] * cfg['train_loader_len']
+                base_lr = cfg['learning_rate']
+                min_lr = base_lr * cfg.get('min_lr_ratio', 0.01)
+                def lr_lambda(step):
+                    if step < warm:
+                        return float(step) / float(max(1, warm))
+                    prog = (step - warm) / max(1, total - warm)
+                    return (min_lr + 0.5 * (base_lr - min_lr) * (1 + np.cos(np.pi * min(prog, 1.0)))) / base_lr
+                cfg['scheduler_obj'] = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+                cfg['global_step'] = 0
+            cfg['global_step'] += 1
+            cfg['scheduler_obj'].step()
 
-                self.model = torch.compile(self.model)
-                self.logger.info("Model compiled with PyTorch 2.0 (Mamba layers excluded from compilation)")
-            except Exception as e:
-                self.logger.warning(f"Model compilation failed: {e}")
-        
-        # Log model info
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        untrainable_params = total_params - trainable_params
-        
-        self.logger.info(f"Model created: {self.model.__class__.__name__}")
-        self.logger.info(f"Total parameters: {total_params:,}")
-        self.logger.info(f"Trainable parameters: {trainable_params:,}")
-        self.logger.info(f"Untrainable parameters: {untrainable_params:,}")
-        self.logger.info(f"Model size: {total_params * 4 / 1e6:.1f} MB (float32)")
-        
-        # Save architecture info to file
-        self.save_architecture_info(total_params, trainable_params, untrainable_params)
-    
-    def save_architecture_info(self, total_params: int, trainable_params: int, untrainable_params: int):
-        """
-        Save detailed model architecture information to a text file.
-        
-        Args:
-            total_params: Total number of parameters
-            trainable_params: Number of trainable parameters
-            untrainable_params: Number of untrainable parameters
-        """
-        architecture_file = self.experiment_dir / 'architecture.txt'
-        
-        with open(architecture_file, 'w') as f:
-            f.write("=" * 80 + "\n")
-            f.write("GBM MODEL ARCHITECTURE SUMMARY\n")
-            f.write("=" * 80 + "\n\n")
-            
-            # Basic model info
-            f.write(f"Model Class: {self.model.__class__.__name__}\n")
-            f.write(f"Experiment: {self.config['experiment']['name']}\n")
-            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            
-            # Model configuration
-            f.write("MODEL CONFIGURATION:\n")
-            f.write("-" * 40 + "\n")
-            model_config = self.config['model']
-            for key, value in model_config.items():
-                f.write(f"  {key}: {value}\n")
-            f.write("\n")
-            
-            # Parameter counts
-            f.write("PARAMETER SUMMARY:\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"  Total Parameters:      {total_params:,}\n")
-            f.write(f"  Trainable Parameters:   {trainable_params:,}\n")
-            f.write(f"  Untrainable Parameters: {untrainable_params:,}\n")
-            f.write(f"  Model Size (float32):   {total_params * 4 / 1e6:.2f} MB\n")
-            f.write(f"  Model Size (float16):   {total_params * 2 / 1e6:.2f} MB\n\n")
-            
-            # Detailed parameter breakdown by layer
-            f.write("PARAMETER BREAKDOWN BY LAYER:\n")
-            f.write("-" * 40 + "\n")
-            for name, param in self.model.named_parameters():
-                param_count = param.numel()
-                trainable = "✓" if param.requires_grad else "✗"
-                f.write(f"  {name:<40} {param_count:>10,} [{trainable}] {tuple(param.shape)}\n")
-            f.write("\n")
-            
-            # Buffer information (non-trainable tensors)
-            f.write("REGISTERED BUFFERS:\n")
-            f.write("-" * 40 + "\n")
-            for name, buffer in self.model.named_buffers():
-                buffer_count = buffer.numel() if buffer is not None else 0
-                shape = tuple(buffer.shape) if buffer is not None else "None"
-                f.write(f"  {name:<40} {buffer_count:>10,} {shape}\n")
-            f.write("\n")
-            
-            # Model architecture string representation
-            f.write("DETAILED MODEL ARCHITECTURE:\n")
-            f.write("-" * 40 + "\n")
-            f.write(str(self.model))
-            f.write("\n\n")
-            
-            # Training configuration
-            f.write("TRAINING CONFIGURATION:\n")
-            f.write("-" * 40 + "\n")
-            training_config = self.config['training']
-            for key, value in training_config.items():
-                f.write(f"  {key}: {value}\n")
-            f.write("\n")
-            
-            # Hardware info
-            f.write("HARDWARE INFORMATION:\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"  Device: {self.device}\n")
-            if self.device.type == 'cuda':
-                f.write(f"  GPU Name: {torch.cuda.get_device_name()}\n")
-                f.write(f"  GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB\n")
-                f.write(f"  CUDA Version: {torch.version.cuda}\n")
-            f.write(f"  PyTorch Version: {torch.__version__}\n")
-            f.write(f"  Mixed Precision: {self.config['training'].get('mixed_precision', False)}\n")
-            f.write(f"  Model Compilation: {self.config['training'].get('compile_model', False)}\n")
-            
-            f.write("\n" + "=" * 80 + "\n")
-        
-        self.logger.info(f"Model architecture saved to: {architecture_file}")
-    
-    def load_gbm_checkpoint(self, checkpoint_path: str):
-        """
-        Load a complete GBM checkpoint for continued training.
-        
-        Args:
-            checkpoint_path: Path to the GBM checkpoint file
-        """
-        checkpoint_path = Path(checkpoint_path)
-        self.logger.info(f"Loading GBM checkpoint from: {checkpoint_path}")
-        
-        try:
-            # Load checkpoint
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            
-            # Handle torch.compile() prefixes (_orig_mod.) in state dict keys
-            model_state_dict = checkpoint['model_state_dict']
-            cleaned_state_dict = {}
-            for key, value in model_state_dict.items():
-                # Remove _orig_mod. prefix if present (from torch.compile)
-                if key.startswith('_orig_mod.'):
-                    cleaned_key = key[len('_orig_mod.'):]
-                else:
-                    cleaned_key = key
-                cleaned_state_dict[cleaned_key] = value
-            
-            # Load model state
-            self.model.load_state_dict(cleaned_state_dict)
-            
-            # Load training state (unless reset is requested)
-            reset_training_state = self.config['model'].get('reset_training_state', False)
-            if reset_training_state:
-                self.checkpoint_epoch = 0
-                self.checkpoint_step = 0
-                self.best_val_loss = float('inf')
-                self.logger.info("Training state reset - will start training from epoch 1")
-            else:
-                self.checkpoint_epoch = checkpoint.get('epoch', 0)
-                self.checkpoint_step = checkpoint.get('step', 0)
-                self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-                
-                # If this was the best model, update best_model_path
-                if 'validation_loss' in checkpoint:
-                    self.best_val_loss = checkpoint['validation_loss']
-            
-            self.loaded_from_checkpoint = True
-            self.checkpoint_data = checkpoint  # Store for optimizer/scheduler loading
-            
-            self.logger.info(f"Successfully loaded GBM checkpoint:")
-            self.logger.info(f"  Checkpoint epoch: {self.checkpoint_epoch}")
-            self.logger.info(f"  Checkpoint step: {self.checkpoint_step}")
-            self.logger.info(f"  Best validation loss: {self.best_val_loss}")
-            
-            # Check if config matches
-            if 'config' in checkpoint:
-                checkpoint_config = checkpoint['config']
-                current_model_config = self.config['model']
-                checkpoint_model_config = checkpoint_config.get('model', {})
-                
-                # Compare key model parameters
-                key_params = ['d_model', 'n_heads', 'n_layers', 'volume_size', 'region_size']
-                for param in key_params:
-                    current_val = current_model_config.get(param)
-                    checkpoint_val = checkpoint_model_config.get(param)
-                    if current_val != checkpoint_val:
-                        self.logger.warning(f"Config mismatch for {param}: current={current_val}, checkpoint={checkpoint_val}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to load GBM checkpoint: {e}")
-            raise ValueError(f"Could not load GBM checkpoint from {checkpoint_path}: {e}")
-    
-    def load_optimizer_states(self):
-        """
-        Load optimizer and scheduler states from the stored checkpoint data.
-        This should be called after the optimizer and scheduler are built.
-        """
-        if not self.checkpoint_data:
-            self.logger.warning("No checkpoint data available for loading optimizer states")
-            return
-        
-        # Check if training state should be reset
-        reset_training_state = self.config['model'].get('reset_training_state', False)
-        if reset_training_state:
-            self.logger.info("Training state reset requested - using fresh optimizer/scheduler/scaler states")
-            return
-        
-        try:
-            # Load optimizer state
-            if 'optimizer_state_dict' in self.checkpoint_data:
-                self.optimizer.load_state_dict(self.checkpoint_data['optimizer_state_dict'])
-                self.logger.info("Loaded optimizer state from checkpoint")
-            else:
-                self.logger.info("No optimizer state found in checkpoint - using fresh optimizer")
-            
-            # Load scheduler state
-            if self.scheduler and 'scheduler_state_dict' in self.checkpoint_data:
-                self.scheduler.load_state_dict(self.checkpoint_data['scheduler_state_dict'])
-                self.logger.info("Loaded scheduler state from checkpoint")
-            elif self.scheduler:
-                self.logger.info("No scheduler state found in checkpoint - using fresh scheduler")
-            
-            # Load scaler state
-            if self.scaler and 'scaler_state_dict' in self.checkpoint_data:
-                self.scaler.load_state_dict(self.checkpoint_data['scaler_state_dict'])
-                self.logger.info("Loaded mixed precision scaler state from checkpoint")
-            elif self.scaler:
-                self.logger.info("No scaler state found in checkpoint - using fresh scaler")
-                
-        except Exception as e:
-            self.logger.warning(f"Failed to load optimizer/scheduler states from checkpoint: {e}")
-            self.logger.warning("Continuing with fresh optimizer/scheduler states")
-    
-    def build_optimizer(self):
-        """Build optimizer and scheduler."""
-        training_config = self.config['training']
-        
-        # Optimizer - only optimize trainable parameters
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        
-        optimizer_type = training_config.get('optimizer', 'adamw')
-        
-        if optimizer_type == 'adamw':
-            self.optimizer = optim.AdamW(
-                trainable_params,
-                lr=training_config['learning_rate'],
-                weight_decay=training_config['weight_decay']
-            )
-            self.logger.info(f"Using AdamW optimizer with learning rate {training_config['learning_rate']}")
-        elif optimizer_type == 'muon':
-            # Import Muon optimizer
-            try:
-                from muon import MuonWithAuxAdam
-            except ImportError:
-                raise ImportError("Muon optimizer not found. Please install with: pip install git+https://github.com/KellerJordan/Muon")
-            
-            # Separate parameters according to Muon guidelines
-            hidden_weights = []
-            hidden_gains_biases = []
-            nonhidden_params = []
-            
-            for name, param in self.model.named_parameters():
-                if not param.requires_grad:
-                    continue
-                    
-                # Parameters from autoencoder should use AdamW (non-hidden)
-                if 'autoencoder' in name:
-                    nonhidden_params.append(param)
-                # Hidden weights: parameters with ndim >= 2 (weight matrices, conv filters)
-                elif param.ndim >= 2:
-                    hidden_weights.append(param)
-                # Hidden gains/biases: parameters with ndim < 2 (biases, layer norms, etc.)
-                else:
-                    hidden_gains_biases.append(param)
-            
-            # Get optimizer settings
-            muon_lr = training_config.get('muon_lr', 0.02)
-            muon_momentum = training_config.get('muon_momentum', 0.95)
-            muon_nesterov = training_config.get('muon_nesterov', True)
-            muon_ns_steps = training_config.get('muon_ns_steps', 5)
-            
-            # AdamW optimizer for non-hidden parameters
-            adamw_lr = training_config.get('adamw_lr', 3e-4)
-            adamw_betas = training_config.get('adamw_betas', [0.9, 0.95])
-            
-            # Create parameter groups for MuonWithAuxAdam
-            param_groups = []
-            
-            # Hidden weights use Muon
-            if hidden_weights:
-                # Muon group: params, use_muon, lr, momentum, weight_decay
-                param_groups.append({
-                    'params': hidden_weights,
-                    'use_muon': True,
-                    'lr': muon_lr,
-                    'momentum': muon_momentum,
-                    'weight_decay': training_config['weight_decay']
-                })
-            
-            # Hidden gains/biases and non-hidden params use AdamW
-            if hidden_gains_biases or nonhidden_params:
-                # AdamW group in MuonWithAuxAdam: params, use_muon, lr, betas, eps, weight_decay
-                param_groups.append({
-                    'params': hidden_gains_biases + nonhidden_params,
-                    'use_muon': False,
-                    'lr': adamw_lr,
-                    'betas': training_config.get('adamw_betas'),
-                    'eps': training_config.get('adamw_eps'),
-                    'weight_decay': training_config['weight_decay']
-                })
-            
-            self.optimizer = MuonWithAuxAdam(param_groups)
-            
-            self.logger.info(f"Using Muon optimizer:")
-            self.logger.info(f"  Hidden weights ({len(hidden_weights)} params): Muon (LR: {muon_lr})")
-            self.logger.info(f"  Other params ({len(hidden_gains_biases) + len(nonhidden_params)} params): AdamW (LR: {adamw_lr})")
-        else:
-            raise ValueError(f"Unknown optimizer type: {optimizer_type}")
-        
-        self.logger.info(f"Optimizer parameters: {sum(p.numel() for p in trainable_params):,}")
-        
-        # Scheduler
-        scheduler_type = training_config.get('scheduler', 'cosine')
-        
-        # For Muon optimizer, we need to handle multiple parameter groups with different base LRs
-        if optimizer_type == 'muon':
-            base_muon_lr = training_config.get('muon_lr', 0.02)
-            base_adamw_lr = training_config.get('adamw_lr', 3e-4)
-        else:
-            base_lr = training_config['learning_rate']
-        
-        if scheduler_type == 'linear_warmup':
-            # Calculate total batches for warmup (10% of first epoch)
-            warmup_batches = int(0.1 * len(self.train_loader))
-            
-            if optimizer_type == 'muon':
-                # Different lambda functions for different parameter groups
-                def muon_lr_lambda(batch):
-                    if batch < warmup_batches:
-                        return float(batch) / float(max(1, warmup_batches))
-                    return 1.0
-                
-                def adamw_lr_lambda(batch):
-                    if batch < warmup_batches:
-                        return float(batch) / float(max(1, warmup_batches))
-                    return 1.0
-                
-                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, [muon_lr_lambda, adamw_lr_lambda])
-            else:
-                def lr_lambda(batch):
-                    if batch < warmup_batches:
-                        return float(batch) / float(max(1, warmup_batches))
-                    return 1.0
-                
-                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
-            
-            self.logger.info(f"Using Linear Warmup scheduler with {warmup_batches} warmup batches.")
-        
-        elif scheduler_type == 'warmup_cosine':
-            # Linear warmup followed by cosine annealing
-            warmup_batches = int(0.1 * len(self.train_loader))  # 10% of first epoch for warmup
-            total_batches = training_config['num_epochs'] * len(self.train_loader)
-            cosine_batches = total_batches - warmup_batches  # Remaining batches for cosine annealing
-            
-            # Get minimum learning rate (default to 1% of initial LR)
-            min_lr_ratio = training_config.get('min_lr_ratio', 0.01)
-            if optimizer_type == 'muon':
-                # Different lambda functions for different parameter groups
-                min_muon_lr = base_muon_lr * min_lr_ratio
-                min_adamw_lr = base_adamw_lr * min_lr_ratio
-                
-                def muon_lr_lambda(batch):
-                    if batch < warmup_batches:
-                        return float(batch) / float(max(1, warmup_batches))
-                    else:
-                        cosine_batch = batch - warmup_batches
-                        cosine_progress = cosine_batch / cosine_batches
-                        cosine_progress = min(cosine_progress, 1.0)
-                        
-                        lr = min_muon_lr + 0.5 * (base_muon_lr - min_muon_lr) * (1 + np.cos(np.pi * cosine_progress))
-                        return lr / base_muon_lr
-                
-                def adamw_lr_lambda(batch):
-                    if batch < warmup_batches:
-                        return float(batch) / float(max(1, warmup_batches))
-                    else:
-                        cosine_batch = batch - warmup_batches
-                        cosine_progress = cosine_batch / cosine_batches
-                        cosine_progress = min(cosine_progress, 1.0)
-                        
-                        lr = min_adamw_lr + 0.5 * (base_adamw_lr - min_adamw_lr) * (1 + np.cos(np.pi * cosine_progress))
-                        return lr / base_adamw_lr
-                
-                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, [muon_lr_lambda, adamw_lr_lambda])
-                min_lrs = f"Muon: {min_muon_lr:.2e}, AdamW: {min_adamw_lr:.2e}"
-            else:
-                min_lr = base_lr * min_lr_ratio
-                
-                def lr_lambda(batch):
-                    if batch < warmup_batches:
-                        return float(batch) / float(max(1, warmup_batches))
-                    else:
-                        cosine_batch = batch - warmup_batches
-                        cosine_progress = cosine_batch / cosine_batches
-                        cosine_progress = min(cosine_progress, 1.0)
-                        
-                        lr = min_lr + 0.5 * (base_lr - min_lr) * (1 + np.cos(np.pi * cosine_progress))
-                        return lr / base_lr
-                
-                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
-                min_lrs = f"{min_lr:.2e}"
-            
-            self.logger.info(f"Using Warmup + Cosine Annealing scheduler:")
-            self.logger.info(f"  Warmup batches: {warmup_batches}")
-            self.logger.info(f"  Total batches: {total_batches}")
-            self.logger.info(f"  Min LR ratio: {min_lr_ratio} (min_lrs: {min_lrs})")
-        
-        elif scheduler_type == 'warmup_lineardecay':
-            # Linear warmup followed by linear decay
-            warmup_batches = int(0.1 * len(self.train_loader))  # 10% of first epoch for warmup
-            total_batches = training_config['num_epochs'] * len(self.train_loader)
-            decay_batches = total_batches - warmup_batches  # Remaining batches for linear decay
-            
-            # Get minimum learning rate (default to 1% of initial LR)
-            min_lr_ratio = training_config.get('min_lr_ratio', 0.01)
-            if optimizer_type == 'muon':
-                # Different lambda functions for different parameter groups
-                min_muon_lr = base_muon_lr * min_lr_ratio
-                min_adamw_lr = base_adamw_lr * min_lr_ratio
-                
-                def muon_lr_lambda(batch):
-                    if batch < warmup_batches:
-                        return float(batch) / float(max(1, warmup_batches))
-                    else:
-                        decay_batch = batch - warmup_batches
-                        decay_progress = decay_batch / decay_batches
-                        decay_progress = min(decay_progress, 1.0)
-                        
-                        lr = base_muon_lr - (base_muon_lr - min_muon_lr) * decay_progress
-                        return lr / base_muon_lr
-                
-                def adamw_lr_lambda(batch):
-                    if batch < warmup_batches:
-                        return float(batch) / float(max(1, warmup_batches))
-                    else:
-                        decay_batch = batch - warmup_batches
-                        decay_progress = decay_batch / decay_batches
-                        decay_progress = min(decay_progress, 1.0)
-                        
-                        lr = base_adamw_lr - (base_adamw_lr - min_adamw_lr) * decay_progress
-                        return lr / base_adamw_lr
-                
-                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, [muon_lr_lambda, adamw_lr_lambda])
-                min_lrs = f"Muon: {min_muon_lr:.2e}, AdamW: {min_adamw_lr:.2e}"
-            else:
-                min_lr = base_lr * min_lr_ratio
-                
-                def lr_lambda(batch):
-                    if batch < warmup_batches:
-                        return float(batch) / float(max(1, warmup_batches))
-                    else:
-                        decay_batch = batch - warmup_batches
-                        decay_progress = decay_batch / decay_batches
-                        decay_progress = min(decay_progress, 1.0)
-                        
-                        lr = base_lr - (base_lr - min_lr) * decay_progress
-                        return lr / base_lr
-                
-                self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
-                min_lrs = f"{min_lr:.2e}"
-            
-            self.logger.info(f"Using Warmup + Linear Decay scheduler:")
-            self.logger.info(f"  Warmup batches: {warmup_batches}")
-            self.logger.info(f"  Total batches: {total_batches}")
-            self.logger.info(f"  Min LR ratio: {min_lr_ratio} (min_lrs: {min_lrs})")
-        
-        elif scheduler_type == 'cosine':
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=training_config['num_epochs'],
-                eta_min=training_config['learning_rate'] * 0.01
-            )
-            self.logger.info("Using Cosine Annealing scheduler.")
-            
-        elif scheduler_type == 'step':
-            self.scheduler = optim.lr_scheduler.StepLR(
-                self.optimizer,
-                step_size=training_config['num_epochs'] // 3,
-                gamma=0.1
-            )
-            self.logger.info("Using Step LR scheduler.")
-            
-        else:
-            self.scheduler = None
-            self.logger.info("No scheduler will be used.")
-        
-        # Mixed precision scaler
-        if training_config.get('mixed_precision', False):
-            self.scaler = GradScaler()
-            self.logger.info("Mixed precision training enabled")
-        
-        # Load optimizer and scheduler states from checkpoint if available
-        if self.loaded_from_checkpoint:
-            self.load_optimizer_states()
-        
-        self.logger.info(f"Optimizer: {self.optimizer.__class__.__name__}")
-        self.logger.info(f"Scheduler: {scheduler_type}")
-    
-    def build_dataloaders(self):
-        """Build training and validation dataloaders."""
-        self.logger.info("Building dataloaders...")
-        
-        # Get data info to determine volume size
-        try:
-            volume_info = get_volume_info(self.config['data']['data_dir'])
-            # Check if volume_size is manually specified in model config
-            if self.config['model'].get('volume_size') and self.config['model']['volume_size'] != volume_info.get('volume_size'):
-                self.logger.warning(f"Using config volume_size {self.config['model']['volume_size']} instead of detected size {volume_info['volume_size']}.")
-            elif not self.config['model'].get('volume_size'):
-                # Auto-detect and set in model config
-                self.config['model']['volume_size'] = volume_info['volume_size']
-                self.logger.info(f"Auto-detected volume_size: {volume_info['volume_size']}")
-            self.logger.info(f"Auto-detected dataset info: {volume_info}")
-        except Exception as e:
-            self.logger.error(f"Could not auto-detect volume info: {e}")
-            if not self.config['model'].get('volume_size'):
-                raise ValueError("Could not determine volume_size from data directory and it is not specified in model config.")
-            self.logger.info(f"Using volume_size from model config: {self.config['model']['volume_size']}")
+        lr_now = optimizer.param_groups[0]['lr']
+        tracker.log_train(epoch, batch_idx, float(loss.detach().cpu().item()), lr_now)
 
-        self.train_loader, self.test_loader = create_dataloaders(self.config)
-            
-        self.logger.info(f"Train loader: {len(self.train_loader.dataset)} samples")
-        self.logger.info(f"Test loader: {len(self.test_loader.dataset)} samples")
-    
-    def get_loss_function(self):
-        """Get loss function based on configuration."""
-        loss_type = self.config['loss']['loss_function'].lower()
-        
-        if loss_type == 'mse':
-            return nn.MSELoss()
-        elif loss_type == 'mae':
-            return nn.L1Loss()
-        elif loss_type == 'huber':
-            return nn.SmoothL1Loss()
-        elif loss_type == 'bce':
-            return nn.BCEWithLogitsLoss()
-        else:
-            raise ValueError(f"Unknown loss function: {loss_type}")
-    
-    def prepare_seq2seq_data(self, sequences):
-        """
-        Prepare input and target sequences for seq2seq training.
-        
-        Args:
-            sequences: Tensor of shape (B, T, X, Y, Z)
-            
-        Returns:
-            Tuple of (input_sequences, target_sequences)
-            - input_sequences: (B, T-1, X, Y, Z) - sequences[0:T-1]
-            - target_sequences: (B, T-1, X, Y, Z) - sequences[1:T]
-        """
-        B, T, X, Y, Z = sequences.shape
-        
-        # Standard seq2seq preparation
-        if T < 2:
-            raise ValueError(f"Sequence length must be at least 2 for seq2seq training, got {T}")
-        
-        # Input: all timesteps except the last
-        input_seq = sequences[:, :-1, :, :, :]  # (B, T-1, X, Y, Z)
-        
-        # Target: all timesteps except the first  
-        target_seq = sequences[:, 1:, :, :, :]   # (B, T-1, X, Y, Z)
-        
-        return input_seq, target_seq
 
-    def run_validation(self, epoch: int, batch_idx: int, global_step: int, total_steps: int):
-        """
-        Run validation on entire test dataset and log metrics using the metrics tracker.
-        
-        Args:
-            epoch: Current epoch number
-            batch_idx: Current batch index within epoch
-            global_step: Current global training step
-            total_steps: Total training steps across all epochs
-        """
-        self.logger.info(f"Running validation at epoch {epoch}, batch {batch_idx}")
-        
-        self.model.eval()
-        total_val_loss = 0.0
-        num_batches = 0
-        
-        loss_fn = self.get_loss_function()
-        
-        # Initialize PR AUC binned accumulators to avoid storing all predictions
-        threshold = self.metrics_tracker.validation_tracker.threshold
-        device = self.device
-        num_bins = 1000
-        bin_edges = torch.linspace(0.0, 1.0, num_bins + 1, device=device)
-        tp_counts = torch.zeros(num_bins, device=device)
-        total_counts = torch.zeros(num_bins, device=device)
-        total_positives = 0.0
-        
-        with torch.no_grad():
-            val_pbar = tqdm(self.test_loader, desc=f"Validation E{epoch}B{batch_idx}", leave=False, ncols=100)
-            
-            for val_batch_data in val_pbar:
-                # To device
-                if isinstance(val_batch_data, (list, tuple)):
-                    val_sequences, _ = val_batch_data
-                else:
-                    val_sequences = val_batch_data
-                
-                val_sequences = val_sequences.to(self.device, non_blocking=True)
-                
-                # Prepare seq2seq data
-                val_input, val_target = self.prepare_seq2seq_data(val_sequences)
-                
-                # Forward pass
-                with autocast(enabled=self.scaler is not None):
-                    # Get predicted next volumes
-                    val_output = self.model(val_input, get_logits=True)
-                    val_loss = loss_fn(val_output, val_target)
-                    val_probabilities = torch.sigmoid(val_output)
-                
-                total_val_loss += val_loss.item()
-                num_batches += 1
-                
-                # Flatten predictions and targets
-                batch_preds = val_probabilities.flatten()
-                batch_targets = val_target.flatten()
-                # Binarize and accumulate for PR AUC
-                binary_targets = (batch_targets >= threshold).float()
-                total_positives += binary_targets.sum().item()
-                bin_indices = torch.searchsorted(bin_edges[1:], batch_preds, right=False)
-                tp_counts.scatter_add_(0, bin_indices, binary_targets)
-                total_counts.scatter_add_(0, bin_indices, torch.ones_like(binary_targets))
-                # Update progress bar
-                val_pbar.set_postfix({'Val Loss': f'{total_val_loss/num_batches:.4f}'})
-                # Free GPU memory from this validation batch
-                del val_sequences, val_input, val_target, val_output, val_loss, val_probabilities, batch_preds, batch_targets
-                torch.cuda.empty_cache()
-        
-        # Calculate average validation loss
-        avg_val_loss = total_val_loss / num_batches
-        # Compute PR AUC from accumulators
-        tp_flipped = torch.flip(tp_counts, [0])
-        total_flipped = torch.flip(total_counts, [0])
-        cumulative_tp = torch.cumsum(tp_flipped, dim=0)
-        cumulative_fp = torch.cumsum(total_flipped - tp_flipped, dim=0)
-        precision = cumulative_tp / (cumulative_tp + cumulative_fp + 1e-8)
-        recall = cumulative_tp / (total_positives + 1e-8)
-        precision = torch.cat([torch.tensor([1.0], device=device), precision])
-        recall = torch.cat([torch.tensor([0.0], device=device), recall])
-        recall_diff = recall[1:] - recall[:-1]
-        pr_auc = torch.sum(recall_diff * precision[:-1]).item()
-        # Cleanup bins
-        del tp_counts, total_counts, tp_flipped, total_flipped, cumulative_tp, cumulative_fp
-        del precision, recall, recall_diff, bin_edges
-        torch.cuda.empty_cache()
-        # Log validation metrics directly to validation CSV
-        self.metrics_tracker.validation_tracker.csv_logger.log_metrics({
-            'epoch': epoch,
-            'batch_idx': batch_idx,
-            'validation_loss': avg_val_loss,
-            'pr_auc': pr_auc
-        })
-        self.logger.info(f"Validation - Loss: {avg_val_loss:.6f}, PR AUC: {pr_auc:.4f}")
-        # Generate updated plots
-        if self.metrics_tracker.plot_generator is not None:
-            try:
-                self.metrics_tracker.plot_generator.generate_training_plots()
-            except Exception as e:
-                self.logger.warning(f"Failed to generate plots: {e}")
-        metrics = {'validation_loss': avg_val_loss, 'pr_auc': pr_auc}
-        
-        # Check if this is the best validation loss and save best model
-        if avg_val_loss < self.best_val_loss:
-            self.best_val_loss = avg_val_loss
-            self.save_best_model(epoch, batch_idx, avg_val_loss)
-            self.early_stopping_counter = 0
-            self.logger.info(f"New best validation loss: {avg_val_loss:.6f}")
-        else:
-            self.early_stopping_counter += 1
-        
-        self.model.train()
-        return avg_val_loss
+@torch.no_grad()
+def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, tracker: CombinedMetricsTracker, epoch: int) -> Dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    total_batches = 0
+    loss_fn = nn.BCEWithLogitsLoss()
+    for batch_idx, batch in enumerate(tqdm(loader, desc=f"Validation E{epoch}"), 1):
+        spikes = batch['spikes'].to(device)
+        positions = batch['positions'].to(device)
+        mask = batch['neuron_mask'].to(device)
+        stim = batch['stimulus'].to(device).float()
 
-    def train(self):
-        """Main training loop."""
-        self.logger.info("Starting GBM training...")
-        # If not in distributed mode, ensure Muon optimizer sees world size = 1 and stub all_gather
-        try:
-            import torch.distributed as dist
-            if not dist.is_initialized():
-                dist.get_world_size = lambda group=None: 1
-                dist.get_rank = lambda group=None: 0
-                # Stub all_gather so Muon step doesn't require init_process_group
-                def _fake_all_gather(tensor_list, tensor, group=None):
-                    # For world_size=1, just copy tensor to output list
-                    tensor_list[0].copy_(tensor)
-                dist.all_gather = _fake_all_gather
-        except ImportError:
-            pass
-        
-        # Build all components
-        self.build_model()
-        self.build_dataloaders()  # Ensure train_loader exists for scheduler
-        self.build_optimizer()
-        
-        # Save configuration
-        config_path = self.experiment_dir / 'config.yaml'
-        save_config(self.config, str(config_path))
-        
-        num_epochs = self.config['training']['num_epochs']
-        total_batches = len(self.train_loader)
-        total_steps = num_epochs * total_batches
-        
-        # Set starting epoch and step based on checkpoint loading
-        if self.loaded_from_checkpoint:
-            start_epoch = self.checkpoint_epoch + 1
-            global_step = self.checkpoint_step
-            self.logger.info(f"Resuming training from epoch {start_epoch} (loaded from checkpoint)")
-        else:
-            start_epoch = 1
-            global_step = 0
-            
-        self.current_epoch = 0
+        x_in = spikes[:, :-1, :]
+        x_tgt = spikes[:, 1:, :]
+        stim_in = stim[:, :-1].unsqueeze(-1)
 
-        for epoch in range(start_epoch, num_epochs + 1):
-            self.current_epoch = epoch
-            self.model.train()
-            
-            running_loss = 0.0
-            pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}/{num_epochs}', leave=True)
-            
-            # Calculate validation frequency for this epoch
-            validation_frequency = self.config['training'].get('validation_frequency', 8)
-            total_batches = len(self.train_loader)
-            validation_interval = max(1, total_batches // validation_frequency)
+        logits = model(x_in, stim_in, positions, mask, get_logits=True)
+        loss = loss_fn(logits, x_tgt)
+        total_loss += float(loss.detach().cpu().item())
+        total_batches += 1
 
-            for batch_idx, batch_data in enumerate(pbar):
-                global_step += 1
+        probs = torch.sigmoid(logits)
+        tracker.log_validation(epoch, batch_idx, probs, x_tgt)
 
-                # To device
-                if isinstance(batch_data, (list, tuple)):
-                    sequences, _ = batch_data
-                else:
-                    sequences = batch_data
-                
-                sequences = sequences.to(self.device, non_blocking=True)
-                
-                # Prepare seq2seq data
-                input_seq, target_seq = self.prepare_seq2seq_data(sequences)
-                
-                # Get gradient accumulation settings
-                grad_accum_steps = self.config['training'].get('gradient_accumulation_steps')
-                use_grad_accum = grad_accum_steps is not None and grad_accum_steps > 1
-                
-                # Zero gradients at start of accumulation cycle
-                if not use_grad_accum or (batch_idx % grad_accum_steps == 0):
-                    self.optimizer.zero_grad()
-                
-                with autocast(enabled=self.scaler is not None):
-                    # Predict next volumes (L1 loss)
-                    output_seq = self.model(input_seq, get_logits=True)
-                    loss_fn = self.get_loss_function()
-                    loss = loss_fn(output_seq, target_seq)
-                    
-                    # Scale loss by accumulation steps for proper averaging
-                    if use_grad_accum:
-                        loss = loss / grad_accum_steps
-                
-                if self.scaler:
-                    self.scaler.scale(loss).backward()
-                    
-                    # Only step optimizer at end of accumulation cycle
-                    if not use_grad_accum or ((batch_idx + 1) % grad_accum_steps == 0):
-                        if self.config['training'].get('gradient_clip_norm'):
-                            self.scaler.unscale_(self.optimizer)
-                            grad_norm = torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(), self.config['training']['gradient_clip_norm']
-                            )
-                        else:
-                            grad_norm = None
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                else:
-                    loss.backward()
-                    
-                    # Only step optimizer at end of accumulation cycle
-                    if not use_grad_accum or ((batch_idx + 1) % grad_accum_steps == 0):
-                        if self.config['training'].get('gradient_clip_norm'):
-                            grad_norm = torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(), self.config['training']['gradient_clip_norm']
-                            )
-                        else:
-                            grad_norm = None
-                        self.optimizer.step()
+    avg_loss = total_loss / max(1, total_batches)
+    return {'val_loss': avg_loss}
 
-                # Scheduler per batch for linear warmup (only when actually stepping)
-                if (self.scheduler and self.config['training']['scheduler'] in ['linear_warmup', 'warmup_cosine', 'warmup_lineardecay'] and
-                    (not use_grad_accum or ((batch_idx + 1) % grad_accum_steps == 0))):
-                    self.scheduler.step()
-                
-                # Update running loss
-                # Note: loss.item() already scaled by grad_accum_steps if accumulation is used
-                actual_loss = loss.item() * (grad_accum_steps if use_grad_accum else 1)
-                running_loss += actual_loss
-                current_lr = self.optimizer.param_groups[0]['lr']
 
-                # Current batch loss
-                batch_loss = loss.item()
-                
-                # Log training metrics with EMA
-                self.metrics_tracker.log_training_step(
-                    epoch=epoch,
-                    batch_idx=batch_idx + 1,
-                    loss=loss.item(),
-                    learning_rate=current_lr
-                )
- 
-                # Update progress bar with EMA loss
-                ema_loss = self.metrics_tracker.get_current_training_ema()
-                pbar.set_postfix({
-                    'Loss': f'{batch_loss:.6f}',
-                    'EMA Loss': f'{ema_loss:.6f}' if ema_loss else 'N/A',
-                })
-                
-                # Run validation at specified frequency
-                if (batch_idx + 1) % validation_interval == 0 or batch_idx == total_batches - 1:
-                    self.run_validation(epoch, batch_idx + 1, global_step, total_steps)
-                # Free GPU tensors for this batch
-                del sequences, input_seq, target_seq, output_seq, loss
+def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: torch.device, videos_dir: Path, epoch: int) -> None:
+    model.eval()
+    spikes = batch['spikes'].to(device)              # (B, L, N)
+    positions = batch['positions'].to(device)        # (B, N, 3)
+    mask = batch['neuron_mask'].to(device)
+    stim = batch['stimulus'].to(device).float()
 
-            # Scheduler step per epoch for other schedulers
-            if self.scheduler and self.config['training']['scheduler'] not in ['linear_warmup', 'warmup_cosine', 'warmup_lineardecay']:
-                self.scheduler.step()
-        
-            # Save checkpoint at end of every epoch
-            self.save_checkpoint(epoch, global_step)
-        
-        self.logger.info("GBM training completed!")
-        
-        # Load best model for video generation
-        try:
-            best_model_for_video = self.load_best_model_for_inference()
-        except (ValueError, FileNotFoundError) as e:
-            self.logger.warning(f"Could not load best model checkpoint: {e}")
-            self.logger.warning("Using current model state for video generation...")
-            best_model_for_video = self.model
-        
-        # Generate validation comparison video
-        try:
-            self.logger.info("Generating validation comparison video...")
-            self.logger.info("Using best model checkpoint for video generation...")
-            video_path = create_validation_video(
-                model=best_model_for_video,
-                validation_loader=self.test_loader,
-                device=self.device,
-                experiment_dir=self.experiment_dir,
-                video_name="gbm_validation_comparison.mp4",
-                seq2seq=True  # GBM is a seq2seq model that predicts next frames
-            )
-            self.logger.info(f"Validation comparison video saved to: {video_path}")
-        except Exception as e:
-            self.logger.error(f"Failed to generate validation video: {e}")
-            self.logger.error("Continuing without video generation...")
+    # Next-step comparison on last step of input
+    x_in = spikes[:, :-1, :]
+    x_tgt = spikes[:, 1:, :]
+    stim_in = stim[:, :-1].unsqueeze(-1)
+    logits = model(x_in, stim_in, positions, mask, get_logits=True)
+    probs = torch.sigmoid(logits)
+    nextstep_path = videos_dir / f'nextstep_epoch_{epoch}.mp4'
+    create_nextstep_video(x_tgt, probs, positions, nextstep_path)
 
-    def save_checkpoint(self, epoch: int, step: int):
-        """
-        Save model checkpoint.
-        
-        Args:
-            epoch: Current epoch
-            step: Current global step
-        """
-        checkpoint_name = f"checkpoint_epoch_{epoch}.pth"
-        checkpoint_path = self.checkpoint_dir / checkpoint_name
-        
-        state = {
-            'epoch': epoch,
-            'step': step,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'config': self.config,
-            'best_val_loss': self.best_val_loss
-        }
-        
-        if self.scheduler:
-            state['scheduler_state_dict'] = self.scheduler.state_dict()
-        if self.scaler:
-            state['scaler_state_dict'] = self.scaler.state_dict()
-            
-        torch.save(state, checkpoint_path)
-        self.logger.info(f"Checkpoint saved at epoch {epoch}")
-
-        # Cleanup old checkpoints
-        self.cleanup_checkpoints()
-        
-    def save_best_model(self, epoch: int, batch_idx: int, val_loss: float):
-        """
-        Save the best model based on validation loss.
-        
-        Args:
-            epoch: Current epoch
-            batch_idx: Current batch index
-            val_loss: Validation loss that triggered this save
-        """
-        best_model_name = "best_gbm_model.pth"
-        best_model_path = self.checkpoint_dir / best_model_name
-        
-        # Remove previous best model if it exists
-        if self.best_model_path and self.best_model_path.exists():
-            self.best_model_path.unlink()
-        
-        state = {
-            'epoch': epoch,
-            'batch_idx': batch_idx,
-            'validation_loss': val_loss,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'config': self.config,
-            'best_val_loss': self.best_val_loss
-        }
-        
-        if self.scheduler:
-            state['scheduler_state_dict'] = self.scheduler.state_dict()
-        if self.scaler:
-            state['scaler_state_dict'] = self.scaler.state_dict()
-            
-        torch.save(state, best_model_path)
-        self.best_model_path = best_model_path
-        self.logger.info(f"Best GBM model saved with validation loss: {val_loss:.6f} at epoch {epoch}, batch {batch_idx}")
-        
-        return best_model_path
-        
-    def cleanup_checkpoints(self):
-        """Remove old checkpoints to save space."""
-        keep_n = self.config['logging']['keep_n_checkpoints']
-        if keep_n <= 0:
-            return
-        
-        # Get all checkpoint files, sort by epoch number
-        checkpoints = list(self.checkpoint_dir.glob('checkpoint_epoch_*.pth'))
-        checkpoints.sort(key=lambda x: int(x.stem.split('_')[-1]))
-        
-        # Remove oldest checkpoints
-        if len(checkpoints) > keep_n:
-            for checkpoint in checkpoints[:-keep_n]:
-                checkpoint.unlink()
-                self.logger.debug(f"Removed old checkpoint: {checkpoint}")
-
-    def load_best_model_for_inference(self) -> torch.nn.Module:
-        """
-        Load the best model checkpoint for inference.
-        
-        Returns:
-            The loaded model.
-            
-        Raises:
-            ValueError: If no best model checkpoint path is available
-            FileNotFoundError: If the best model checkpoint file doesn't exist
-        """
-        if self.best_model_path is None:
-            raise ValueError("No best model checkpoint found. Please train the model first.")
-        
-        if not self.best_model_path.exists():
-            raise FileNotFoundError(f"Best model checkpoint file not found: {self.best_model_path}")
-        
-        self.logger.info(f"Loading best model from: {self.best_model_path}")
-        state_dict = torch.load(self.best_model_path, map_location=self.device)
-        
-        # Handle torch.compile() prefixes (_orig_mod.) in state dict keys
-        model_state_dict = state_dict['model_state_dict']
-        cleaned_state_dict = {}
-        for key, value in model_state_dict.items():
-            # Remove _orig_mod. prefix if present (from torch.compile)
-            if key.startswith('_orig_mod.'):
-                cleaned_key = key[len('_orig_mod.'):]
-            else:
-                cleaned_key = key
-            cleaned_state_dict[cleaned_key] = value
-        
-        # Create a new model instance to avoid modifying the current model's state
-        model_config = self.config['model']
-        
-        best_model = GBM(
-            d_model=model_config['d_model'],
-            n_heads=model_config['n_heads'],
-            n_layers=model_config['n_layers'],
-            autoencoder_path=model_config.get('autoencoder_path'),
-            volume_size=tuple(model_config['volume_size']),
-            region_size=tuple(model_config['region_size'])
-        )
-        
-        best_model.load_state_dict(cleaned_state_dict)
-        best_model.to(self.device)
-        
-        # Log information about the best model
-        best_val_loss = state_dict.get('validation_loss', 'unknown')
-        best_epoch = state_dict.get('epoch', 'unknown')
-        best_batch = state_dict.get('batch_idx', 'unknown')
-        model_size = sum(p.numel() for p in best_model.parameters())
-        
-        self.logger.info(f"Best model loaded successfully:")
-        self.logger.info(f"  Validation loss: {best_val_loss}")
-        self.logger.info(f"  Epoch: {best_epoch}, Batch: {best_batch}")
-        self.logger.info(f"  Model size: {model_size:,} parameters")
-        
-        return best_model
+    # Autoregression demo: use last context_len frames and generate n_steps
+    context_len = min(8, x_in.shape[1])
+    n_steps = min(16, spikes.shape[1] - context_len)
+    if n_steps > 0:
+        init_x = spikes[:, :context_len, :]
+        init_stim = stim[:, :context_len].unsqueeze(-1)
+        future_stim = stim[:, context_len:context_len + n_steps].unsqueeze(-1)
+        gen_seq = model.autoregress(init_x, init_stim, positions, mask, future_stim, n_steps=n_steps, context_len=context_len)
+        ar_path = videos_dir / f'autoreg_epoch_{epoch}.mp4'
+        create_autoregression_video(gen_seq[:, context_len:, :], positions, ar_path)
 
 
 def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description="Train GBM on 3D volume sequences.")
-    
-    # Config generation
-    parser.add_argument(
-        '--generate-config', 
-        type=str,
-        metavar='PATH',
-        help="Generate a default config file at the specified path and exit."
-    )
-    
-    # Config file
-    parser.add_argument(
-        '--config', 
-        type=str, 
-        help="Path to the YAML configuration file."
-    )
-    
+    parser = argparse.ArgumentParser(description='Train GBM on neuron sequences')
+    parser.add_argument('--config', type=str, required=False, help='Path to YAML config')
     args = parser.parse_args()
-    
-    if args.generate_config:
-        try:
-            generate_config_file(args.generate_config)
-            print(f"Default GBM config file generated at: {args.generate_config}")
-        except Exception as e:
-            print(f"Error generating config file: {e}")
-        return
 
-    if not args.config:
-        parser.error("The --config argument is required unless --generate-config is used.")
-        
-    # Load and set up configuration
-    config = load_config(args.config)
-    config = setup_experiment_paths(config)
-    validate_config(config)
-    
-    # Start training
-    trainer = GBMTrainer(config)
-    trainer.train()
+    cfg = create_default_config()
+    if args.config:
+        with open(args.config, 'r') as f:
+            user = yaml.safe_load(f)
+        cfg = deep_update(cfg, user)
+
+    # Setup experiment dirs
+    base_dir = Path('experiments/gbm_neural')
+    dirs = setup_experiment_dirs(base_dir, cfg['experiment']['name'])
+    save_config(cfg, dirs['exp'] / 'config.yaml')
+    logger = build_logger(dirs['logs'], cfg['logging'].get('log_level', 'INFO'))
+
+    # Device & seeds
+    device = torch.device('cuda' if (cfg['training']['use_gpu'] and torch.cuda.is_available()) else 'cpu')
+    set_seeds(cfg['training']['seed'])
+    if device.type == 'cuda':
+        logger.info(f"Using GPU: {torch.cuda.get_device_name()}")
+
+    # Data
+    train_loader, val_loader = create_dataloaders(cfg)
+    cfg['training']['train_loader_len'] = len(train_loader)
+
+    # Model
+    mcfg = cfg['model']
+    model = GBM(d_model=mcfg['d_model'], d_stimuli=mcfg['d_stimuli'], n_heads=mcfg['n_heads'], n_layers=mcfg['n_layers']).to(device)
+    if cfg['training'].get('compile_model', False):
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            logger.warning(f"torch.compile failed: {e}")
+
+    # Optimizer & scheduler
+    optimizer, scheduler = build_optimizer(model, cfg['training'])
+    scaler = GradScaler(enabled=cfg['training'].get('mixed_precision', False))
+
+    # Metrics
+    tracker = CombinedMetricsTracker(log_dir=dirs['logs'], ema_alpha=0.05, val_threshold=0.5, enable_plots=True)
+
+    best_loss = float('inf')
+    best_ckpt = None
+
+    num_epochs = cfg['training']['num_epochs']
+    for epoch in range(1, num_epochs + 1):
+        train_one_epoch(model, train_loader, device, optimizer, scheduler, scaler, tracker, epoch, cfg['training'])
+        val_metrics = validate(model, val_loader, device, tracker, epoch)
+        logger.info(f"Epoch {epoch} - Val: {val_metrics}")
+
+        # Save checkpoint
+        ckpt_path = dirs['ckpt'] / f'epoch_{epoch}.pth'
+        torch.save({'epoch': epoch, 'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'config': cfg}, ckpt_path)
+
+        # Videos on a small sampled batch
+        try:
+            sample_batch = next(iter(val_loader))
+            generate_epoch_videos(model, sample_batch, device, dirs['videos'], epoch)
+        except Exception as e:
+            logger.warning(f"Epoch {epoch} video generation failed: {e}")
+
+        # Track best
+        if val_metrics['val_loss'] < best_loss:
+            best_loss = val_metrics['val_loss']
+            best_ckpt = ckpt_path
+
+        # Update plots
+        tracker.plot_training()
+
+    logger.info("Training complete.")
+    # Best checkpoint videos
+    if best_ckpt is not None:
+        logger.info(f"Loading best checkpoint: {best_ckpt}")
+        state = torch.load(best_ckpt, map_location=device)
+        model.load_state_dict(state['model'])
+        try:
+            sample_batch = next(iter(val_loader))
+            generate_epoch_videos(model, sample_batch, device, dirs['videos'], epoch='best')
+        except Exception as e:
+            logger.warning(f"Best checkpoint video generation failed: {e}")
+
 
 if __name__ == '__main__':
     main()
+
+
