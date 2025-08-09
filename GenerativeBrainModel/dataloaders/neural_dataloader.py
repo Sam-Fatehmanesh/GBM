@@ -185,19 +185,6 @@ class NeuralDataset(Dataset):
                 pass
 
 
-def _group_files_by_rate(files: List[str]) -> Dict[float, List[str]]:
-    """Group subject files by their final_sampling_rate attribute."""
-    groups: Dict[float, List[str]] = {}
-    for fp in files:
-        try:
-            with h5py.File(fp, 'r') as f:
-                rate = float(f.attrs.get('final_sampling_rate', f.attrs.get('effective_sampling_rate', 0.0)))
-        except Exception:
-            rate = 0.0
-        groups.setdefault(rate, []).append(fp)
-    return groups
-
-
 def _max_neurons_in_files(files: List[str]) -> int:
     max_n = 0
     for fp in files:
@@ -236,21 +223,9 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     if not all_files:
         raise ValueError(f"No H5 files found in {data_dir}")
 
-    # Group by sampling rate
-    groups = _group_files_by_rate(all_files)
-    print(f"Found {len(groups)} sampling-rate group(s): {[(rate, len(files)) for rate, files in groups.items()]}")
-
-    # Optionally pick a specific rate
-    desired_rate = data_config.get('sampling_rate', None)
-    if desired_rate is not None:
-        # find closest matching rate
-        selected_rate = min(groups.keys(), key=lambda r: abs(r - float(desired_rate)))
-    else:
-        # choose the largest group by file count
-        selected_rate = max(groups.keys(), key=lambda r: len(groups[r]))
-
-    selected_files = groups[selected_rate]
-    print(f"Selected sampling rate: {selected_rate} Hz with {len(selected_files)} files")
+    # Use all files. Sampling rate has been unified during preprocessing.
+    selected_files = all_files
+    print(f"Selected all files: {len(selected_files)}")
 
     # Train/test split
     test_subjects = data_config.get('test_subjects', [])
@@ -258,10 +233,10 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     train_files = [f for f in selected_files if f not in test_files]
 
     if not test_files and test_subjects:
-        print(f"Warning: No valid files found for test subjects in selected rate group: {test_subjects}")
+        print(f"Warning: No valid files found for requested test subjects: {test_subjects}")
 
     if not test_files:
-        print("No valid test subjects provided. Creating a random 80/20 train/test split within selected rate group.")
+        print("No valid test subjects provided. Creating a random 80/20 train/test split.")
         num_test = max(1, len(selected_files) // 5)
         random.seed(training_config.get('seed', 42))
         test_files = random.sample(selected_files, num_test)

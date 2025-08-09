@@ -36,13 +36,11 @@ def create_default_config() -> Dict[str, Any]:
     return {
         'experiment': {
             'name': 'gbm_neural_training',
-            'description': 'GBM training on neuron-level probabilities with positions',
-            'tags': ['gbm', 'neurons', 'positions', 'seq2seq']
+            # Minimal experiment metadata; unused keys removed
         },
         'data': {
             'data_dir': 'processed_spike_voxels_2018',
             'test_subjects': [],
-            'sampling_rate': None,  # pick auto group
             'use_cache': False,
         },
         'model': {
@@ -55,6 +53,8 @@ def create_default_config() -> Dict[str, Any]:
             'batch_size': 2,
             'num_epochs': 50,
             'learning_rate': 5e-4,
+            'muon_lr': 2e-2,
+            'adamw_betas': (0.9, 0.95),
             'weight_decay': 1e-4,
             'scheduler': 'warmup_cosine',
             'min_lr_ratio': 0.01,
@@ -69,7 +69,8 @@ def create_default_config() -> Dict[str, Any]:
             'mixed_precision': True,
             'compile_model': False,
             'seed': 42,
-            'validation_frequency': 8,
+            'validation_frequency': 8,          # run small validation every N training batches
+            'val_sample_batches': 64,           # number of batches to use for frequent validation
             'gradient_clip_norm': 1.0,
             'gradient_accumulation_steps': None,
         },
@@ -172,9 +173,11 @@ def build_optimizer(model: GBM, cfg: Dict[str, Any]) -> Tuple[optim.Optimizer, O
     return opt, scheduler
 
 
-def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, optimizer, scheduler, scaler: Optional[GradScaler], tracker: CombinedMetricsTracker, epoch: int, cfg: Dict[str, Any]) -> None:
+def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader: torch.utils.data.DataLoader, device: torch.device, optimizer, scheduler, scaler: Optional[GradScaler], tracker: CombinedMetricsTracker, epoch: int, cfg: Dict[str, Any]) -> None:
     model.train()
     grad_accum = cfg.get('gradient_accumulation_steps') or 1
+    val_freq = int(cfg.get('validation_frequency') or 0)
+    val_sample_batches = int(cfg.get('val_sample_batches') or 1)
     pbar = tqdm(loader, desc=f"Epoch {epoch}")
     for batch_idx, batch in enumerate(pbar, 1):
         spikes = batch['spikes'].to(device)           # (B, L, N)
@@ -230,6 +233,32 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, device: tor
 
         lr_now = optimizer.param_groups[0]['lr']
         tracker.log_train(epoch, batch_idx, float(loss.detach().cpu().item()), lr_now)
+
+        # Lightweight validation at frequency
+        if val_freq > 0 and batch_idx % val_freq == 0:
+            model.eval()
+            loss_fn = nn.BCEWithLogitsLoss()
+            # sample a few batches from val_loader
+            vb = 0
+            total_vloss = 0.0
+            for vbatch in val_loader:
+                spikes_v = vbatch['spikes'].to(device)
+                positions_v = vbatch['positions'].to(device)
+                mask_v = vbatch['neuron_mask'].to(device)
+                stim_v = vbatch['stimulus'].to(device).float()
+                x_in_v = spikes_v[:, :-1, :]
+                x_tgt_v = spikes_v[:, 1:, :]
+                stim_in_v = stim_v[:, :-1].unsqueeze(-1)
+                with torch.no_grad():
+                    logits_v = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
+                    vloss = loss_fn(logits_v, x_tgt_v)
+                    probs_v = torch.sigmoid(logits_v)
+                total_vloss += float(vloss.detach().cpu().item())
+                vb += 1
+                tracker.log_validation(epoch, batch_idx, probs_v, x_tgt_v, float(vloss))
+                if vb >= val_sample_batches:
+                    break
+            model.train()
 
 
 @torch.no_grad()
@@ -336,7 +365,7 @@ def main():
 
     num_epochs = cfg['training']['num_epochs']
     for epoch in range(1, num_epochs + 1):
-        train_one_epoch(model, train_loader, device, optimizer, scheduler, scaler, tracker, epoch, cfg['training'])
+        train_one_epoch(model, train_loader, val_loader, device, optimizer, scheduler, scaler, tracker, epoch, cfg['training'])
         val_metrics = validate(model, val_loader, device, tracker, epoch)
         logger.info(f"Epoch {epoch} - Val: {val_metrics}")
 

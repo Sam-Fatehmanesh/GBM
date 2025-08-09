@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from tqdm import tqdm
+import h5py
 
 from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
@@ -31,12 +32,10 @@ def create_default_config() -> Dict[str, Any]:
     return {
         'experiment': {
             'name': 'gbm_neural_evaluation',
-            'description': 'Evaluation of GBM on neuron-level sequences',
         },
         'data': {
             'data_dir': 'processed_spike_voxels_2018',
             'test_subjects': [],               # if empty: random split used by dataloader
-            'sampling_rate': None,             # optional: force a sampling rate group
             'use_cache': False,
         },
         'model': {
@@ -50,7 +49,7 @@ def create_default_config() -> Dict[str, Any]:
             'use_gpu': True,
             'threshold': 0.5,
             'num_batches': None,               # limit batches for quick eval
-            'make_videos': True,
+            'make_videos': True,               # also controls H5 saving when True
         },
         'logging': {
             'log_level': 'INFO',
@@ -159,6 +158,16 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
         probs = torch.sigmoid(logits)
         create_nextstep_video(x_tgt, probs, positions, videos_dir / f'nextstep_batch{i+1}.mp4')
 
+        # Save next-step H5 comparisons
+        try:
+            out_h5 = videos_dir / f'nextstep_batch{i+1}.h5'
+            with h5py.File(out_h5, 'w') as f:
+                f.create_dataset('truth_next_step', data=x_tgt.detach().cpu().numpy(), compression='gzip', compression_opts=1)
+                f.create_dataset('pred_next_step', data=probs.detach().cpu().numpy(), compression='gzip', compression_opts=1)
+                f.create_dataset('positions', data=positions.detach().cpu().numpy(), compression='gzip', compression_opts=1)
+        except Exception:
+            pass
+
         # Autoregression video: use half as context
         context_len = min(8, spikes.shape[1] // 2)
         n_steps = min(16, spikes.shape[1] - context_len)
@@ -168,6 +177,18 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
             future_stim = stim[:, context_len:context_len + n_steps].unsqueeze(-1)
             gen_seq = model.autoregress(init_x, init_stim, positions, mask, future_stim, n_steps=n_steps, context_len=context_len)
             create_autoregression_video(gen_seq[:, context_len:, :], positions, videos_dir / f'autoreg_batch{i+1}.mp4')
+
+            # Save autoregression H5 comparisons
+            try:
+                out_h5 = videos_dir / f'autoreg_batch{i+1}.h5'
+                with h5py.File(out_h5, 'w') as f:
+                    f.create_dataset('truth_future', data=spikes[:, context_len:, :].detach().cpu().numpy(), compression='gzip', compression_opts=1)
+                    f.create_dataset('pred_future', data=gen_seq[:, context_len:, :].detach().cpu().numpy(), compression='gzip', compression_opts=1)
+                    f.create_dataset('positions', data=positions.detach().cpu().numpy(), compression='gzip', compression_opts=1)
+                    f.attrs['context_len'] = int(context_len)
+                    f.attrs['n_steps'] = int(n_steps)
+            except Exception:
+                pass
 
 
 @torch.no_grad()
@@ -284,12 +305,6 @@ def main():
     if ckpt is None or not Path(ckpt).exists():
         raise ValueError('Please specify model.checkpoint path to a training checkpoint')
     model = load_model_from_checkpoint(Path(ckpt), device)
-
-    # Use sampling rate group from checkpoint if available
-    state = torch.load(ckpt, map_location='cpu')
-    ckpt_cfg = state.get('config', {})
-    if 'data' in ckpt_cfg and ckpt_cfg['data'].get('sampling_rate') is not None:
-        cfg['data']['sampling_rate'] = ckpt_cfg['data']['sampling_rate']
 
     # Build dataloaders; we'll use the test loader to evaluate
     # Ensure eval-specific sequence params are reflected
