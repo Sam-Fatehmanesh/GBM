@@ -14,7 +14,7 @@ import argparse
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -47,7 +47,7 @@ def create_default_config() -> Dict[str, Any]:
             'd_model': 256,
             'n_heads': 8,
             'n_layers': 4,
-            'd_stimuli': 1,  # stimulus is a scalar code per step
+            'd_stimuli': None,  # will be inferred from data (stimulus_onehot width)
         },
         'training': {
             'batch_size': 2,
@@ -183,12 +183,12 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
         spikes = batch['spikes'].to(device)           # (B, L, N)
         positions = batch['positions'].to(device)     # (B, N, 3)
         mask = batch['neuron_mask'].to(device)        # (B, N)
-        stim = batch['stimulus'].to(device).float()   # (B, L)
+        stim = batch['stimulus'].to(device).float()   # (B, L, K)
 
         # Prepare seq2seq (input: 0..L-2, target: 1..L-1)
         x_in = spikes[:, :-1, :]
         x_tgt = spikes[:, 1:, :]
-        stim_in = stim[:, :-1].unsqueeze(-1)  # (B, L-1, 1)
+        stim_in = stim[:, :-1, :]  # already one-hot: (B, L-1, K)
 
         if batch_idx % grad_accum == 1:
             optimizer.zero_grad()
@@ -248,7 +248,7 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
                 stim_v = vbatch['stimulus'].to(device).float()
                 x_in_v = spikes_v[:, :-1, :]
                 x_tgt_v = spikes_v[:, 1:, :]
-                stim_in_v = stim_v[:, :-1].unsqueeze(-1)
+                stim_in_v = stim_v[:, :-1, :]
                 with torch.no_grad():
                     logits_v = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
                     vloss = loss_fn(logits_v, x_tgt_v)
@@ -280,7 +280,7 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
 
         x_in = spikes[:, :-1, :]
         x_tgt = spikes[:, 1:, :]
-        stim_in = stim[:, :-1].unsqueeze(-1)
+        stim_in = stim[:, :-1, :]
 
         logits = model(x_in, stim_in, positions, mask, get_logits=True)
         loss = loss_fn(logits, x_tgt)
@@ -299,12 +299,12 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
     spikes = batch['spikes'].to(device)              # (B, L, N)
     positions = batch['positions'].to(device)        # (B, N, 3)
     mask = batch['neuron_mask'].to(device)
-    stim = batch['stimulus'].to(device).float()
+    stim = batch['stimulus'].to(device).float()  # (B, L, K)
 
     # Next-step comparison on last step of input
     x_in = spikes[:, :-1, :]
     x_tgt = spikes[:, 1:, :]
-    stim_in = stim[:, :-1].unsqueeze(-1)
+    stim_in = stim[:, :-1, :]
     logits = model(x_in, stim_in, positions, mask, get_logits=True)
     probs = torch.sigmoid(logits)
     nextstep_path = videos_dir / f'nextstep_epoch_{epoch}.mp4'
@@ -315,8 +315,8 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
     n_steps = min(16, spikes.shape[1] - context_len)
     if n_steps > 0:
         init_x = spikes[:, :context_len, :]
-        init_stim = stim[:, :context_len].unsqueeze(-1)
-        future_stim = stim[:, context_len:context_len + n_steps].unsqueeze(-1)
+        init_stim = stim[:, :context_len, :]
+        future_stim = stim[:, context_len:context_len + n_steps, :]
         gen_seq = model.autoregress(init_x, init_stim, positions, mask, future_stim, n_steps=n_steps, context_len=context_len)
         ar_path = videos_dir / f'autoreg_epoch_{epoch}.mp4'
         create_autoregression_video(gen_seq[:, context_len:, :], positions, ar_path)
@@ -351,7 +351,15 @@ def main():
 
     # Model
     mcfg = cfg['model']
-    model = GBM(d_model=mcfg['d_model'], d_stimuli=mcfg['d_stimuli'], n_heads=mcfg['n_heads'], n_layers=mcfg['n_layers']).to(device)
+    # Infer d_stimuli from data one-hot width if not provided
+    inferred_d_stimuli: Optional[int] = None
+    try:
+        sample_batch = next(iter(train_loader))
+        inferred_d_stimuli = int(sample_batch['stimulus'].shape[-1])
+    except Exception:
+        pass
+    d_stimuli = mcfg['d_stimuli'] if mcfg['d_stimuli'] is not None else (inferred_d_stimuli or 1)
+    model = GBM(d_model=mcfg['d_model'], d_stimuli=d_stimuli, n_heads=mcfg['n_heads'], n_layers=mcfg['n_layers']).to(device)
     if cfg['training'].get('compile_model', False):
         try:
             model = torch.compile(model)

@@ -84,10 +84,13 @@ class NeuralDataset(Dataset):
                     if file_path not in self.cached_positions:
                         pos = f['cell_positions'][:]  # (N, 3)
                         self.cached_positions[file_path] = pos.astype(np.float32)
-                    # Stimulus may or may not exist
-                    stim = f['stimulus_full'][:] if 'stimulus_full' in f else np.zeros((T_total,), dtype=np.uint8)
-                    stim = stim[start_point:end_point]
-                    self.cached_stimulus[file_path] = stim.astype(np.int64)
+                    # Stimulus: expect one-hot float dataset at 'stimulus_full'
+                    if 'stimulus_full' in f:
+                        stim_oh = f['stimulus_full'][start_point:end_point]
+                        self.cached_stimulus[file_path] = stim_oh.astype(np.float32)  # (T, K)
+                    else:
+                        # default to zeros with one channel
+                        self.cached_stimulus[file_path] = np.zeros((end_point - start_point, 1), dtype=np.float32)
 
                 # Create sequence indices
                 max_start_idx = end_point - self.sequence_length
@@ -140,16 +143,16 @@ class NeuralDataset(Dataset):
             spikes_TN = self.cached_spikes[file_path]  # (T_slice, N)
             segment = spikes_TN[start_idx - (self.start_timepoint or 0): end_idx - (self.start_timepoint or 0)]  # (L, N)
             positions = self.cached_positions[file_path]  # (N, 3)
-            stimulus = self.cached_stimulus[file_path][start_idx - (self.start_timepoint or 0): end_idx - (self.start_timepoint or 0)]
+            stimulus = self.cached_stimulus[file_path][start_idx - (self.start_timepoint or 0): end_idx - (self.start_timepoint or 0)]  # (L, K)
         else:
             f = self._get_file_handle(file_path)
             spikes_ds = f['spike_probabilities']  # (T, N)
             positions = f['cell_positions'][:]    # (N, 3)
             segment = spikes_ds[start_idx:end_idx].astype(np.float32)
             if 'stimulus_full' in f:
-                stimulus = f['stimulus_full'][start_idx:end_idx].astype(np.int64)
+                stimulus = f['stimulus_full'][start_idx:end_idx].astype(np.float32)  # (L, K)
             else:
-                stimulus = np.zeros((self.sequence_length,), dtype=np.int64)
+                stimulus = np.zeros((self.sequence_length, 1), dtype=np.float32)
 
         # Determine valid neuron count before padding
         N_valid = positions.shape[0]
@@ -166,13 +169,13 @@ class NeuralDataset(Dataset):
         spikes_tensor = torch.from_numpy(segment_padded.astype(np.float32))  # (L, pad_N)
         positions_tensor = torch.from_numpy(positions_padded.astype(np.float32))  # (pad_N, 3)
         mask_tensor = torch.from_numpy(neuron_mask)
-        stimulus_tensor = torch.from_numpy(stimulus.astype(np.int64))  # (L,)
+        stimulus_tensor = torch.from_numpy(stimulus.astype(np.float32))  # (L, K)
 
         return {
             'spikes': spikes_tensor,            # (sequence_length, pad_N)
             'positions': positions_tensor,      # (pad_N, 3)
             'neuron_mask': mask_tensor,         # (pad_N,)
-            'stimulus': stimulus_tensor,        # (sequence_length,)
+            'stimulus': stimulus_tensor,        # (sequence_length, K)
             'file_path': file_path,
             'start_idx': start_idx,
         }

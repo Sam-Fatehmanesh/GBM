@@ -233,7 +233,8 @@ def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_
 
 
 
-def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path, num_neurons=10):
+def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path, 
+                             num_neurons=10, stim=None, behavior=None, eye=None):
     """
     Create visualization PDF showing calcium traces and spike probabilities.
     
@@ -326,6 +327,100 @@ def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path,
             plt.close(fig)
         except Exception:
             pass
+
+        # Helper to align auxiliary time series length to calcium T
+        def _align_length(arr, time_len):
+            try:
+                if arr is None:
+                    return None
+                if hasattr(arr, 'ndim'):
+                    if arr.ndim == 1:
+                        L = arr.shape[0]
+                        if L != time_len:
+                            Lnew = min(L, time_len)
+                            return arr[:Lnew]
+                        return arr
+                    elif arr.ndim == 2:
+                        L = arr.shape[1]
+                        if L != time_len:
+                            Lnew = min(L, time_len)
+                            return arr[:, :Lnew]
+                        return arr
+                return arr
+            except Exception:
+                return None
+
+        stim = _align_length(stim, T)
+        behavior = _align_length(behavior, T)
+        eye = _align_length(eye, T)
+
+        # Stimulus page (step plot for discrete stimuli)
+        if stim is not None:
+            try:
+                fig, ax = plt.subplots(1, 1, figsize=(10, 3))
+                ax.plot(stim, drawstyle='steps-post', color='tab:green', lw=0.8)
+                ax.set_title('Stimulus over time')
+                ax.set_xlabel('Frame')
+                ax.set_ylabel('Stimulus')
+                ax.grid(alpha=0.2)
+                plt.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+            except Exception:
+                pass
+
+        # Behavior page(s)
+        if behavior is not None:
+            try:
+                B = behavior.shape[0] if behavior.ndim == 2 else 0
+                if B > 0:
+                    cols = 3
+                    rows = int(np.ceil(B / cols))
+                    fig, axes = plt.subplots(rows, cols, figsize=(12, 3 * rows), sharex=True)
+                    axes = np.atleast_1d(axes).reshape(rows, cols)
+                    for i in range(rows * cols):
+                        r = i // cols
+                        c = i % cols
+                        ax = axes[r, c]
+                        if i < B:
+                            ax.plot(behavior[i], lw=0.8, color='tab:blue')
+                            ax.set_title(f'Behavior {i+1}')
+                            ax.grid(alpha=0.2)
+                        else:
+                            ax.axis('off')
+                    axes[-1, 0].set_xlabel('Frame')
+                    plt.tight_layout()
+                    pdf.savefig(fig)
+                    plt.close(fig)
+            except Exception:
+                pass
+
+        # Eye tracking page(s)
+        if eye is not None:
+            try:
+                E = eye.shape[0] if eye.ndim == 2 else 0
+                if E > 0:
+                    cols = min(E, 3)
+                    rows = int(np.ceil(E / cols))
+                    fig, axes = plt.subplots(rows, cols, figsize=(12, 3 * rows), sharex=True)
+                    axes = np.atleast_1d(axes)
+                    axes = axes.reshape(rows, cols)
+                    for i in range(rows * cols):
+                        r = i // cols
+                        c = i % cols
+                        ax = axes[r, c]
+                        if i < E:
+                            ax.plot(eye[i], lw=0.8, color='tab:orange')
+                            ax.set_title(f'Eye {i+1}')
+                            ax.grid(alpha=0.2)
+                        else:
+                            ax.axis('off')
+                    axes[-1, 0].set_xlabel('Frame')
+                    plt.tight_layout()
+                    pdf.savefig(fig)
+                    plt.close(fig)
+            except Exception:
+                pass
 
         # Select random neurons to visualize
         sel = np.random.choice(N, min(num_neurons, N), replace=False)
@@ -753,8 +848,21 @@ def process_subject(subject_dir, config):
                                  compression_opts=1)
 
                 # Temporal data (stimulus, behavior, eye tracking)
+                # Save stimulus_full as one-hot float array directly (T, K)
+                try:
+                    stim_int = np.asarray(stim_full).astype(np.int64).reshape(-1)
+                    unique_labels = np.unique(stim_int)
+                    label_to_compact = {int(lbl): i for i, lbl in enumerate(unique_labels.tolist())}
+                    compact_labels = np.vectorize(lambda x: label_to_compact[int(x)])(stim_int)
+                    K = int(len(unique_labels))
+                    stim_onehot = np.eye(K, dtype=np.float32)[compact_labels]  # (T, K)
+                except Exception:
+                    # Fallback: single-channel zeros
+                    K = 1
+                    stim_onehot = np.zeros((stim_full.shape[0], K), dtype=np.float32)
+
                 f.create_dataset('stimulus_full',
-                                 data=stim_full,
+                                 data=stim_onehot,
                                  compression='gzip',
                                  compression_opts=1)
 
@@ -767,6 +875,8 @@ def process_subject(subject_dir, config):
                                  data=eye_full,
                                  compression='gzip',
                                  compression_opts=1)
+                # Attributes for stimulus encoding
+                f.attrs['stimulus_num_classes'] = int(K)
             else:
                 print(f"  → Skipping additional datasets per configuration")
 
@@ -795,8 +905,16 @@ def process_subject(subject_dir, config):
         
         # Create visualization PDF
         print("  → Creating visualization PDF...")
-        create_visualization_pdf(calcium_for_viz, prob_data, subject_name, pdf_file, 
-                               config['processing']['num_neurons_viz'])
+        create_visualization_pdf(
+            calcium_for_viz,
+            prob_data,
+            subject_name,
+            pdf_file,
+            config['processing']['num_neurons_viz'],
+            stim=stim_full,
+            behavior=behavior_full,
+            eye=eye_full,
+        )
             
         # Clean up memory
         del calcium_for_viz, prob_data, prob_data_transposed, cell_positions
