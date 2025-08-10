@@ -8,6 +8,7 @@ import random
 import torch
 import torch.multiprocessing as mp
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 # Set multiprocessing tensor sharing strategy to file_system to reduce shared memory usage
 try:
@@ -209,7 +210,7 @@ def _max_stimuli_in_files(files: List[str]) -> int:
     return max_k
 
 
-def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
+def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler], Optional[DistributedSampler]]:
     """
     Create train/test DataLoaders for neural spike probability data.
 
@@ -298,6 +299,35 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     if num_workers > 0:
         dl_kwargs['prefetch_factor'] = training_config.get('prefetch_factor', 2)
 
+    # Distributed samplers (if dist is initialized)
+    train_sampler = None
+    test_sampler = None
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            train_sampler = DistributedSampler(NeuralDataset(
+                train_files,
+                pad_stimuli_to=pad_stimuli_to,
+                sequence_length=sequence_length,
+                stride=stride,
+                max_timepoints_per_subject=max_timepoints_per_subject,
+                use_cache=use_cache,
+                start_timepoint=start_timepoint,
+                end_timepoint=end_timepoint,
+            ), shuffle=True)
+            test_sampler = DistributedSampler(NeuralDataset(
+                test_files,
+                pad_stimuli_to=pad_stimuli_to,
+                sequence_length=sequence_length,
+                stride=stride,
+                max_timepoints_per_subject=max_timepoints_per_subject,
+                use_cache=use_cache,
+                start_timepoint=start_timepoint,
+                end_timepoint=end_timepoint,
+            ), shuffle=False)
+    except Exception:
+        pass
+
     def collate_pad(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         # Determine max neurons in this batch
         max_n = max(item['positions'].shape[0] for item in batch)
@@ -343,7 +373,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
             'start_idx': torch.tensor([it['start_idx'] for it in batch], dtype=torch.long),
         }
 
-    train_loader = DataLoader(train_dataset, shuffle=True, collate_fn=collate_pad, **dl_kwargs)
-    test_loader = DataLoader(test_dataset, shuffle=False, collate_fn=collate_pad, **dl_kwargs)
+    train_loader = DataLoader(train_dataset, shuffle=(train_sampler is None), sampler=train_sampler, collate_fn=collate_pad, **dl_kwargs)
+    test_loader = DataLoader(test_dataset, shuffle=False, sampler=test_sampler, collate_fn=collate_pad, **dl_kwargs)
 
-    return train_loader, test_loader
+    return train_loader, test_loader, train_sampler, test_sampler

@@ -68,6 +68,8 @@ def create_default_config() -> Dict[str, Any]:
             'use_gpu': True,
             'mixed_precision': True,      # enable AMP
             'amp_dtype': 'bf16',          # 'bf16' | 'fp16' | 'none'
+            'distributed': False,         # enable DistributedDataParallel (single-node multi-GPU)
+            'backend': 'nccl',            # DDP backend
             'compile_model': False,
             'seed': 42,
             'validation_frequency': 8,          # run small validation every N training batches
@@ -172,6 +174,37 @@ def build_optimizer(model: GBM, cfg: Dict[str, Any]) -> Tuple[optim.Optimizer, O
     elif sched_type == 'step':
         scheduler = optim.lr_scheduler.StepLR(opt, step_size=max(1, cfg['num_epochs'] // 3), gamma=0.1)
     return opt, scheduler
+
+
+def write_architecture_file(model: nn.Module, dirs: Dict[str, Path], cfg: Dict[str, Any]) -> None:
+    """Write an architecture summary (model repr and params) at run start."""
+    exp_dir: Path = dirs['exp']
+    out_path = exp_dir / 'architecture.txt'
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    untrainable_params = total_params - trainable_params
+
+    with open(out_path, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write("GBM MODEL ARCHITECTURE SUMMARY\n")
+        f.write("=" * 80 + "\n\n")
+        f.write("MODEL CONFIGURATION\n")
+        f.write("-" * 40 + "\n")
+        for k, v in cfg['model'].items():
+            f.write(f"  {k}: {v}\n")
+        f.write("\nPARAMETERS\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"  Total:        {total_params:,}\n")
+        f.write(f"  Trainable:    {trainable_params:,}\n")
+        f.write(f"  Non-trainable:{untrainable_params:,}\n\n")
+        f.write("PARAMETER BREAKDOWN (name, shape, count, trainable)\n")
+        f.write("-" * 40 + "\n")
+        for name, p in model.named_parameters():
+            f.write(f"  {name:<60} {tuple(p.shape)!s:<20} {p.numel():>12,}  {'✓' if p.requires_grad else '✗'}\n")
+        f.write("\nMODEL STRUCTURE (repr)\n")
+        f.write("-" * 40 + "\n")
+        f.write(str(model))
+        f.write("\n")
 
 
 def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader: torch.utils.data.DataLoader, device: torch.device, optimizer, scheduler, scaler: Optional[GradScaler], tracker: CombinedMetricsTracker, epoch: int, cfg: Dict[str, Any]) -> None:
@@ -351,6 +384,7 @@ def main():
     logger = build_logger(dirs['logs'], cfg['logging'].get('log_level', 'INFO'))
 
     # Device & seeds
+    #torch.autograd.set_detect_anomaly(True)
     device = torch.device('cuda' if (cfg['training']['use_gpu'] and torch.cuda.is_available()) else 'cpu')
     set_seeds(cfg['training']['seed'])
     if device.type == 'cuda':
@@ -377,7 +411,7 @@ def main():
         pass
 
     # Data
-    train_loader, val_loader = create_dataloaders(cfg)
+    train_loader, val_loader, train_sampler, val_sampler = create_dataloaders(cfg)
     cfg['training']['train_loader_len'] = len(train_loader)
 
     # Model
@@ -401,6 +435,20 @@ def main():
         except Exception as e:
             logger.warning(f"torch.compile failed: {e}")
 
+    # Initialize DDP if requested
+    ddp_enabled = bool(cfg['training'].get('distributed', False))
+    if ddp_enabled and torch.cuda.device_count() > 1:
+        try:
+            import torch.distributed as dist
+            if not dist.is_initialized():
+                dist.init_process_group(backend=cfg['training'].get('backend', 'nccl'))
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            torch.cuda.set_device(local_rank)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+            logger.info("Initialized DistributedDataParallel")
+        except Exception as e:
+            logger.warning(f"Failed to initialize DDP, continuing single-process: {e}")
+
     # Optimizer & scheduler
     optimizer, scheduler = build_optimizer(model, cfg['training'])
     amp_dtype_cfg = (cfg['training'].get('amp_dtype') or 'bf16').lower()
@@ -409,12 +457,20 @@ def main():
 
     # Metrics
     tracker = CombinedMetricsTracker(log_dir=dirs['logs'], ema_alpha=0.05, val_threshold=0.5, enable_plots=True)
+    # Persist architecture summary once per run
+    try:
+        write_architecture_file(model, dirs, cfg)
+    except Exception as e:
+        logger.warning(f"Failed to write architecture file: {e}")
 
     best_loss = float('inf')
     best_ckpt = None
 
     num_epochs = cfg['training']['num_epochs']
     for epoch in range(1, num_epochs + 1):
+        # Shuffle between epochs for distributed samplers
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_one_epoch(model, train_loader, val_loader, device, optimizer, scheduler, scaler, tracker, epoch, cfg['training'])
         val_metrics = validate(model, val_loader, device, tracker, epoch)
         logger.info(f"Epoch {epoch} - Val: {val_metrics}")
