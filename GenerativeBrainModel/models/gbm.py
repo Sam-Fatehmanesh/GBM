@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import numpy as np
 from GenerativeBrainModel.models.rms import RMSNorm
 from GenerativeBrainModel.models.mlp import MLP
-from GenerativeBrainModel.models.convnormencoder import ConvNormEncoder
 from GenerativeBrainModel.models.spatiotemporal import SpatioTemporalNeuralAttention
 from mamba_ssm import Mamba2 as Mamba
 import pdb
@@ -21,7 +20,7 @@ class GBM(nn.Module):
         self.n_heads = n_heads
         self.n_layers = n_layers
         self.d_stimuli = d_stimuli
-        
+
         self.layers = nn.ModuleList([SpatioTemporalNeuralAttention(d_model, n_heads) for _ in range(n_layers)])
         
         self.stimuli_encoder = nn.Sequential(
@@ -55,11 +54,14 @@ class GBM(nn.Module):
         # Returns sequences of shape (batch_size, seq_len, n_neurons, d_model)
         B, T, N = x.shape
 
-        x = x.unsqueeze(-1) # (B, T, n_neurons, 1)
-        x = self.neuron_scalar_encoder(x) # (B, T, n_neurons, d_model)
+        x = x.unsqueeze(-1)
+        # Keep dtype consistent with model weights (bf16 when enabled)
+        if x.dtype != next(self.parameters()).dtype:
+            x = x.to(next(self.parameters()).dtype)
+        x = self.neuron_scalar_encoder(x)
 
         # (B, T, d_stimuli) -> (B, T, 1, d_model), acts as a global stimulus embedding as a token for each time step
-        x_stimuli = x_stimuli.float().unsqueeze(2) # (B, T, 1, d_stimuli)
+        x_stimuli = x_stimuli.to(next(self.parameters()).dtype).unsqueeze(2)
         x_stimuli = self.stimuli_encoder(x_stimuli) # (B, T, 1, d_model)
 
         # concatenate the stimulus embedding to the input

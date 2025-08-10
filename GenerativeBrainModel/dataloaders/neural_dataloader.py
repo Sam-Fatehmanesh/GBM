@@ -29,7 +29,7 @@ class NeuralDataset(Dataset):
     def __init__(
         self,
         data_files: List[str],
-        pad_neurons_to: int,
+        pad_stimuli_to: int,
         sequence_length: int = 1,
         stride: int = 1,
         max_timepoints_per_subject: Optional[int] = None,
@@ -38,7 +38,7 @@ class NeuralDataset(Dataset):
         end_timepoint: Optional[int] = None,
     ) -> None:
         self.data_files = data_files
-        self.pad_neurons_to = pad_neurons_to
+        self.pad_stimuli_to = pad_stimuli_to
         self.sequence_length = sequence_length
         self.stride = stride
         self.max_timepoints_per_subject = max_timepoints_per_subject
@@ -105,33 +105,20 @@ class NeuralDataset(Dataset):
             self.worker_file_handles[file_path] = h5py.File(file_path, 'r')
         return self.worker_file_handles[file_path]
 
-    def _pad_neurons(self, data_2d: np.ndarray, pad_value: float = 0.0) -> np.ndarray:
-        """
-        Pad along neuron dimension to self.pad_neurons_to.
-        Expected input shapes:
-          - (seq_len, N) for spikes (time-major)
-          - (N, 3) for positions
-        """
-        if data_2d.ndim == 2:
-            if data_2d.shape[-1] == self.pad_neurons_to:
-                return data_2d
-            if data_2d.shape[0] == self.pad_neurons_to:
-                return data_2d  # already padded
-        N = data_2d.shape[-1] if data_2d.shape[0] != self.pad_neurons_to else data_2d.shape[0]
+    # Removed neuron pre-padding: padding is now handled in collate_fn per-batch
 
-        if data_2d.shape == (N, 3):
-            # positions (N, 3) -> pad to (pad_N, 3)
-            pad_N = self.pad_neurons_to
-            out = np.zeros((pad_N, 3), dtype=data_2d.dtype)
-            out[:N, :] = data_2d
-            return out
-        else:
-            # spikes (seq_len, N) -> pad to (seq_len, pad_N)
-            seq_len = data_2d.shape[0]
-            pad_N = self.pad_neurons_to
-            out = np.zeros((seq_len, pad_N), dtype=data_2d.dtype)
-            out[:, :N] = data_2d
-            return out
+    def _pad_stimulus(self, stim_2d: np.ndarray) -> np.ndarray:
+        """Pad stimulus along feature dimension to self.pad_stimuli_to.
+        Expects (seq_len, K) and returns (seq_len, pad_K).
+        """
+        if stim_2d.ndim != 2:
+            return stim_2d
+        L, K = stim_2d.shape
+        if K == self.pad_stimuli_to:
+            return stim_2d
+        out = np.zeros((L, self.pad_stimuli_to), dtype=stim_2d.dtype)
+        out[:, :min(K, self.pad_stimuli_to)] = stim_2d[:, :min(K, self.pad_stimuli_to)]
+        return out
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         seq_info = self.sequences[idx]
@@ -143,39 +130,41 @@ class NeuralDataset(Dataset):
             spikes_TN = self.cached_spikes[file_path]  # (T_slice, N)
             segment = spikes_TN[start_idx - (self.start_timepoint or 0): end_idx - (self.start_timepoint or 0)]  # (L, N)
             positions = self.cached_positions[file_path]  # (N, 3)
-            stimulus = self.cached_stimulus[file_path][start_idx - (self.start_timepoint or 0): end_idx - (self.start_timepoint or 0)]  # (L, K)
+            stimulus = self.cached_stimulus[file_path][start_idx - (self.start_timepoint or 0): end_idx - (self.start_timepoint or 0)]  # (L, K_file)
         else:
             f = self._get_file_handle(file_path)
             spikes_ds = f['spike_probabilities']  # (T, N)
             positions = f['cell_positions'][:]    # (N, 3)
             segment = spikes_ds[start_idx:end_idx].astype(np.float32)
             if 'stimulus_full' in f:
-                stimulus = f['stimulus_full'][start_idx:end_idx].astype(np.float32)  # (L, K)
+                stimulus = f['stimulus_full'][start_idx:end_idx].astype(np.float32)  # (L, K_file)
             else:
                 stimulus = np.zeros((self.sequence_length, 1), dtype=np.float32)
+
+        # Pad stimulus to the global width across files
+        stimulus = self._pad_stimulus(stimulus)
 
         # Determine valid neuron count before padding
         N_valid = positions.shape[0]
 
-        # Pad spikes and positions to group max
-        segment_padded = self._pad_neurons(segment, pad_value=0.0)  # (L, pad_N)
-        positions_padded = self._pad_neurons(positions, pad_value=0.0)  # (pad_N, 3)
+        # Do not pre-pad neurons; collate_fn will pad per-batch
+        segment_padded = segment  # (L, N)
+        positions_padded = positions  # (N, 3)
 
         # Neuron validity mask (1 for real neurons, 0 for padded)
-        neuron_mask = np.zeros((self.pad_neurons_to,), dtype=np.float32)
-        neuron_mask[:N_valid] = 1.0
+        neuron_mask = np.ones((N_valid,), dtype=np.float32)
 
         # Convert to tensors
         spikes_tensor = torch.from_numpy(segment_padded.astype(np.float32))  # (L, pad_N)
         positions_tensor = torch.from_numpy(positions_padded.astype(np.float32))  # (pad_N, 3)
         mask_tensor = torch.from_numpy(neuron_mask)
-        stimulus_tensor = torch.from_numpy(stimulus.astype(np.float32))  # (L, K)
+        stimulus_tensor = torch.from_numpy(stimulus.astype(np.float32))  # (L, K_file)
 
         return {
-            'spikes': spikes_tensor,            # (sequence_length, pad_N)
-            'positions': positions_tensor,      # (pad_N, 3)
-            'neuron_mask': mask_tensor,         # (pad_N,)
-            'stimulus': stimulus_tensor,        # (sequence_length, K)
+            'spikes': spikes_tensor,            # (sequence_length, N)
+            'positions': positions_tensor,      # (N, 3)
+            'neuron_mask': mask_tensor,         # (N,)
+            'stimulus': stimulus_tensor,        # (sequence_length, K_file)
             'file_path': file_path,
             'start_idx': start_idx,
         }
@@ -201,6 +190,23 @@ def _max_neurons_in_files(files: List[str]) -> int:
         except Exception:
             continue
     return max_n
+
+
+def _max_stimuli_in_files(files: List[str]) -> int:
+    """Return max stimulus width (K) across files; if missing, assume 1."""
+    max_k = 1
+    for fp in files:
+        try:
+            with h5py.File(fp, 'r') as f:
+                if 'stimulus_full' in f:
+                    ds = f['stimulus_full']
+                    if ds.ndim == 2:
+                        max_k = max(max_k, int(ds.shape[1]))
+                    elif ds.ndim == 1:
+                        max_k = max(max_k, 1)
+        except Exception:
+            continue
+    return max_k
 
 
 def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
@@ -245,9 +251,11 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         test_files = random.sample(selected_files, num_test)
         train_files = [f for f in selected_files if f not in test_files]
 
-    # Compute padding size (max neurons) within selected files
+    # Compute padding sizes across selected files
     pad_neurons_to = _max_neurons_in_files(selected_files)
+    pad_stimuli_to = _max_stimuli_in_files(selected_files)
     print(f"Padding neuron dimension to: {pad_neurons_to}")
+    print(f"Padding stimulus dimension to: {pad_stimuli_to}")
 
     # Parameters
     sequence_length = training_config.get('sequence_length', 1)
@@ -259,7 +267,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
 
     train_dataset = NeuralDataset(
         train_files,
-        pad_neurons_to=pad_neurons_to,
+        pad_stimuli_to=pad_stimuli_to,
         sequence_length=sequence_length,
         stride=stride,
         max_timepoints_per_subject=max_timepoints_per_subject,
@@ -270,7 +278,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
 
     test_dataset = NeuralDataset(
         test_files,
-        pad_neurons_to=pad_neurons_to,
+        pad_stimuli_to=pad_stimuli_to,
         sequence_length=sequence_length,
         stride=stride,
         max_timepoints_per_subject=max_timepoints_per_subject,
@@ -280,15 +288,62 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     )
 
     # Safer defaults for memory usage
+    num_workers = int(training_config.get('num_workers', 0))
     dl_kwargs = {
         'batch_size': training_config.get('batch_size', 4),
-        'num_workers': training_config.get('num_workers', 2),
+        'num_workers': num_workers,
         'pin_memory': training_config.get('pin_memory', False),
-        'persistent_workers': training_config.get('persistent_workers', False),
-        'prefetch_factor': training_config.get('prefetch_factor', 2),
+        'persistent_workers': training_config.get('persistent_workers', False) if num_workers > 0 else False,
     }
+    if num_workers > 0:
+        dl_kwargs['prefetch_factor'] = training_config.get('prefetch_factor', 2)
 
-    train_loader = DataLoader(train_dataset, shuffle=True, **dl_kwargs)
-    test_loader = DataLoader(test_dataset, shuffle=False, **dl_kwargs)
+    def collate_pad(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        # Determine max neurons in this batch
+        max_n = max(item['positions'].shape[0] for item in batch)
+        # Determine stimulus width (already padded by dataset for K); unify L as given
+        L = batch[0]['spikes'].shape[0]
+        K = batch[0]['stimulus'].shape[1]
+
+        def pad_spikes(x: torch.Tensor, target_n: int) -> torch.Tensor:
+            Lx, Nx = x.shape
+            if Nx == target_n:
+                return x
+            out = torch.zeros((Lx, target_n), dtype=x.dtype)
+            out[:, :Nx] = x
+            return out
+
+        def pad_positions(p: torch.Tensor, target_n: int) -> torch.Tensor:
+            Nx, D = p.shape
+            if Nx == target_n:
+                return p
+            out = torch.zeros((target_n, D), dtype=p.dtype)
+            out[:Nx, :] = p
+            return out
+
+        def pad_mask(m: torch.Tensor, target_n: int) -> torch.Tensor:
+            Nx = m.shape[0]
+            if Nx == target_n:
+                return m
+            out = torch.zeros((target_n,), dtype=m.dtype)
+            out[:Nx] = m
+            return out
+
+        spikes = torch.stack([pad_spikes(it['spikes'], max_n) for it in batch], dim=0)
+        positions = torch.stack([pad_positions(it['positions'], max_n) for it in batch], dim=0)
+        masks = torch.stack([pad_mask(it['neuron_mask'], max_n) for it in batch], dim=0)
+        stimulus = torch.stack([it['stimulus'] for it in batch], dim=0)  # (B, L, K) already padded across files
+
+        return {
+            'spikes': spikes,           # (B, L, max_n)
+            'positions': positions,     # (B, max_n, 3)
+            'neuron_mask': masks,       # (B, max_n)
+            'stimulus': stimulus,       # (B, L, K)
+            'file_path': [it['file_path'] for it in batch],
+            'start_idx': torch.tensor([it['start_idx'] for it in batch], dtype=torch.long),
+        }
+
+    train_loader = DataLoader(train_dataset, shuffle=True, collate_fn=collate_pad, **dl_kwargs)
+    test_loader = DataLoader(test_dataset, shuffle=False, collate_fn=collate_pad, **dl_kwargs)
 
     return train_loader, test_loader

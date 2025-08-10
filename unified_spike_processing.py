@@ -240,7 +240,7 @@ def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path,
     
     Args:
         calcium_data: (T, N) array of raw calcium data
-        prob_data: (N, T) array of spike probabilities  
+        prob_data: (N, T) array of spike probabilities
         subject_name: Name of the subject
         output_path: Path to save PDF
         num_neurons: Number of neurons to visualize
@@ -461,16 +461,16 @@ def process_subject(subject_dir, config):
         
     # Create output directory
     os.makedirs(config['data']['output_dir'], exist_ok=True)
-
-    # Check if already processed
+        
+        # Check if already processed
     final_file = os.path.join(config['data']['output_dir'], f'{subject_name}.h5')
     pdf_file = os.path.join(config['data']['output_dir'], f'{subject_name}_visualization.pdf')
-
+        
     if os.path.exists(final_file) and os.path.exists(pdf_file):
         print("  → Already processed; skipping.")
         return final_file
-
-    start_time = time.time()
+        
+        start_time = time.time()
         
     try:
         # Load raw data
@@ -501,38 +501,49 @@ def process_subject(subject_dir, config):
             except Exception:
                 cell_xyz_norm = None
         
-        # Load additional datasets
+        # Load additional datasets (robust to missing fields)
         print("  → Loading additional datasets from MATLAB file...")
-        
-        # Anatomical stack
-        anat_stack = data0['anat_stack']
-        if isinstance(anat_stack, np.ndarray) and anat_stack.dtype == np.object_:
-            anat_stack = anat_stack[0, 0]
-        
-        # Sampling rate
-        fpsec = data0['fpsec']
-        if isinstance(fpsec, np.ndarray) and fpsec.dtype == np.object_:
-            fpsec = fpsec[0, 0]
-        fpsec = float(fpsec.item() if hasattr(fpsec, 'item') else fpsec)
-        
-        # Stimulus data
-        stim_full = data0['stim_full']
-        if isinstance(stim_full, np.ndarray) and stim_full.dtype == np.object_:
-            stim_full = stim_full[0, 0]
-        stim_full = np.squeeze(stim_full)  # Remove singleton dimensions
-        
-        # Behavioral data
-        behavior_full = data0['Behavior_full']
-        if isinstance(behavior_full, np.ndarray) and behavior_full.dtype == np.object_:
-            behavior_full = behavior_full[0, 0]
-        
-        # Eye tracking data
-        eye_full = data0['Eye_full']
-        if isinstance(eye_full, np.ndarray) and eye_full.dtype == np.object_:
-            eye_full = eye_full[0, 0]
-        
-        print(f"  → Loaded anat_stack: {anat_stack.shape}, fpsec: {fpsec} Hz")
-        print(f"  → Loaded stim_full: {stim_full.shape}, behavior_full: {behavior_full.shape}, eye_full: {eye_full.shape}")
+
+        def _get_field(obj, name):
+            try:
+                if name in obj.dtype.names:
+                    val = obj[name]
+                    if isinstance(val, np.ndarray) and val.dtype == np.object_:
+                        val = val[0, 0]
+                    return val
+            except Exception:
+                pass
+            return None
+
+        anat_stack = _get_field(data0, 'anat_stack')
+
+        # Sampling rate (fallback to config if missing)
+        fpsec_val = _get_field(data0, 'fpsec')
+        if fpsec_val is not None:
+            fpsec = float(fpsec_val.item() if hasattr(fpsec_val, 'item') else fpsec_val)
+        else:
+            fpsec = float(config['processing'].get('original_sampling_rate') or 1.0)
+            print(f"  → fpsec missing; using config original_sampling_rate = {fpsec} Hz")
+
+        # Stimulus data (may be missing)
+        stim_full = _get_field(data0, 'stim_full')
+        if stim_full is not None:
+            stim_full = np.squeeze(stim_full)
+
+        # Behavioral data (may be missing)
+        behavior_full = _get_field(data0, 'Behavior_full')
+
+        # Eye tracking data (may be missing)
+        eye_full = _get_field(data0, 'Eye_full')
+
+        def _shape(x):
+            try:
+                return x.shape
+            except Exception:
+                return None
+
+        print(f"  → Loaded anat_stack: {_shape(anat_stack)}, fpsec: {fpsec} Hz")
+        print(f"  → Loaded stim_full: {_shape(stim_full)}, behavior_full: {_shape(behavior_full)}, eye_full: {_shape(eye_full)}")
         
         # Load fluorescence traces
         calcium_dataset = config['data']['calcium_dataset']
@@ -699,14 +710,14 @@ def process_subject(subject_dir, config):
                 from scipy.interpolate import interp1d
                 
                 # Hold interpolation for stimulus data (1D) - preserves discrete values
-                if stim_full.shape[0] == len(original_time):
+                if stim_full is not None and stim_full.shape[0] == len(original_time):
                     stim_hold_interp = interp1d(original_time, stim_full.astype(float), 
                                               kind='previous', bounds_error=False, 
                                               fill_value=(stim_full[0], stim_full[-1]))
                     stim_full = stim_hold_interp(new_time).astype(stim_full.dtype)
                 
                 # Hold interpolation for behavioral data (2D: behaviors x time)
-                if behavior_full.shape[1] == len(original_time):
+                if behavior_full is not None and behavior_full.shape[1] == len(original_time):
                     behavior_interp = np.zeros((behavior_full.shape[0], upsampled_T), dtype=behavior_full.dtype)
                     for b in range(behavior_full.shape[0]):
                         behav_hold_interp = interp1d(original_time, behavior_full[b, :], 
@@ -716,7 +727,7 @@ def process_subject(subject_dir, config):
                     behavior_full = behavior_interp
                 
                 # Hold interpolation for eye tracking data (2D: eye dimensions x time)
-                if eye_full.shape[1] == len(original_time):
+                if eye_full is not None and eye_full.shape[1] == len(original_time):
                     eye_interp = np.zeros((eye_full.shape[0], upsampled_T), dtype=eye_full.dtype)
                     for e in range(eye_full.shape[0]):
                         eye_hold_interp = interp1d(original_time, eye_full[e, :], 
@@ -725,7 +736,7 @@ def process_subject(subject_dir, config):
                         eye_interp[e, :] = eye_hold_interp(new_time)
                     eye_full = eye_interp
                 
-                print(f"  → Interpolated temporal data: stim_full {stim_full.shape}, behavior_full {behavior_full.shape}, eye_full {eye_full.shape}")
+                print(f"  → Interpolated temporal data: stim_full {_shape(stim_full)}, behavior_full {_shape(behavior_full)}, eye_full {_shape(eye_full)}")
             else:
                 print(f"  → Keeping temporal data at original rate (will downsample neural data later)")
         
@@ -746,15 +757,15 @@ def process_subject(subject_dir, config):
         del calcium
         gc.collect()
         
-        # Run CASCADE inference
+                # Run CASCADE inference
         prob_data = run_cascade_inference(
-            processed_calcium,
-            config['processing']['batch_size'],
+            processed_calcium, 
+            config['processing']['batch_size'], 
             config['cascade']['model_type'],
             effective_sampling_rate
-        )
-
-        # Clean up after CASCADE
+                )
+                
+                # Clean up after CASCADE
         del processed_calcium
         gc.collect()
         
@@ -811,11 +822,11 @@ def process_subject(subject_dir, config):
 
         # Use normalized positions computed above
         cell_positions = norm_positions.astype(output_dtype)  # (N, 3) in [0, 1]
-
+            
         # Save final data
         print(f"  → Saving final data to {final_file}")
         with h5py.File(final_file, 'w') as f:
-            # Save main datasets
+                # Save main datasets
             f.create_dataset('spike_probabilities',
                             data=prob_data_transposed,
                             chunks=(min(1000, T), min(100, N)),
@@ -824,12 +835,12 @@ def process_subject(subject_dir, config):
 
             f.create_dataset('cell_positions',
                              data=cell_positions,
-                             compression='gzip',
-                             compression_opts=1)
-
-            f.create_dataset('timepoint_indices',
-                             data=np.arange(T, dtype=np.int32))
-
+                                compression='gzip',
+                                compression_opts=1)
+                
+            f.create_dataset('timepoint_indices', 
+                            data=np.arange(T, dtype=np.int32))
+                
             # Save metadata as datasets
             f.create_dataset('num_timepoints', data=T)
             f.create_dataset('num_neurons', data=N)
@@ -842,44 +853,46 @@ def process_subject(subject_dir, config):
                 print(f"  → Saving additional datasets...")
 
                 # Anatomical reference stack
-                f.create_dataset('anat_stack',
-                                 data=anat_stack,
-                                 compression='gzip',
-                                 compression_opts=1)
+                if anat_stack is not None:
+                    f.create_dataset('anat_stack',
+                                     data=anat_stack,
+                                     compression='gzip',
+                                     compression_opts=1)
 
                 # Temporal data (stimulus, behavior, eye tracking)
                 # Save stimulus_full as one-hot float array directly (T, K)
-                try:
-                    stim_int = np.asarray(stim_full).astype(np.int64).reshape(-1)
-                    unique_labels = np.unique(stim_int)
-                    label_to_compact = {int(lbl): i for i, lbl in enumerate(unique_labels.tolist())}
-                    compact_labels = np.vectorize(lambda x: label_to_compact[int(x)])(stim_int)
-                    K = int(len(unique_labels))
-                    stim_onehot = np.eye(K, dtype=np.float32)[compact_labels]  # (T, K)
-                except Exception:
-                    # Fallback: single-channel zeros
-                    K = 1
-                    stim_onehot = np.zeros((stim_full.shape[0], K), dtype=np.float32)
+                K = None
+                if stim_full is not None:
+                    try:
+                        stim_int = np.asarray(stim_full).astype(np.int64).reshape(-1)
+                        unique_labels = np.unique(stim_int)
+                        label_to_compact = {int(lbl): i for i, lbl in enumerate(unique_labels.tolist())}
+                        compact_labels = np.vectorize(lambda x: label_to_compact[int(x)])(stim_int)
+                        K = int(len(unique_labels))
+                        stim_onehot = np.eye(K, dtype=np.float32)[compact_labels]  # (T, K)
+                    except Exception:
+                        K = 1
+                        stim_onehot = np.zeros((stim_full.shape[0], K), dtype=np.float32)
+                    f.create_dataset('stimulus_full',
+                                     data=stim_onehot,
+                                     compression='gzip',
+                                     compression_opts=1)
+                    f.attrs['stimulus_num_classes'] = int(K)
 
-                f.create_dataset('stimulus_full',
-                                 data=stim_onehot,
-                                 compression='gzip',
-                                 compression_opts=1)
+                if behavior_full is not None:
+                    f.create_dataset('behavior_full',
+                                     data=behavior_full,
+                                     compression='gzip',
+                                     compression_opts=1)
 
-                f.create_dataset('behavior_full',
-                                 data=behavior_full,
-                                 compression='gzip',
-                                 compression_opts=1)
-
-                f.create_dataset('eye_full',
-                                 data=eye_full,
-                                 compression='gzip',
-                                 compression_opts=1)
-                # Attributes for stimulus encoding
-                f.attrs['stimulus_num_classes'] = int(K)
+                if eye_full is not None:
+                    f.create_dataset('eye_full',
+                                     data=eye_full,
+                                     compression='gzip',
+                                     compression_opts=1)
             else:
                 print(f"  → Skipping additional datasets per configuration")
-
+                
             # Save attributes
             f.attrs['subject'] = subject_name
             f.attrs['data_source'] = 'raw_calcium'
@@ -911,12 +924,12 @@ def process_subject(subject_dir, config):
             subject_name,
             pdf_file,
             config['processing']['num_neurons_viz'],
-            stim=stim_full,
+            stim=(stim_full if stim_full is not None else None),
             behavior=behavior_full,
             eye=eye_full,
         )
             
-        # Clean up memory
+            # Clean up memory
         del calcium_for_viz, prob_data, prob_data_transposed, cell_positions
         del anat_stack, stim_full, behavior_full, eye_full
         gc.collect()

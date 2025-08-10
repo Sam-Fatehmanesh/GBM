@@ -61,12 +61,13 @@ def create_default_config() -> Dict[str, Any]:
             'sequence_length': 12,
             'stride': 3,
             'max_timepoints_per_subject': None,
-            'num_workers': 2,
+            'num_workers': 0,
             'pin_memory': False,
             'persistent_workers': False,
             'prefetch_factor': 2,
             'use_gpu': True,
-            'mixed_precision': True,
+            'mixed_precision': True,      # enable AMP
+            'amp_dtype': 'bf16',          # 'bf16' | 'fp16' | 'none'
             'compile_model': False,
             'seed': 42,
             'validation_frequency': 8,          # run small validation every N training batches
@@ -178,12 +179,16 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
     grad_accum = cfg.get('gradient_accumulation_steps') or 1
     val_freq = int(cfg.get('validation_frequency') or 0)
     val_sample_batches = int(cfg.get('val_sample_batches') or 1)
+    # Resolve AMP dtype locally from cfg
+    amp_dtype_cfg = (cfg.get('amp_dtype') or 'bf16').lower()
+    amp_dtype = torch.bfloat16 if amp_dtype_cfg == 'bf16' else (torch.float16 if amp_dtype_cfg == 'fp16' else torch.float32)
+    use_amp = bool(cfg.get('mixed_precision', True))
     pbar = tqdm(loader, desc=f"Epoch {epoch}")
     for batch_idx, batch in enumerate(pbar, 1):
         spikes = batch['spikes'].to(device)           # (B, L, N)
         positions = batch['positions'].to(device)     # (B, N, 3)
         mask = batch['neuron_mask'].to(device)        # (B, N)
-        stim = batch['stimulus'].to(device).float()   # (B, L, K)
+        stim = batch['stimulus'].to(device)   # (B, L, K)
 
         # Prepare seq2seq (input: 0..L-2, target: 1..L-1)
         x_in = spikes[:, :-1, :]
@@ -193,7 +198,7 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
         if batch_idx % grad_accum == 1:
             optimizer.zero_grad()
 
-        with autocast(enabled=scaler is not None):
+        with autocast(enabled=use_amp, dtype=amp_dtype):
             logits = model(x_in, stim_in, positions, mask, get_logits=True)  # (B, L-1, N)
             loss = nn.BCEWithLogitsLoss()(logits, x_tgt)
             loss_to_backprop = loss / grad_accum
@@ -233,6 +238,12 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
 
         lr_now = optimizer.param_groups[0]['lr']
         tracker.log_train(epoch, batch_idx, float(loss.detach().cpu().item()), lr_now)
+        # Update tqdm with live loss and EMA
+        ema_now = tracker.loss_ema.get()
+        pbar.set_postfix({
+            'loss': f"{float(loss.detach().cpu().item()):.6f}",
+            'ema': f"{ema_now:.6f}" if ema_now is not None else 'N/A'
+        })
 
         # Lightweight validation at frequency
         if val_freq > 0 and batch_idx % val_freq == 0:
@@ -245,7 +256,7 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
                 spikes_v = vbatch['spikes'].to(device)
                 positions_v = vbatch['positions'].to(device)
                 mask_v = vbatch['neuron_mask'].to(device)
-                stim_v = vbatch['stimulus'].to(device).float()
+                stim_v = vbatch['stimulus'].to(device)
                 x_in_v = spikes_v[:, :-1, :]
                 x_tgt_v = spikes_v[:, 1:, :]
                 stim_in_v = stim_v[:, :-1, :]
@@ -276,7 +287,7 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         spikes = batch['spikes'].to(device)
         positions = batch['positions'].to(device)
         mask = batch['neuron_mask'].to(device)
-        stim = batch['stimulus'].to(device).float()
+        stim = batch['stimulus'].to(device)
 
         x_in = spikes[:, :-1, :]
         x_tgt = spikes[:, 1:, :]
@@ -345,13 +356,33 @@ def main():
     if device.type == 'cuda':
         logger.info(f"Using GPU: {torch.cuda.get_device_name()}")
 
+    # If not in distributed mode, stub minimal torch.distributed functions so Muon works in single-process
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and not dist.is_initialized():
+            dist.get_world_size = lambda group=None: 1
+            dist.get_rank = lambda group=None: 0
+            def _fake_all_gather(tensor_list, tensor, group=None):
+                if tensor_list is None:
+                    return
+                if len(tensor_list) == 0:
+                    return
+                if tensor_list[0].shape == tensor.shape:
+                    tensor_list[0].copy_(tensor)
+                else:
+                    # Fallback: resize and copy if shape differs
+                    tensor_list[0].resize_(tensor.shape).copy_(tensor)
+            dist.all_gather = _fake_all_gather
+    except Exception:
+        pass
+
     # Data
     train_loader, val_loader = create_dataloaders(cfg)
     cfg['training']['train_loader_len'] = len(train_loader)
 
     # Model
     mcfg = cfg['model']
-    # Infer d_stimuli from data one-hot width if not provided
+    # Infer d_stimuli from data one-hot width if not provided (uses global padded width)
     inferred_d_stimuli: Optional[int] = None
     try:
         sample_batch = next(iter(train_loader))
@@ -360,6 +391,10 @@ def main():
         pass
     d_stimuli = mcfg['d_stimuli'] if mcfg['d_stimuli'] is not None else (inferred_d_stimuli or 1)
     model = GBM(d_model=mcfg['d_model'], d_stimuli=d_stimuli, n_heads=mcfg['n_heads'], n_layers=mcfg['n_layers']).to(device)
+    # If bf16 requested, move model to bf16 to ensure Linear weights match bf16 inputs under autocast
+    amp_dtype_cfg = (cfg['training'].get('amp_dtype') or 'bf16').lower()
+    if cfg['training'].get('mixed_precision', True) and amp_dtype_cfg == 'bf16' and device.type == 'cuda':
+        model = model.to(dtype=torch.bfloat16)
     if cfg['training'].get('compile_model', False):
         try:
             model = torch.compile(model)
@@ -368,7 +403,9 @@ def main():
 
     # Optimizer & scheduler
     optimizer, scheduler = build_optimizer(model, cfg['training'])
-    scaler = GradScaler(enabled=cfg['training'].get('mixed_precision', False))
+    amp_dtype_cfg = (cfg['training'].get('amp_dtype') or 'bf16').lower()
+    amp_dtype = torch.bfloat16 if amp_dtype_cfg == 'bf16' else (torch.float16 if amp_dtype_cfg == 'fp16' else torch.float32)
+    scaler = GradScaler(enabled=cfg['training'].get('mixed_precision', False) and amp_dtype is torch.float16)
 
     # Metrics
     tracker = CombinedMetricsTracker(log_dir=dirs['logs'], ema_alpha=0.05, val_threshold=0.5, enable_plots=True)
