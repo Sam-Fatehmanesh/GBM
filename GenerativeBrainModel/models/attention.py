@@ -31,15 +31,14 @@ class RoutingFlashMHA(nn.Module):
         assert d_model % n_heads == 0
         self.d_model, self.n_heads = d_model, n_heads
         self.head_dim = d_model // n_heads
-        assert self.head_dim % 8 == 0
+        assert self.head_dim % 8 == 0  # FlashAttention requirement
 
         self.w = int(target_cluster_size)
         self.routing_iters = int(routing_iters)
         self.dropout_p = float(dropout_p)
 
-        self.q_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.k_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.v_proj = nn.Linear(d_model, d_model, bias=bias)
+        # (3) FUSED QKV PROJECTION
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
 
     @staticmethod
@@ -60,7 +59,7 @@ class RoutingFlashMHA(nn.Module):
         seqlens_tokens: torch.Tensor,   # [S]
         global_idx_per_set: torch.Tensor,  # [S]
     ):
-        # Cast to module dtype first, then force FLASH-friendly dtype (bf16/fp16)
+        # Cast to module dtype then ensure bf16/fp16 for FlashAttention
         dtype = next(self.parameters()).dtype
         q_in = q_in.to(dtype=dtype)
         k_in = k_in.to(dtype=dtype)
@@ -78,132 +77,127 @@ class RoutingFlashMHA(nn.Module):
         S = int(seqlens_tokens.numel())
         assert global_idx_per_set.numel() == S
 
-        # QKV projections (vectorized)
-        q_full = self.q_proj(q_in)                # [Ttot, D]
-        k_full = self.k_proj(k_in)
-        v_full = self.v_proj(v_in)
-        qh = q_full.view(Ttot, H, Dh)             # [Ttot, H, Dh]
-        kh = k_full.view(Ttot, H, Dh)
-        vh = v_full.view(Ttot, H, Dh)
+        # (3) FUSED QKV PROJECTION → reshape once
+        # Use q_in for Q, and k_in/v_in for K/V so upstream callers can pass distinct sources if needed.
+        # If they are the same tensor, this still hits one GEMM.
+        qkv_full = self.qkv(q_in)                              # [Ttot, 3*D]
+        qkv_full = qkv_full.view(Ttot, 3, H, Dh)               # [Ttot, 3, H, Dh]
+        qh = qkv_full[:, 0]                                    # [Ttot, H, Dh]
+        # For K/V: if k_in/v_in differ from q_in, project them too; else reuse split from fused proj.
+        if k_in.data_ptr() == q_in.data_ptr():
+            kh = qkv_full[:, 1]
+            vh = qkv_full[:, 2]
+        else:
+            kv_full = self.qkv(k_in) if v_in.data_ptr() == k_in.data_ptr() else None
+            if kv_full is not None:
+                kv_full = kv_full.view(Ttot, 3, H, Dh)
+                kh = kv_full[:, 1]
+                vh = kv_full[:, 2]
+            else:
+                kh = self.qkv(k_in).view(Ttot, 3, H, Dh)[:, 1]
+                vh = self.qkv(v_in).view(Ttot, 3, H, Dh)[:, 2]
 
-        # Routing features (stop grad so routing doesn’t build a graph)
+        # Routing features (detach so routing has no autograd graph)
         r = 0.5 * (self._l2n(qh.mean(1).detach()) + self._l2n(kh.mean(1).detach()))  # [Ttot, Dh]
 
-        # ---- per-set offsets computed on device to guarantee consistency with Ttot ----
-        lens_dev = seqlens_tokens.to(device=q_in.device, dtype=torch.long)             # [S]
+        # Per-set offsets on device; copy to CPU list once to avoid CUDA syncs in the loop
+        lens_dev = seqlens_tokens.to(device=q_in.device, dtype=torch.long)  # [S]
         cu_tok = torch.zeros(S + 1, device=q_in.device, dtype=torch.long)
         cu_tok[1:] = lens_dev.cumsum(0)
-        # Avoid per-iteration CUDA .item() syncs by materializing bounds on CPU once
-        bounds = cu_tok.detach().cpu().tolist()                                        # length S+1
+        bounds = cu_tok.detach().cpu().tolist()  # length S+1
 
         order_aug_chunks = []
         lens_aug_chunks  = []
 
-        # one reusable scalar tensor for ‘global’ write (avoid tiny allocs)
-        one_f32 = torch.tensor(1.0, device=q_in.device, dtype=dtype)  # for counts later
+        one_f32 = torch.tensor(1.0, device=q_in.device, dtype=q_in.dtype)  # for counts later
 
         for s in range(S):
-            a = int(bounds[s])
-            b = int(bounds[s + 1])
-            Ls = b - a
+            a = int(bounds[s]); b = int(bounds[s + 1])
+            Ls = max(0, min(b, Ttot) - min(a, Ttot))
             if Ls <= 0:
                 continue
-            # Clamp bounds defensively to Ttot
             a = min(a, Ttot)
-            b = min(b, Ttot)
-            Ls = b - a
-            if Ls <= 0:
-                continue
 
-            feats = r.narrow(0, a, Ls)                      # [L, Dh] on GPU
-            # Ensure non-zero cluster widths and counts
+            feats = r.narrow(0, a, Ls)                 # [L, Dh]
             w = max(1, min(self.w, Ls))
             k = max(1, (Ls + w - 1) // w)
 
-            # ---- k-means-lite (vectorized), small fixed iters ----
-            # init centroids deterministically
+            # k-means-lite (vectorized)
             with torch.no_grad():
-                # evenly spaced indices (compute on CPU, then clamp and move)
-                init_idx_cpu = torch.linspace(0, max(Ls - 1, 0), steps=k).round().to(torch.long)
-                if Ls > 0:
-                    init_idx_cpu.clamp_(0, Ls - 1)
-                centroids = feats[init_idx_cpu.to(feats.device)]          # [k, Dh]
+                init_idx = torch.linspace(0, max(Ls - 1, 0), steps=k, device=feats.device).round().to(torch.long)
+                centroids = feats[init_idx]
                 for _ in range(max(1, self.routing_iters)):
-                    sims = feats @ centroids.T                            # [L, k]
-                    assign = sims.argmax(dim=1)                           # [L]
-                    sums = torch.zeros_like(centroids)                    # [k, Dh]
+                    sims = feats @ centroids.T
+                    assign = sims.argmax(dim=1)
+                    sums = torch.zeros_like(centroids)
                     sums.index_add_(0, assign, feats)
                     counts = torch.bincount(assign, minlength=k).clamp_min(1).unsqueeze(1).to(sums.dtype)
                     centroids = sums / counts
                     centroids = centroids / (centroids.norm(dim=-1, keepdim=True) + 1e-6)
 
-            sims = feats @ centroids.T                                    # [L, k]
-            assign = sims.argmax(dim=1)                                   # [L]
-            own = sims.gather(1, assign.unsqueeze(1)).squeeze(1)          # [L]
+            sims = feats @ centroids.T
+            assign = sims.argmax(dim=1)
+            own = sims.gather(1, assign.unsqueeze(1)).squeeze(1)
 
-            # ---- balanced trimming (fully vectorized within the set) ----
-            # sort by score desc, then by cluster id (stable)
             order1 = torch.argsort(-own)
             assign1 = assign[order1]
             order2 = torch.argsort(assign1, stable=True)
-            perm = order1[order2]                                         # [L]
-            cid_sorted = assign1[order2]                                  # [L]
+            perm = order1[order2]
+            cid_sorted = assign1[order2]
 
-            counts = torch.bincount(cid_sorted, minlength=k)              # [k]
+            counts = torch.bincount(cid_sorted, minlength=k)
             keep_counts = torch.minimum(counts, torch.tensor(w, device=counts.device))
-            valid_clusters = keep_counts > 0
-            if not bool(valid_clusters.any()):
+            if not bool((keep_counts > 0).any()):
                 keep_counts = torch.tensor([Ls], device=counts.device)
                 cid_sorted = torch.zeros(Ls, device=counts.device, dtype=torch.long)
                 perm = torch.arange(Ls, device=counts.device, dtype=torch.long)
 
-            # compute position within each cluster segment
-            starts = (torch.cumsum(counts, dim=0) - counts)               # [k]
+            starts = (torch.cumsum(counts, dim=0) - counts)
             starts_rep = torch.repeat_interleave(starts, counts.clamp_min(0))
             pos = torch.arange(cid_sorted.numel(), device=cid_sorted.device) - starts_rep
             keep_mask = pos < keep_counts[cid_sorted]
-            kept = perm[keep_mask]                                        # [sum kept]
+            kept = perm[keep_mask]                         # [sum kept]
+            order_abs_kept = kept + a
 
-            # absolute indices in global compact space
-            order_abs_kept = kept + a                                     # [sum kept]
-
-            # ---- append global token after each cluster (vectorized) ----
-            kc = keep_counts[keep_counts > 0]                              # [C]
+            kc = keep_counts[keep_counts > 0]              # [C]
             C = kc.numel()
-            ins = kc.cumsum(0) + torch.arange(C, device=kc.device)         # [C]
+            ins = kc.cumsum(0) + torch.arange(C, device=kc.device)
             total_aug = int(kc.sum().item()) + C
 
             with_global = torch.empty(total_aug, device=q_in.device, dtype=torch.long)
             mask = torch.ones(total_aug, dtype=torch.bool, device=q_in.device)
             mask[ins] = False
             with_global[mask] = order_abs_kept
-
             gidx = int(global_idx_per_set[s].item())
             with_global[ins] = gidx
 
-            order_aug_chunks.append(with_global)                           # [total_aug]
-            lens_aug_chunks.append((kc + 1).to(torch.int32))               # +1 for global
+            order_aug_chunks.append(with_global)
+            lens_aug_chunks.append((kc + 1).to(torch.int32))
 
         if not order_aug_chunks:
             return torch.zeros_like(q_in)
 
-        # ---- concat across sets and call FlashAttention once ----
-        order_aug = torch.cat(order_aug_chunks, dim=0)                     # [Tdup]
-        lens_t = torch.cat(lens_aug_chunks, dim=0)                         # [#clusters_total]
+        order_aug = torch.cat(order_aug_chunks, dim=0)        # [Tdup]
+        lens_t = torch.cat(lens_aug_chunks, dim=0)            # [#clusters_total]
         cu_cls = torch.zeros(lens_t.numel() + 1, device=q_in.device, dtype=torch.int32)
         cu_cls[1:] = lens_t.cumsum(0)
         max_seqlen = int(lens_t.max().item())
 
-        qkv = torch.stack([qh, kh, vh], dim=1).contiguous()                # [Ttot, 3, H, Dh]
-        qkv = qkv[order_aug]                                               # [Tdup, 3, H, Dh]
+        # (1) REORDER → STACK (avoid building [Ttot,3,H,Dh] first)
+        qh_sel = qh.index_select(0, order_aug)                # [Tdup, H, Dh]
+        kh_sel = kh.index_select(0, order_aug)
+        vh_sel = vh.index_select(0, order_aug)
+        qkv    = torch.stack([qh_sel, kh_sel, vh_sel], dim=1).contiguous()  # [Tdup, 3, H, Dh]
         if qkv.dtype not in (torch.bfloat16, torch.float16):
             qkv = qkv.to(torch.bfloat16)
 
         p = self.dropout_p if self.training and self.dropout_p > 0 else 0.0
-        out_packed = flash_varlen_qkv(qkv, cu_seqlens=cu_cls, max_seqlen=max_seqlen,
-                                      dropout_p=p, softmax_scale=None, causal=False)   # [Tdup, H, Dh]
+        out_packed = flash_varlen_qkv(
+            qkv, cu_seqlens=cu_cls, max_seqlen=max_seqlen,
+            dropout_p=p, softmax_scale=None, causal=False
+        )                                                     # [Tdup, H, Dh]
 
-        # merge duplicates (global per cluster) by MEAN — fully vectorized
+        # mean-merge duplicates (global appears once per cluster)
         out_h = torch.zeros(Ttot, H, Dh, device=q_in.device, dtype=out_packed.dtype)
         out_h.index_add_(0, order_aug, out_packed)
         counts_merge = torch.zeros(Ttot, device=q_in.device, dtype=out_packed.dtype)
@@ -211,6 +205,7 @@ class RoutingFlashMHA(nn.Module):
         out_h = out_h / counts_merge.clamp_min(1.0).view(-1, 1, 1)
 
         return self.out_proj(out_h.reshape(Ttot, D))
+
 
 
 class SpatialNeuralAttention(nn.Module):
