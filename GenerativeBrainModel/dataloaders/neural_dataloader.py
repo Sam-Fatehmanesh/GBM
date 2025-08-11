@@ -295,9 +295,11 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
         'num_workers': num_workers,
         'pin_memory': training_config.get('pin_memory', False),
         'persistent_workers': training_config.get('persistent_workers', False) if num_workers > 0 else False,
+        'prefetch_factor': training_config.get('prefetch_factor', 2) if num_workers > 0 else None,
+        'pin_memory_device': 'cuda' if training_config.get('pin_memory', False) else '',
     }
-    if num_workers > 0:
-        dl_kwargs['prefetch_factor'] = training_config.get('prefetch_factor', 2)
+    if num_workers == 0 and 'prefetch_factor' in dl_kwargs:
+        del dl_kwargs['prefetch_factor']
 
     # Distributed samplers (if dist is initialized)
     train_sampler = None

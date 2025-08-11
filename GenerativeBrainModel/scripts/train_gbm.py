@@ -19,7 +19,7 @@ from typing import Dict, Any, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.amp import GradScaler
+# No GradScaler import; bf16 does not require loss scaling
 
 import numpy as np
 import random
@@ -31,6 +31,53 @@ from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloader
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
 
+
+class CUDAPrefetchLoader:
+    """Wrap a DataLoader to prefetch the next batch to CUDA on a dedicated stream.
+    Casts spikes/stim to bf16 when requested to minimize cast kernels.
+    """
+    def __init__(self, loader: torch.utils.data.DataLoader, device: torch.device, *, cast_bf16: bool):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
+        self.cast_bf16 = cast_bf16
+
+    def __len__(self):
+        return len(self.loader)
+
+    def _to_device(self, batch):
+        non_blocking = True
+        out = {}
+        out['spikes'] = batch['spikes'].to(self.device, non_blocking=non_blocking)
+        out['positions'] = batch['positions'].to(self.device, non_blocking=non_blocking)
+        out['neuron_mask'] = batch['neuron_mask'].to(self.device, non_blocking=non_blocking)
+        out['stimulus'] = batch['stimulus'].to(self.device, non_blocking=non_blocking)
+        if self.cast_bf16:
+            out['spikes'] = out['spikes'].to(torch.bfloat16)
+            out['stimulus'] = out['stimulus'].to(torch.bfloat16)
+        out['file_path'] = batch['file_path']
+        out['start_idx'] = batch['start_idx']
+        return out
+
+    def __iter__(self):
+        if self.stream is None:
+            for b in self.loader:
+                yield self._to_device(b)
+            return
+        first = True
+        next_batch = None
+        for b in self.loader:
+            with torch.cuda.stream(self.stream):
+                next_batch = self._to_device(b)
+            if not first:
+                torch.cuda.current_stream().wait_stream(self.stream)
+                yield cur
+            else:
+                first = False
+            cur = next_batch
+        torch.cuda.current_stream().wait_stream(self.stream)
+        if next_batch is not None:
+            yield next_batch
 
 def create_default_config() -> Dict[str, Any]:
     return {
@@ -207,7 +254,7 @@ def write_architecture_file(model: nn.Module, dirs: Dict[str, Path], cfg: Dict[s
         f.write("\n")
 
 
-def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader: torch.utils.data.DataLoader, device: torch.device, optimizer, scheduler, scaler: Optional[GradScaler], tracker: CombinedMetricsTracker, epoch: int, cfg: Dict[str, Any]) -> None:
+def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader: torch.utils.data.DataLoader, device: torch.device, optimizer, scheduler, scaler: Optional[object], tracker: CombinedMetricsTracker, epoch: int, cfg: Dict[str, Any]) -> None:
     model.train()
     grad_accum = cfg.get('gradient_accumulation_steps') or 1
     val_freq = int(cfg.get('validation_frequency') or 0)
@@ -216,12 +263,26 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
     amp_dtype_cfg = (cfg.get('amp_dtype') or 'bf16').lower()
     amp_dtype = torch.bfloat16 if amp_dtype_cfg == 'bf16' else (torch.float16 if amp_dtype_cfg == 'fp16' else torch.float32)
     use_amp = bool(cfg.get('mixed_precision', True))
-    pbar = tqdm(loader, desc=f"Epoch {epoch}")
+    # Wrap loader with CUDA prefetch to overlap H2D with compute
+    prefetch = (device.type == 'cuda')
+    wrapped_loader = CUDAPrefetchLoader(loader, device, cast_bf16=(use_amp and amp_dtype is torch.bfloat16)) if prefetch else loader
+    pbar = tqdm(wrapped_loader, desc=f"Epoch {epoch}", mininterval=0.1, smoothing=0.05)
+    use_profiler = bool(cfg.get('profile', False)) and torch.cuda.is_available()
+    prof = None
+    if use_profiler:
+        prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=cfg.get('profile_steps', 50), repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(cfg.get('profile_dir', './tb_prof'))),
+            record_shapes=True, profile_memory=True, with_stack=True, with_modules=True
+        )
+        prof.__enter__()
     for batch_idx, batch in enumerate(pbar, 1):
-        spikes = batch['spikes'].to(device)           # (B, L, N)
-        positions = batch['positions'].to(device)     # (B, N, 3)
-        mask = batch['neuron_mask'].to(device)        # (B, N)
-        stim = batch['stimulus'].to(device)   # (B, L, K)
+        # Batches are already on device via the prefetcher when CUDA is used
+        spikes = batch['spikes']
+        positions = batch['positions']
+        mask = batch['neuron_mask']
+        stim = batch['stimulus']
 
         # Prepare seq2seq (input: 0..L-2, target: 1..L-1)
         x_in = spikes[:, :-1, :]
@@ -236,20 +297,12 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
             loss = nn.BCEWithLogitsLoss()(logits, x_tgt)
             loss_to_backprop = loss / grad_accum
 
-        if scaler is not None:
-            scaler.scale(loss_to_backprop).backward()
-            if batch_idx % grad_accum == 0:
-                scaler.unscale_(optimizer)
-                if cfg.get('gradient_clip_norm'):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['gradient_clip_norm'])
-                scaler.step(optimizer)
-                scaler.update()
-        else:
-            loss_to_backprop.backward()
-            if batch_idx % grad_accum == 0:
-                if cfg.get('gradient_clip_norm'):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['gradient_clip_norm'])
-                optimizer.step()
+        # bf16/fp32 path: no GradScaler needed
+        loss_to_backprop.backward()
+        if batch_idx % grad_accum == 0:
+            if cfg.get('gradient_clip_norm'):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['gradient_clip_norm'])
+            optimizer.step()
 
         # Per-batch scheduler (warmup_cosine)
         if scheduler == 'warmup_cosine_placeholder' and 'train_loader_len' in cfg:
@@ -277,6 +330,9 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
             'loss': f"{float(loss.detach().cpu().item()):.6f}",
             'ema': f"{ema_now:.6f}" if ema_now is not None else 'N/A'
         })
+
+        if prof is not None:
+            prof.step()
 
         # Lightweight validation at frequency
         if val_freq > 0 and batch_idx % val_freq == 0:
@@ -385,10 +441,15 @@ def main():
 
     # Device & seeds
     #torch.autograd.set_detect_anomaly(True)
+    
     device = torch.device('cuda' if (cfg['training']['use_gpu'] and torch.cuda.is_available()) else 'cpu')
     set_seeds(cfg['training']['seed'])
     if device.type == 'cuda':
         logger.info(f"Using GPU: {torch.cuda.get_device_name()}")
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
 
     # If not in distributed mode, stub minimal torch.distributed functions so Muon works in single-process
     try:
@@ -508,6 +569,8 @@ def main():
         tracker.plot_training()
 
     logger.info("Training complete.")
+    if prof is not None:
+        prof.__exit__(None, None, None)
     # Best checkpoint videos
     if best_ckpt is not None:
         logger.info(f"Loading best checkpoint: {best_ckpt}")
