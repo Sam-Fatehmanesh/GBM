@@ -9,6 +9,7 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 import math
 # Require FlashAttention-2 varlen
 from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as flash_varlen_qkv
+import torch.distributed as dist
 
 
 
@@ -16,100 +17,180 @@ from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as 
 
 # ========================= Routing + FlashAttention (shared) =========================
 
+
+
 class RoutingFlashMHA(nn.Module):
+    """
+    Shared-routing + FlashAttention-2(varlen), with:
+      • Spherical routing features (LN no-affine + L2)
+      • Persistent **EMA centroids** synchronized across DDP ranks
+      • Balanced top-w per centroid (multi-membership)
+    """
     def __init__(
         self,
         d_model: int,
         n_heads: int,
         *,
-        target_cluster_size: int = 384,
-        routing_iters: int = 1,
-        dropout_p: float = 0.0,
+        target_cluster_size: int = 384,    # w
+        ema_decay: float = 0.999,          # λ
         bias: bool = False,
+        ddp_sync: bool = True,             # turn on DDP all-reduce/broadcast
+        ddp_pg=None,                       # optional process group
     ):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model, self.n_heads = d_model, n_heads
         self.head_dim = d_model // n_heads
-        assert self.head_dim % 8 == 0  # FlashAttention requirement
+        assert self.head_dim % 8 == 0
 
         self.w = int(target_cluster_size)
-        self.routing_iters = int(routing_iters)
-        self.dropout_p = float(dropout_p)
+        self.ema_decay = float(ema_decay)
+        self.ddp_sync = bool(ddp_sync)
+        self.ddp_pg = ddp_pg
 
-        # (3) FUSED QKV PROJECTION
+        # Fused QKV
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
 
-    @staticmethod
-    def _ensure_flash_dtype(*xs):
-        for x in xs:
-            if x.dtype not in (torch.bfloat16, torch.float16):
-                raise RuntimeError(f"FlashAttention requires bf16/fp16 (got {x.dtype}).")
+        # Spherical routing norm over shared routing features (per-token Dh)
+        self.route_ln = nn.LayerNorm(self.head_dim, elementwise_affine=False)
+
+        # Persistent centroid bank as a BUFFER (not optimized): [K, Dh], unit-norm
+        self.register_buffer("centroids", torch.empty(0, self.head_dim), persistent=True)
 
     @staticmethod
-    def _l2n(x, eps=1e-6):
+    def _l2n(x: torch.Tensor, eps: float = 1e-6):
         return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+    def _ddp_available(self):
+        return self.ddp_sync and dist.is_available() and dist.is_initialized()
+
+    def _all_reduce_(self, t: torch.Tensor):
+        if self._ddp_available():
+            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=self.ddp_pg)
+
+    def _bcast_centroids_(self):
+        if self._ddp_available() and self.centroids.numel() > 0:
+            # Broadcast whole tensor (simple & robust)
+            dist.broadcast(self.centroids, src=0, group=self.ddp_pg)
+
+    def _ensure_centroids(self, device, dtype, K_needed: int, seed_feats: torch.Tensor):
+        """
+        Ensure we have at least K_needed centroids. If we grow, rank-0 seeds new rows and broadcasts them.
+        seed_feats are assumed roughly unit-norm in (Dh,).
+        """
+        K_cur = int(self.centroids.shape[0])
+        if K_needed <= K_cur:
+            return
+
+        K_new = K_needed
+        # Resize (all ranks) and zero-fill new rows
+        if K_cur == 0:
+            centroids = torch.zeros(K_new, self.head_dim, device=device, dtype=dtype)
+        else:
+            centroids = torch.zeros(K_new, self.head_dim, device=device, dtype=dtype)
+            centroids[:K_cur] = self.centroids.to(device=device, dtype=dtype)
+
+        # Rank-0 seeds the new rows, others leave zeros; then broadcast
+        if (not self._ddp_available()) or dist.get_rank(self.ddp_pg or dist.group.WORLD) == 0:
+            if seed_feats.numel() > 0:
+                idx = torch.linspace(0, max(seed_feats.size(0) - 1, 0),
+                                     steps=K_new - K_cur, device=seed_feats.device).round().to(torch.long)
+                new_c = seed_feats.index_select(0, idx).to(device=device, dtype=dtype)
+                new_c = self._l2n(new_c)
+            else:
+                new_c = self._l2n(torch.randn(K_new - K_cur, self.head_dim, device=device, dtype=dtype))
+            centroids[K_cur:K_new] = new_c
+
+        self.centroids = centroids  # assign buffer
+        self._bcast_centroids_()
+
+    @torch.no_grad()
+    def _ema_update_ddp(self, sums_f32: torch.Tensor, counts_f32: torch.Tensor, k_use: int):
+        """
+        DDP-safe EMA update:
+          - all-reduce sums & counts
+          - update centroids[:k_use] with fp32 EMA, then write back unit-norm in buffer dtype
+        """
+        if k_use == 0:
+            return
+        # All-reduce (SUM) across ranks
+        self._all_reduce_(sums_f32)
+        self._all_reduce_(counts_f32)
+
+        have = (counts_f32.squeeze(1) > 0)
+        if not bool(have.any()):
+            return
+
+        # Promote to fp32 for the EMA math
+        c = self.centroids[:k_use].to(dtype=torch.float32)
+        means = torch.zeros_like(c)
+        means[have] = sums_f32[have] / counts_f32[have].clamp_min(1e-6)
+
+        decay = self.ema_decay
+        c[have] = self._l2n(decay * c[have] + (1.0 - decay) * means[have])
+
+        # Write back in buffer dtype
+        self.centroids[:k_use] = c.to(dtype=self.centroids.dtype)
 
     def forward(
         self,
-        q_in: torch.Tensor,             # [Ttot, D]
-        k_in: torch.Tensor,             # [Ttot, D]
-        v_in: torch.Tensor,             # [Ttot, D]
-        seqlens_tokens: torch.Tensor,   # [S]
-        global_idx_per_set: torch.Tensor,  # [S]
+        x_compact: torch.Tensor,          # [Ttot, D]
+        seqlens_tokens: torch.Tensor,     # [S]
     ):
-        # Cast to module dtype then ensure bf16/fp16 for FlashAttention
         dtype = next(self.parameters()).dtype
-        q_in = q_in.to(dtype=dtype)
-        k_in = k_in.to(dtype=dtype)
-        v_in = v_in.to(dtype=dtype)
-        if q_in.dtype not in (torch.bfloat16, torch.float16):
-            q_in = q_in.to(torch.bfloat16)
-        if k_in.dtype not in (torch.bfloat16, torch.float16):
-            k_in = k_in.to(torch.bfloat16)
-        if v_in.dtype not in (torch.bfloat16, torch.float16):
-            v_in = v_in.to(torch.bfloat16)
+        x = x_compact.to(dtype=dtype)
+        if x.dtype not in (torch.bfloat16, torch.float16):
+            x = x.to(torch.bfloat16)
 
-        Ttot, D = q_in.shape
+        Ttot, D = x.shape
         H, Dh = self.n_heads, self.head_dim
         assert D == H * Dh
         S = int(seqlens_tokens.numel())
-        assert global_idx_per_set.numel() == S
 
-        # (3) FUSED QKV PROJECTION → reshape once
-        # Use q_in for Q, and k_in/v_in for K/V so upstream callers can pass distinct sources if needed.
-        # If they are the same tensor, this still hits one GEMM.
-        qkv_full = self.qkv(q_in)                              # [Ttot, 3*D]
-        qkv_full = qkv_full.view(Ttot, 3, H, Dh)               # [Ttot, 3, H, Dh]
-        qh = qkv_full[:, 0]                                    # [Ttot, H, Dh]
-        # For K/V: if k_in/v_in differ from q_in, project them too; else reuse split from fused proj.
-        if k_in.data_ptr() == q_in.data_ptr():
-            kh = qkv_full[:, 1]
-            vh = qkv_full[:, 2]
-        else:
-            kv_full = self.qkv(k_in) if v_in.data_ptr() == k_in.data_ptr() else None
-            if kv_full is not None:
-                kv_full = kv_full.view(Ttot, 3, H, Dh)
-                kh = kv_full[:, 1]
-                vh = kv_full[:, 2]
-            else:
-                kh = self.qkv(k_in).view(Ttot, 3, H, Dh)[:, 1]
-                vh = self.qkv(v_in).view(Ttot, 3, H, Dh)[:, 2]
+        # Fused QKV
+        qkv_full = self.qkv(x).view(Ttot, 3, H, Dh)   # [Ttot, 3, H, Dh]
+        qh, kh, vh = qkv_full[:, 0], qkv_full[:, 1], qkv_full[:, 2]
 
-        # Routing features (detach so routing has no autograd graph)
-        r = 0.5 * (self._l2n(qh.mean(1).detach()) + self._l2n(kh.mean(1).detach()))  # [Ttot, Dh]
+        # Spherical routing features: LN (no affine) + L2, shared across heads
+        q_route = self.route_ln(qh.mean(1))
+        k_route = self.route_ln(kh.mean(1))
+        r = 0.5 * (q_route + k_route)
+        r = self._l2n(r.detach())                     # [Ttot, Dh], unit-norm
 
-        # Per-set offsets on device; copy to CPU list once to avoid CUDA syncs in the loop
-        lens_dev = seqlens_tokens.to(device=q_in.device, dtype=torch.long)  # [S]
-        cu_tok = torch.zeros(S + 1, device=q_in.device, dtype=torch.long)
+        # Per-set bounds
+        lens_dev = seqlens_tokens.to(device=x.device, dtype=torch.long)
+        cu_tok = torch.zeros(S + 1, device=x.device, dtype=torch.long)
         cu_tok[1:] = lens_dev.cumsum(0)
-        bounds = cu_tok.detach().cpu().tolist()  # length S+1
+        bounds = cu_tok.detach().cpu().tolist()
 
-        order_aug_chunks = []
-        lens_aug_chunks  = []
+        # Determine local k_needed (max over sets)
+        k_needed_local = 0
+        for s in range(S):
+            a = int(bounds[s]); b = int(bounds[s + 1])
+            Ls = max(0, min(b, Ttot) - min(a, Ttot))
+            if Ls <= 0:
+                continue
+            w_eff = max(1, min(self.w, Ls))
+            k_s = max(1, (Ls + w_eff - 1) // w_eff)
+            k_needed_local = max(k_needed_local, k_s)
 
-        one_f32 = torch.tensor(1.0, device=q_in.device, dtype=q_in.dtype)  # for counts later
+        # Global max across ranks so we reduce with uniform shapes
+        k_needed = k_needed_local
+        if self._ddp_available():
+            t = torch.tensor([k_needed_local], device=x.device, dtype=torch.int64)
+            dist.all_reduce(t, op=dist.ReduceOp.MAX, group=self.ddp_pg)
+            k_needed = int(t.item())
+
+        # Ensure/grow centroid bank to k_needed (seed & broadcast if needed)
+        seed_idx = torch.linspace(0, max(Ttot - 1, 0), steps=max(1, k_needed),
+                                  device=r.device).round().to(torch.long)
+        self._ensure_centroids(x.device, r.dtype, k_needed, seed_feats=r.index_select(0, seed_idx))
+
+        # Build multi-membership top-w packing and accumulate EMA stats (fp32)
+        order_chunks, lens_chunks = [], []
+        ema_sums = torch.zeros(k_needed, Dh, device=x.device, dtype=torch.float32)
+        ema_counts = torch.zeros(k_needed, 1, device=x.device, dtype=torch.float32)
 
         for s in range(S):
             a = int(bounds[s]); b = int(bounds[s + 1])
@@ -118,107 +199,75 @@ class RoutingFlashMHA(nn.Module):
                 continue
             a = min(a, Ttot)
 
-            feats = r.narrow(0, a, Ls)                 # [L, Dh]
-            w = max(1, min(self.w, Ls))
-            k = max(1, (Ls + w - 1) // w)
+            feats = r.narrow(0, a, Ls)                       # [L, Dh]
+            w_eff = max(1, min(self.w, Ls))
+            k_s = max(1, (Ls + w_eff - 1) // w_eff)
 
-            # k-means-lite (vectorized)
-            with torch.no_grad():
-                init_idx = torch.linspace(0, max(Ls - 1, 0), steps=k, device=feats.device).round().to(torch.long)
-                centroids = feats[init_idx]
-                for _ in range(max(1, self.routing_iters)):
-                    sims = feats @ centroids.T
-                    assign = sims.argmax(dim=1)
-                    sums = torch.zeros_like(centroids)
-                    sums.index_add_(0, assign, feats)
-                    counts = torch.bincount(assign, minlength=k).clamp_min(1).unsqueeze(1).to(sums.dtype)
-                    centroids = sums / counts
-                    centroids = centroids / (centroids.norm(dim=-1, keepdim=True) + 1e-6)
+            C = self.centroids[:k_s]                          # [k_s, Dh]
+            sims = feats @ C.T                                # [L, k_s]
 
-            sims = feats @ centroids.T
-            assign = sims.argmax(dim=1)
-            own = sims.gather(1, assign.unsqueeze(1)).squeeze(1)
+            # Balanced top-w per centroid (multi-membership)
+            top_idx = sims.topk(k=w_eff, dim=0, largest=True, sorted=False).indices  # [w_eff, k_s]
+            kept_rel = top_idx.transpose(0, 1).reshape(-1)    # [k_s * w_eff]
+            order_abs = kept_rel + a
+            order_chunks.append(order_abs)
+            lens_chunks.append(torch.full((k_s,), w_eff, device=x.device, dtype=torch.int32))
 
-            order1 = torch.argsort(-own)
-            assign1 = assign[order1]
-            order2 = torch.argsort(assign1, stable=True)
-            perm = order1[order2]
-            cid_sorted = assign1[order2]
+            # Nearest-centroid assign for EMA stats
+            assign = sims.argmax(dim=1)                       # [L]
+            # fp32 accumulation
+            feats_f32 = feats.to(torch.float32)
+            ema_sums[:k_s].index_add_(0, assign, feats_f32)
+            ema_counts[:k_s] += torch.bincount(assign, minlength=k_s).to(torch.float32).unsqueeze(1)
 
-            counts = torch.bincount(cid_sorted, minlength=k)
-            keep_counts = torch.minimum(counts, torch.tensor(w, device=counts.device))
-            if not bool((keep_counts > 0).any()):
-                keep_counts = torch.tensor([Ls], device=counts.device)
-                cid_sorted = torch.zeros(Ls, device=counts.device, dtype=torch.long)
-                perm = torch.arange(Ls, device=counts.device, dtype=torch.long)
+        if not order_chunks:
+            return self.out_proj(torch.zeros_like(x))
 
-            starts = (torch.cumsum(counts, dim=0) - counts)
-            starts_rep = torch.repeat_interleave(starts, counts.clamp_min(0))
-            pos = torch.arange(cid_sorted.numel(), device=cid_sorted.device) - starts_rep
-            keep_mask = pos < keep_counts[cid_sorted]
-            kept = perm[keep_mask]                         # [sum kept]
-            order_abs_kept = kept + a
-
-            kc = keep_counts[keep_counts > 0]              # [C]
-            C = kc.numel()
-            ins = kc.cumsum(0) + torch.arange(C, device=kc.device)
-            total_aug = int(kc.sum().item()) + C
-
-            with_global = torch.empty(total_aug, device=q_in.device, dtype=torch.long)
-            mask = torch.ones(total_aug, dtype=torch.bool, device=q_in.device)
-            mask[ins] = False
-            with_global[mask] = order_abs_kept
-            gidx = int(global_idx_per_set[s].item())
-            with_global[ins] = gidx
-
-            order_aug_chunks.append(with_global)
-            lens_aug_chunks.append((kc + 1).to(torch.int32))
-
-        if not order_aug_chunks:
-            return torch.zeros_like(q_in)
-
-        order_aug = torch.cat(order_aug_chunks, dim=0)        # [Tdup]
-        lens_t = torch.cat(lens_aug_chunks, dim=0)            # [#clusters_total]
-        cu_cls = torch.zeros(lens_t.numel() + 1, device=q_in.device, dtype=torch.int32)
+        order = torch.cat(order_chunks, dim=0)                # [Tdup]
+        lens_t = torch.cat(lens_chunks, dim=0)                # [#clusters_total]
+        cu_cls = torch.zeros(lens_t.numel() + 1, device=x.device, dtype=torch.int32)
         cu_cls[1:] = lens_t.cumsum(0)
         max_seqlen = int(lens_t.max().item())
 
-        # (1) REORDER → STACK (avoid building [Ttot,3,H,Dh] first)
-        qh_sel = qh.index_select(0, order_aug)                # [Tdup, H, Dh]
-        kh_sel = kh.index_select(0, order_aug)
-        vh_sel = vh.index_select(0, order_aug)
-        qkv    = torch.stack([qh_sel, kh_sel, vh_sel], dim=1).contiguous()  # [Tdup, 3, H, Dh]
+        # QKV pack (reorder → stack)
+        qh_sel = qh.index_select(0, order)
+        kh_sel = kh.index_select(0, order)
+        vh_sel = vh.index_select(0, order)
+        qkv = torch.stack([qh_sel, kh_sel, vh_sel], dim=1).contiguous()  # [Tdup, 3, H, Dh]
         if qkv.dtype not in (torch.bfloat16, torch.float16):
             qkv = qkv.to(torch.bfloat16)
 
-        p = self.dropout_p if self.training and self.dropout_p > 0 else 0.0
-        out_packed = flash_varlen_qkv(
-            qkv, cu_seqlens=cu_cls, max_seqlen=max_seqlen,
-            dropout_p=p, softmax_scale=None, causal=False
-        )                                                     # [Tdup, H, Dh]
+        out_packed = flash_varlen_qkv(qkv, cu_seqlens=cu_cls, max_seqlen=max_seqlen,
+                                      dropout_p=0.0, softmax_scale=None, causal=False)  # [Tdup, H, Dh]
 
-        # mean-merge duplicates (global appears once per cluster)
-        out_h = torch.zeros(Ttot, H, Dh, device=q_in.device, dtype=out_packed.dtype)
-        out_h.index_add_(0, order_aug, out_packed)
-        counts_merge = torch.zeros(Ttot, device=q_in.device, dtype=out_packed.dtype)
-        counts_merge.index_add_(0, order_aug, one_f32.expand(order_aug.numel()))
-        out_h = out_h / counts_merge.clamp_min(1.0).view(-1, 1, 1)
+        # Merge duplicates by sum → average by count
+        out_h = torch.zeros(Ttot, H, Dh, device=x.device, dtype=out_packed.dtype)
+        out_h.index_add_(0, order, out_packed)
+        counts = torch.zeros(Ttot, device=x.device, dtype=out_packed.dtype)
+        counts.index_add_(0, order, torch.ones(order.numel(), device=x.device, dtype=out_packed.dtype))
+        out_h = out_h / counts.clamp_min(1.0).view(-1, 1, 1)
+
+        # DDP-safe EMA update (single pass across batch)
+        with torch.no_grad():
+            self._ema_update_ddp(ema_sums, ema_counts, k_needed)
 
         return self.out_proj(out_h.reshape(Ttot, D))
 
-
-
 class SpatialNeuralAttention(nn.Module):
+    """
+    Vectorized pad compaction → shared-routing (spherical, EMA, multi-membership top-w) → FA-2(varlen).
+    No special global token; duplicates across clusters are allowed and scatter-added.
+    """
     def __init__(self, d_model, n_heads, n_rope_features=32,
-                 target_cluster_size: int = 384, routing_iters: int = 1):
+                 target_cluster_size: int = 384, ema_decay: float = 0.999):
         super().__init__()
         self.attn = RoutingFlashMHA(
             d_model, n_heads,
             target_cluster_size=target_cluster_size,
-            routing_iters=routing_iters,
-            dropout_p=0.0,
+            ema_decay=ema_decay,
             bias=False,
         )
+        from GenerativeBrainModel.models.rms import RMSNorm
         self.norm = RMSNorm(d_model)
         self.rope_proj = nn.Linear(2 * n_rope_features, d_model, bias=False)
 
@@ -243,7 +292,7 @@ class SpatialNeuralAttention(nn.Module):
         return x + rope.unsqueeze(1).expand(B, T, N, D).reshape(B_T, N, D)
 
     def forward(self, x, point_positions, neuron_pad_mask=None):
-        # x: (B,T,N,D) with last token = global
+        # x: (B,T,N,D)  (the last token can be your stimulus token, but it's no longer treated specially)
         B, T, N, D = x.shape
         S = B * T
 
@@ -254,13 +303,11 @@ class SpatialNeuralAttention(nn.Module):
         rope_emb = self._directional_rope(point_positions)
         qk = self._apply_rope(xn, rope_emb)  # RoPE on Q/K only
 
+        # Vectorized compaction
         if neuron_pad_mask is None:
             keep = torch.ones((B, N), dtype=torch.bool, device=x.device)
         else:
             keep = (neuron_pad_mask != 0).to(torch.bool)
-        if not bool(keep[:, -1].all()):
-            raise RuntimeError("Global token (last neuron) must be valid in neuron_pad_mask")
-
         keep_bt = keep.unsqueeze(1).expand(B, T, N).reshape(S, N)      # (S,N)
         lens = keep_bt.sum(dim=1).to(torch.int32)                      # [S]
 
@@ -268,29 +315,22 @@ class SpatialNeuralAttention(nn.Module):
         cu_tok[1:] = lens.to(torch.long).cumsum(0)
 
         flat_mask = keep_bt.reshape(-1)
-        idx_flat = flat_mask.nonzero(as_tuple=False).squeeze(1)
-
-        # compact index of global (last) token per set in compacted space
-        counts_before_last = keep_bt[:, :N-1].sum(dim=1).to(torch.long)  # [S]
-        global_idx_per_set = cu_tok[:-1] + counts_before_last            # [S]
+        # compile-friendly index build (avoid .nonzero())
+        idx_flat = torch.arange(flat_mask.numel(), device=x.device, dtype=torch.long)[flat_mask]
 
         qk_flat = qk.reshape(S * N, D)
         xn_flat = xn.reshape(S * N, D)
-        qk_compact = qk_flat[idx_flat]                                   # [Ttot, D]
-        v_compact  = xn_flat[idx_flat]                                   # [Ttot, D]
+        x_compact = qk_flat.index_select(0, idx_flat)                  # [Ttot, D]
+        v_compact = xn_flat.index_select(0, idx_flat)                  # (not used directly, but x_compact is the source)
 
-        out_compact = self.attn(
-            qk_compact, qk_compact, v_compact,
-            seqlens_tokens=lens,
-            global_idx_per_set=global_idx_per_set
-        )                                                                # [Ttot, D]
+        # Router uses x_compact for Q/K/V sources internally (self-attn)
+        out_compact = self.attn(x_compact, seqlens_tokens=lens)        # [Ttot, D]
 
+        # Scatter back
         out_flat = torch.zeros(S * N, D, device=x.device, dtype=out_compact.dtype)
-        out_flat[idx_flat] = out_compact
+        out_flat.index_copy_(0, idx_flat, out_compact)
         y = out_flat.view(S, N, D) + res
         return y.view(B, T, N, D)
-
-
 
 
 class SDPA_MHA(nn.Module):

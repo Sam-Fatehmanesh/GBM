@@ -254,7 +254,22 @@ def write_architecture_file(model: nn.Module, dirs: Dict[str, Path], cfg: Dict[s
         f.write("\n")
 
 
-def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader: torch.utils.data.DataLoader, device: torch.device, optimizer, scheduler, scaler: Optional[object], tracker: CombinedMetricsTracker, epoch: int, cfg: Dict[str, Any]) -> None:
+def train_one_epoch(
+    model: GBM,
+    loader: torch.utils.data.DataLoader,
+    val_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    optimizer,
+    scheduler,
+    scaler: Optional[object],
+    tracker: CombinedMetricsTracker,
+    epoch: int,
+    cfg: Dict[str, Any],
+    best_loss: float,
+    best_ckpt: Optional[Path],
+    ckpt_dir: Path,
+    videos_dir: Path,
+) -> Tuple[float, Optional[Path]]:
     model.train()
     grad_accum = cfg.get('gradient_accumulation_steps') or 1
     val_freq = int(cfg.get('validation_frequency') or 0)
@@ -378,16 +393,22 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
                 # Generate videos for this validation trigger
                 try:
                     sample_batch = next(iter(val_loader))
-                    videos_dir = Path(cfg.get('videos_dir', 'experiments/videos'))
                     generate_epoch_videos(model, sample_batch, device, videos_dir, epoch=f"{epoch}_step{batch_idx}")
                 except Exception:
                     pass
+                # Save best checkpoint if improved
+                if avg_vloss < best_loss:
+                    best_loss = avg_vloss
+                    ckpt_path = ckpt_dir / f"best_step_{epoch}_{batch_idx}.pth"
+                    torch.save({'epoch': epoch, 'step': batch_idx, 'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'config': cfg}, ckpt_path)
+                    best_ckpt = ckpt_path
             model.train()
             # Update plots immediately after frequent validation
             try:
                 tracker.plot_training()
             except Exception:
                 pass
+    return best_loss, best_ckpt
 
 
 @torch.no_grad()
@@ -562,14 +583,17 @@ def main():
         logger.warning(f"Failed to write architecture file: {e}")
 
     best_loss = float('inf')
-    best_ckpt = None
+    best_ckpt: Optional[Path] = None
 
     num_epochs = cfg['training']['num_epochs']
     for epoch in range(1, num_epochs + 1):
         # Shuffle between epochs for distributed samplers
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(model, train_loader, val_loader, device, optimizer, scheduler, scaler, tracker, epoch, cfg['training'])
+        best_loss, best_ckpt = train_one_epoch(
+            model, train_loader, val_loader, device, optimizer, scheduler, scaler,
+            tracker, epoch, cfg['training'], best_loss, best_ckpt, dirs['ckpt'], dirs['videos']
+        )
         val_metrics = validate(model, val_loader, device, tracker, epoch)
         logger.info(f"Epoch {epoch} - Val: {val_metrics}")
 
