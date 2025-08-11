@@ -267,6 +267,14 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
     prefetch = (device.type == 'cuda')
     wrapped_loader = CUDAPrefetchLoader(loader, device, cast_bf16=(use_amp and amp_dtype is torch.bfloat16)) if prefetch else loader
     pbar = tqdm(wrapped_loader, desc=f"Epoch {epoch}", mininterval=0.1, smoothing=0.05)
+    # Determine evenly spaced validation trigger steps (exactly val_freq times per epoch)
+    val_freq = int(cfg.get('validation_frequency') or 0)
+    triggers: set[int] = set()
+    if val_freq > 0:
+        total_steps = len(loader)
+        for j in range(1, val_freq + 1):
+            step = max(1, min(total_steps, round(j * total_steps / (val_freq + 1))))
+            triggers.add(int(step))
     use_profiler = bool(cfg.get('profile', False)) and torch.cuda.is_available()
     prof = None
     if use_profiler:
@@ -335,12 +343,14 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
             prof.step()
 
         # Lightweight validation at frequency
-        if val_freq > 0 and batch_idx % val_freq == 0:
+        if batch_idx in triggers:
             model.eval()
             loss_fn = nn.BCEWithLogitsLoss()
-            # sample a few batches from val_loader
+            # Aggregate over a few validation batches, then log ONCE at this training step
             vb = 0
             total_vloss = 0.0
+            preds_all = []
+            targs_all = []
             for vbatch in val_loader:
                 spikes_v = vbatch['spikes'].to(device)
                 positions_v = vbatch['positions'].to(device)
@@ -354,10 +364,24 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
                     vloss = loss_fn(logits_v, x_tgt_v)
                     probs_v = torch.sigmoid(logits_v)
                 total_vloss += float(vloss.detach().cpu().item())
+                preds_all.append(probs_v.detach())
+                targs_all.append(x_tgt_v.detach())
                 vb += 1
-                tracker.log_validation(epoch, batch_idx, probs_v, x_tgt_v, float(vloss))
                 if vb >= val_sample_batches:
                     break
+            if vb > 0:
+                avg_vloss = total_vloss / vb
+                preds_all = torch.cat([p.flatten() for p in preds_all], dim=0)
+                targs_all = torch.cat([t.flatten() for t in targs_all], dim=0)
+                # Reuse API: wrap back into shapes-less tensors; the tracker flattens anyway
+                tracker.log_validation(epoch, batch_idx, preds_all, targs_all, avg_vloss)
+                # Generate videos for this validation trigger
+                try:
+                    sample_batch = next(iter(val_loader))
+                    videos_dir = Path(cfg.get('videos_dir', 'experiments/videos'))
+                    generate_epoch_videos(model, sample_batch, device, videos_dir, epoch=f"{epoch}_step{batch_idx}")
+                except Exception:
+                    pass
             model.train()
             # Update plots immediately after frequent validation
             try:

@@ -98,8 +98,9 @@ class CombinedMetricsTracker:
         self.train_csv.log({'epoch': epoch, 'batch_idx': batch_idx, 'loss': loss, 'ema_loss': ema, 'lr': lr})
 
     def log_validation(self, epoch: int, batch_idx: int, predictions: torch.Tensor, targets: torch.Tensor, val_loss: float) -> Dict[str, float]:
-        preds_flat = predictions.detach().flatten()
-        targs_flat = targets.detach().flatten()
+        # predictions/targets may come as batched tensors or already flattened
+        preds_flat = predictions.detach().reshape(-1)
+        targs_flat = targets.detach().reshape(-1)
         auc = pr_auc_binned(preds_flat, targs_flat, threshold=self.val_threshold)
         self.val_csv.log({'epoch': epoch, 'batch_idx': batch_idx, 'val_loss': val_loss, 'pr_auc': auc})
         return {'val_loss': val_loss, 'pr_auc': auc}
