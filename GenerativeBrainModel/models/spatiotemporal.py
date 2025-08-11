@@ -5,7 +5,7 @@ import numpy as np
 from GenerativeBrainModel.models.rms import RMSNorm
 from GenerativeBrainModel.models.mlp import MLP, FFN
 from GenerativeBrainModel.models.attention import SpatialNeuralAttention, TemporalNeuralAttention
-from mamba_ssm import Mamba2 as Mamba
+# from mamba_ssm import Mamba2 as Mamba
 import os
 
 

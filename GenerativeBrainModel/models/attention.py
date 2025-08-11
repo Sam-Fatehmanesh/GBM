@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from GenerativeBrainModel.models.rms import RMSNorm
 import numpy as np
-from mamba_ssm import Mamba2 as Mamba  # kept for parity
+# from mamba_ssm import Mamba2 as Mamba  # kept for parity
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
 

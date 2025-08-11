@@ -27,10 +27,8 @@ def _render_frame_2d(points_xy: np.ndarray, values: np.ndarray, img_size: int = 
     ys = np.clip((points_xy[:, 1] * (H - 1)).round().astype(int), 0, H - 1)
     vals = np.clip(values.astype(np.float32), 0.0, 1.0)
 
-    # Accumulate max to visualize strongest activity per pixel
-    for x, y, v in zip(xs, ys, vals):
-        if v > img[y, x]:
-            img[y, x] = v
+    # Accumulate max to visualize strongest activity per pixel (vectorized)
+    np.maximum.at(img, (ys, xs), vals)
 
     img_u8 = (img * 255.0).astype(np.uint8)
     return img_u8

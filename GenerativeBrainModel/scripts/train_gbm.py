@@ -19,7 +19,7 @@ from typing import Dict, Any, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler
 
 import numpy as np
 import random
@@ -231,7 +231,7 @@ def train_one_epoch(model: GBM, loader: torch.utils.data.DataLoader, val_loader:
         if batch_idx % grad_accum == 1:
             optimizer.zero_grad()
 
-        with autocast(enabled=use_amp, dtype=amp_dtype):
+        with torch.amp.autocast(device_type='cuda', enabled=use_amp, dtype=amp_dtype):
             logits = model(x_in, stim_in, positions, mask, get_logits=True)  # (B, L-1, N)
             loss = nn.BCEWithLogitsLoss()(logits, x_tgt)
             loss_to_backprop = loss / grad_accum
@@ -453,7 +453,20 @@ def main():
     optimizer, scheduler = build_optimizer(model, cfg['training'])
     amp_dtype_cfg = (cfg['training'].get('amp_dtype') or 'bf16').lower()
     amp_dtype = torch.bfloat16 if amp_dtype_cfg == 'bf16' else (torch.float16 if amp_dtype_cfg == 'fp16' else torch.float32)
-    scaler = GradScaler(enabled=cfg['training'].get('mixed_precision', False) and amp_dtype is torch.float16)
+    # Create GradScaler with broad compatibility across torch versions
+    scaler = None
+    if cfg['training'].get('mixed_precision', False) and amp_dtype is torch.float16:
+        try:
+            # New API (torch.amp): first positional device type
+            scaler = GradScaler('cuda', enabled=True)
+        except TypeError:
+            try:
+                # Some builds accept only enabled kwarg
+                scaler = GradScaler(enabled=True)
+            except Exception:
+                # Fallback to legacy CUDA AMP GradScaler
+                from torch.cuda.amp import GradScaler as CudaGradScaler
+                scaler = CudaGradScaler(enabled=True)
 
     # Metrics
     tracker = CombinedMetricsTracker(log_dir=dirs['logs'], ema_alpha=0.05, val_threshold=0.5, enable_plots=True)
