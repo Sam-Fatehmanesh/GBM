@@ -120,8 +120,9 @@ class GBM(nn.Module):
         for i in range(n_steps):
             # get the context from the current sequence
             context = current_neuron_scalars[:, -context_len:]
-            # generate the next step
-            next_step = self.forward(context, current_stimuli, point_positions, neuron_pad_mask, get_logits=False)[:, -1:]  # (B, 1, n_neurons)
+            context_stim = current_stimuli[:, -context_len:, :]
+            # generate the next step using aligned context windows
+            next_step = self.forward(context, context_stim, point_positions, neuron_pad_mask, get_logits=False)[:, -1:]  # (B, 1, n_neurons)
             # append the next step to the current sequence
             current_neuron_scalars = torch.cat([current_neuron_scalars, next_step], dim=1)
             # update the stimuli

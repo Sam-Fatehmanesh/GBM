@@ -2,10 +2,10 @@
 """
 Training script for neuron-level GBM with logging, plots, and videos.
 
-Features:
-- Date-time experiment folders with logs, CSVs, and plots
-- Per-epoch validation and comparison videos (next-step + autoregression)
-- Best-checkpoint video generation at the end
+Changes vs. previous:
+- No AMP/autocast; model runs in bf16 directly; losses in fp32.
+- Optional torch.compile with dynamic=True (fewer recompiles).
+- CUDA prefetcher casts spikes/stim to bf16 to avoid cast kernels on the default stream.
 """
 
 from __future__ import annotations
@@ -19,8 +19,6 @@ from typing import Dict, Any, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
-# No GradScaler import; bf16 does not require loss scaling
-
 import numpy as np
 import random
 import yaml
@@ -30,13 +28,16 @@ from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
+import pdb
 
+
+# ------------------------------- CUDA prefetcher (casts to bf16) -------------------------------
 
 class CUDAPrefetchLoader:
     """Wrap a DataLoader to prefetch the next batch to CUDA on a dedicated stream.
-    Casts spikes/stim to bf16 when requested to minimize cast kernels.
+    Casts spikes/stim to bf16 to minimize cast kernels on the default stream.
     """
-    def __init__(self, loader: torch.utils.data.DataLoader, device: torch.device, *, cast_bf16: bool):
+    def __init__(self, loader: torch.utils.data.DataLoader, device: torch.device, *, cast_bf16: bool = True):
         self.loader = loader
         self.device = device
         self.stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
@@ -79,11 +80,13 @@ class CUDAPrefetchLoader:
         if next_batch is not None:
             yield next_batch
 
+
+# ---------------------------------- Default config & utilities ----------------------------------
+
 def create_default_config() -> Dict[str, Any]:
     return {
         'experiment': {
             'name': 'gbm_neural_training',
-            # Minimal experiment metadata; unused keys removed
         },
         'data': {
             'data_dir': 'processed_spike_voxels_2018',
@@ -94,7 +97,7 @@ def create_default_config() -> Dict[str, Any]:
             'd_model': 256,
             'n_heads': 8,
             'n_layers': 4,
-            'd_stimuli': None,  # will be inferred from data (stimulus_onehot width)
+            'd_stimuli': None,  # inferred from data (stimulus_onehot width)
         },
         'training': {
             'batch_size': 2,
@@ -113,16 +116,17 @@ def create_default_config() -> Dict[str, Any]:
             'persistent_workers': False,
             'prefetch_factor': 2,
             'use_gpu': True,
-            'mixed_precision': True,      # enable AMP
-            'amp_dtype': 'bf16',          # 'bf16' | 'fp16' | 'none'
-            'distributed': False,         # enable DistributedDataParallel (single-node multi-GPU)
-            'backend': 'nccl',            # DDP backend
-            'compile_model': False,
+            'distributed': False,
+            'backend': 'nccl',
+            'compile_model': False,     # set True to enable torch.compile(dynamic=True)
             'seed': 42,
-            'validation_frequency': 8,          # run small validation every N training batches
-            'val_sample_batches': 64,           # number of batches to use for frequent validation
+            'validation_frequency': 8,
+            'val_sample_batches': 64,
             'gradient_clip_norm': 1.0,
             'gradient_accumulation_steps': None,
+            'profile': False,
+            'profile_steps': 50,
+            'profile_dir': './tb_prof',
         },
         'logging': {
             'log_level': 'INFO',
@@ -139,6 +143,23 @@ def deep_update(base: Dict, updates: Dict) -> Dict:
             result[k] = v
     return result
 
+
+def sanitized_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a deep-copied config without non-serializable runtime objects.
+    Removes training.scheduler_obj (LambdaLR) and global_step counter.
+    """
+    import copy
+    cfg_copy = copy.deepcopy(cfg)
+    # If a full config dict is passed
+    if isinstance(cfg_copy, dict) and 'training' in cfg_copy and isinstance(cfg_copy['training'], dict):
+        tr = cfg_copy['training']
+        tr.pop('scheduler_obj', None)
+        tr.pop('global_step', None)
+    # If just the training dict is passed
+    elif isinstance(cfg_copy, dict):
+        cfg_copy.pop('scheduler_obj', None)
+        cfg_copy.pop('global_step', None)
+    return cfg_copy
 
 def setup_experiment_dirs(base_dir: Path, name: str) -> Dict[str, Path]:
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -180,8 +201,10 @@ def set_seeds(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+# ------------------------------------- Optimizer & scheduler -------------------------------------
+
 def build_optimizer(model: GBM, cfg: Dict[str, Any]) -> Tuple[optim.Optimizer, Optional[optim.lr_scheduler._LRScheduler]]:
-    """Build Muon optimizer for hidden weights and AdamW for others, per Muon guidance."""
+    """Muon for hidden weights; AdamW for the rest."""
     try:
         from muon import MuonWithAuxAdam
     except ImportError as e:
@@ -197,7 +220,6 @@ def build_optimizer(model: GBM, cfg: Dict[str, Any]) -> Tuple[optim.Optimizer, O
         nonhidden_params += [p for p in m.parameters() if p.requires_grad]
     nonhidden_params += [p for p in model.head.parameters() if p.requires_grad]
 
-    # Construct parameter groups
     muon_lr = cfg.get('muon_lr', 0.02)
     muon_weight_decay = cfg.get('weight_decay', 1e-4)
     adamw_lr = cfg.get('learning_rate', 3e-4)
@@ -217,7 +239,8 @@ def build_optimizer(model: GBM, cfg: Dict[str, Any]) -> Tuple[optim.Optimizer, O
     if sched_type == 'warmup_cosine':
         scheduler = 'warmup_cosine_placeholder'
     elif sched_type == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg['num_epochs'], eta_min=adamw_lr * cfg.get('min_lr_ratio', 0.01))
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg['num_epochs'],
+                                                         eta_min=adamw_lr * cfg.get('min_lr_ratio', 0.01))
     elif sched_type == 'step':
         scheduler = optim.lr_scheduler.StepLR(opt, step_size=max(1, cfg['num_epochs'] // 3), gamma=0.1)
     return opt, scheduler
@@ -254,6 +277,8 @@ def write_architecture_file(model: nn.Module, dirs: Dict[str, Path], cfg: Dict[s
         f.write("\n")
 
 
+# ------------------------------------------- Train / Val -------------------------------------------
+
 def train_one_epoch(
     model: GBM,
     loader: torch.utils.data.DataLoader,
@@ -261,7 +286,6 @@ def train_one_epoch(
     device: torch.device,
     optimizer,
     scheduler,
-    scaler: Optional[object],
     tracker: CombinedMetricsTracker,
     epoch: int,
     cfg: Dict[str, Any],
@@ -274,22 +298,22 @@ def train_one_epoch(
     grad_accum = cfg.get('gradient_accumulation_steps') or 1
     val_freq = int(cfg.get('validation_frequency') or 0)
     val_sample_batches = int(cfg.get('val_sample_batches') or 1)
-    # Resolve AMP dtype locally from cfg
-    amp_dtype_cfg = (cfg.get('amp_dtype') or 'bf16').lower()
-    amp_dtype = torch.bfloat16 if amp_dtype_cfg == 'bf16' else (torch.float16 if amp_dtype_cfg == 'fp16' else torch.float32)
-    use_amp = bool(cfg.get('mixed_precision', True))
-    # Wrap loader with CUDA prefetch to overlap H2D with compute
+
+    # Wrap loader with CUDA prefetch to overlap H2D with compute (and cast to bf16)
     prefetch = (device.type == 'cuda')
-    wrapped_loader = CUDAPrefetchLoader(loader, device, cast_bf16=(use_amp and amp_dtype is torch.bfloat16)) if prefetch else loader
+    wrapped_loader = CUDAPrefetchLoader(loader, device, cast_bf16=True) if prefetch else loader
     pbar = tqdm(wrapped_loader, desc=f"Epoch {epoch}", mininterval=0.1, smoothing=0.05)
-    # Determine evenly spaced validation trigger steps (exactly val_freq times per epoch)
-    val_freq = int(cfg.get('validation_frequency') or 0)
+
+    # Determine validation trigger steps (exact count per epoch), and always include step 4 if possible
     triggers: set[int] = set()
+    total_steps = len(loader)
     if val_freq > 0:
-        total_steps = len(loader)
         for j in range(1, val_freq + 1):
             step = max(1, min(total_steps, round(j * total_steps / (val_freq + 1))))
             triggers.add(int(step))
+    if total_steps >= 4:
+        triggers.add(4)
+
     use_profiler = bool(cfg.get('profile', False)) and torch.cuda.is_available()
     prof = None
     if use_profiler:
@@ -300,54 +324,49 @@ def train_one_epoch(
             record_shapes=True, profile_memory=True, with_stack=True, with_modules=True
         )
         prof.__enter__()
+
     for batch_idx, batch in enumerate(pbar, 1):
-        # Batches are already on device via the prefetcher when CUDA is used
-        spikes = batch['spikes']
-        positions = batch['positions']
-        mask = batch['neuron_mask']
-        stim = batch['stimulus']
+        # Batches are already on device and in bf16 via the prefetcher
+        spikes = batch['spikes']           # (B, L, N) bf16
+        positions = batch['positions']     # (B, N, 3) fp32
+        mask = batch['neuron_mask']        # (B, N) bool/int
+        stim = batch['stimulus']           # (B, L, K) bf16
 
         # Prepare seq2seq (input: 0..L-2, target: 1..L-1)
         x_in = spikes[:, :-1, :]
-        x_tgt = spikes[:, 1:, :]
-        stim_in = stim[:, :-1, :]  # already one-hot: (B, L-1, K)
+        x_tgt = spikes[:, 1:, :].float()   # cast to fp32 for loss
+        stim_in = stim[:, :-1, :]
 
         if batch_idx % grad_accum == 1:
             optimizer.zero_grad()
 
-        with torch.amp.autocast(device_type='cuda', enabled=use_amp, dtype=amp_dtype):
-            logits = model(x_in, stim_in, positions, mask, get_logits=True)  # (B, L-1, N)
-            loss = nn.BCEWithLogitsLoss()(logits, x_tgt)
-            loss_to_backprop = loss / grad_accum
+        logits = model(x_in, stim_in, positions, mask, get_logits=True)  # (B, L-1, N) bf16
+        loss = nn.BCEWithLogitsLoss()(logits.float(), x_tgt)             # fp32 loss
+        (loss / grad_accum).backward()
 
-        # bf16/fp32 path: no GradScaler needed
-        loss_to_backprop.backward()
         if batch_idx % grad_accum == 0:
             if cfg.get('gradient_clip_norm'):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['gradient_clip_norm'])
             optimizer.step()
-
-        # Per-batch scheduler (warmup_cosine)
-        if scheduler == 'warmup_cosine_placeholder' and 'train_loader_len' in cfg:
-            # Setup on first use
-            if 'scheduler_obj' not in cfg:
-                warm = int(0.1 * cfg['train_loader_len'])
-                total = cfg['num_epochs'] * cfg['train_loader_len']
-                base_lr = cfg['learning_rate']
-                min_lr = base_lr * cfg.get('min_lr_ratio', 0.01)
-                def lr_lambda(step):
-                    if step < warm:
-                        return float(step) / float(max(1, warm))
-                    prog = (step - warm) / max(1, total - warm)
-                    return (min_lr + 0.5 * (base_lr - min_lr) * (1 + np.cos(np.pi * min(prog, 1.0)))) / base_lr
-                cfg['scheduler_obj'] = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-                cfg['global_step'] = 0
-            cfg['global_step'] += 1
-            cfg['scheduler_obj'].step()
+            # Per-batch scheduler (warmup_cosine) → step AFTER optimizer.step()
+            if scheduler == 'warmup_cosine_placeholder' and 'train_loader_len' in cfg:
+                if 'scheduler_obj' not in cfg:
+                    warm = int(0.1 * cfg['train_loader_len'])
+                    total = cfg['num_epochs'] * cfg['train_loader_len']
+                    base_lr = cfg['learning_rate']
+                    min_lr = base_lr * cfg.get('min_lr_ratio', 0.01)
+                    def lr_lambda(step):
+                        if step < warm:
+                            return float(step) / float(max(1, warm))
+                        prog = (step - warm) / max(1, total - warm)
+                        return (min_lr + 0.5 * (base_lr - min_lr) * (1 + np.cos(np.pi * min(prog, 1.0)))) / base_lr
+                    cfg['scheduler_obj'] = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+                    cfg['global_step'] = 0
+                cfg['global_step'] += 1
+                cfg['scheduler_obj'].step()
 
         lr_now = optimizer.param_groups[0]['lr']
         tracker.log_train(epoch, batch_idx, float(loss.detach().cpu().item()), lr_now)
-        # Update tqdm with live loss and EMA
         ema_now = tracker.loss_ema.get()
         pbar.set_postfix({
             'loss': f"{float(loss.detach().cpu().item()):.6f}",
@@ -361,22 +380,21 @@ def train_one_epoch(
         if batch_idx in triggers:
             model.eval()
             loss_fn = nn.BCEWithLogitsLoss()
-            # Aggregate over a few validation batches, then log ONCE at this training step
             vb = 0
             total_vloss = 0.0
             preds_all = []
             targs_all = []
             for vbatch in val_loader:
-                spikes_v = vbatch['spikes'].to(device)
+                spikes_v = vbatch['spikes'].to(device).to(torch.bfloat16)
                 positions_v = vbatch['positions'].to(device)
                 mask_v = vbatch['neuron_mask'].to(device)
-                stim_v = vbatch['stimulus'].to(device)
+                stim_v = vbatch['stimulus'].to(device).to(torch.bfloat16)
                 x_in_v = spikes_v[:, :-1, :]
-                x_tgt_v = spikes_v[:, 1:, :]
+                x_tgt_v = spikes_v[:, 1:, :].float()
                 stim_in_v = stim_v[:, :-1, :]
                 with torch.no_grad():
                     logits_v = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
-                    vloss = loss_fn(logits_v, x_tgt_v)
+                    vloss = loss_fn(logits_v.float(), x_tgt_v)
                     probs_v = torch.sigmoid(logits_v)
                 total_vloss += float(vloss.detach().cpu().item())
                 preds_all.append(probs_v.detach())
@@ -388,19 +406,48 @@ def train_one_epoch(
                 avg_vloss = total_vloss / vb
                 preds_all = torch.cat([p.flatten() for p in preds_all], dim=0)
                 targs_all = torch.cat([t.flatten() for t in targs_all], dim=0)
-                # Reuse API: wrap back into shapes-less tensors; the tracker flattens anyway
                 tracker.log_validation(epoch, batch_idx, preds_all, targs_all, avg_vloss)
-                # Generate videos for this validation trigger
+                # Sample video
                 try:
                     sample_batch = next(iter(val_loader))
+                    # Ensure a consistent per-sample shape for videos to avoid cat-size issues
+                    spikes0 = sample_batch['spikes'][0:1]
+                    stim0 = sample_batch['stimulus'][0:1]
+                    pos0 = sample_batch['positions'][0:1]
+                    mask0 = sample_batch['neuron_mask'][0:1]
+                    # Diagnostics
+                    print(f"[VideoDebug] spikes {tuple(spikes0.shape)} stim {tuple(stim0.shape)} pos {tuple(pos0.shape)} mask {tuple(mask0.shape)}")
+                    # Truncate to a common L if mismatch exists
+                    Lx = spikes0.shape[1]
+                    Ls = stim0.shape[1]
+                    L = min(Lx, Ls)
+                    if Lx != Ls:
+                        print(f"[VideoDebug] Truncating sequence length from spikes {Lx} / stim {Ls} to L={L}")
+                    spikes0 = spikes0[:, :L]
+                    stim0 = stim0[:, :L]
+                    sample_batch = {
+                        'spikes': spikes0,
+                        'positions': pos0,
+                        'neuron_mask': mask0,
+                        'stimulus': stim0,
+                    }
                     generate_epoch_videos(model, sample_batch, device, videos_dir, epoch=f"{epoch}_step{batch_idx}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Log and continue; video generation should not break training
+                    import traceback
+                    traceback.print_exc()
+                    print(f"Video generation failed at step {batch_idx}: {e}")
                 # Save best checkpoint if improved
                 if avg_vloss < best_loss:
                     best_loss = avg_vloss
                     ckpt_path = ckpt_dir / f"best_step_{epoch}_{batch_idx}.pth"
-                    torch.save({'epoch': epoch, 'step': batch_idx, 'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'config': cfg}, ckpt_path)
+                    torch.save({
+                        'epoch': epoch,
+                        'step': batch_idx,
+                        'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'config': sanitized_config({'training': cfg})
+                    }, ckpt_path)
                     best_ckpt = ckpt_path
             model.train()
             # Update plots immediately after frequent validation
@@ -408,27 +455,31 @@ def train_one_epoch(
                 tracker.plot_training()
             except Exception:
                 pass
+
+    if prof is not None:
+        prof.__exit__(None, None, None)
     return best_loss, best_ckpt
 
 
 @torch.no_grad()
-def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, tracker: CombinedMetricsTracker, epoch: int) -> Dict[str, float]:
+def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device,
+             tracker: CombinedMetricsTracker, epoch: int) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
     total_batches = 0
     loss_fn = nn.BCEWithLogitsLoss()
     for batch_idx, batch in enumerate(tqdm(loader, desc=f"Validation E{epoch}"), 1):
-        spikes = batch['spikes'].to(device)
+        spikes = batch['spikes'].to(device).to(torch.bfloat16)
         positions = batch['positions'].to(device)
         mask = batch['neuron_mask'].to(device)
-        stim = batch['stimulus'].to(device)
+        stim = batch['stimulus'].to(device).to(torch.bfloat16)
 
         x_in = spikes[:, :-1, :]
-        x_tgt = spikes[:, 1:, :]
+        x_tgt = spikes[:, 1:, :].float()
         stim_in = stim[:, :-1, :]
 
         logits = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = loss_fn(logits, x_tgt)
+        loss = loss_fn(logits.float(), x_tgt)
         total_loss += float(loss.detach().cpu().item())
         total_batches += 1
 
@@ -439,12 +490,14 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
     return {'val_loss': avg_loss}
 
 
-def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: torch.device, videos_dir: Path, epoch: int) -> None:
+def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: torch.device,
+                           videos_dir: Path, epoch: int | str) -> None:
     model.eval()
-    spikes = batch['spikes'].to(device)              # (B, L, N)
-    positions = batch['positions'].to(device)        # (B, N, 3)
+    # Keep spikes in fp32 to preserve small probabilities for visualization
+    spikes = batch['spikes'].to(device).float()                 # (B, L, N)
+    positions = batch['positions'].to(device)                   # (B, N, 3)
     mask = batch['neuron_mask'].to(device)
-    stim = batch['stimulus'].to(device).float()  # (B, L, K)
+    stim = batch['stimulus'].to(device).float()                 # (B, L, K)
 
     # Next-step comparison on last step of input
     x_in = spikes[:, :-1, :]
@@ -453,19 +506,27 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
     logits = model(x_in, stim_in, positions, mask, get_logits=True)
     probs = torch.sigmoid(logits)
     nextstep_path = videos_dir / f'nextstep_epoch_{epoch}.mp4'
+    #pdb.set_trace()
     create_nextstep_video(x_tgt, probs, positions, nextstep_path)
 
-    # Autoregression demo: use last context_len frames and generate n_steps
+    # Autoregression demo: restrict to first example to avoid cat-size issues across batch
     context_len = min(8, x_in.shape[1])
     n_steps = min(16, spikes.shape[1] - context_len)
     if n_steps > 0:
-        init_x = spikes[:, :context_len, :]
-        init_stim = stim[:, :context_len, :]
-        future_stim = stim[:, context_len:context_len + n_steps, :]
-        gen_seq = model.autoregress(init_x, init_stim, positions, mask, future_stim, n_steps=n_steps, context_len=context_len)
+        init_x = spikes[0:1, :context_len, :]
+        init_stim = stim[0:1, :context_len, :]
+        future_stim = stim[0:1, context_len:context_len + n_steps, :]
+        pos0 = positions[0:1]
+        mask0 = mask[0:1]
+        gen_seq = model.autoregress(init_x, init_stim, pos0, mask0, future_stim,
+                                     n_steps=n_steps, context_len=context_len)
         ar_path = videos_dir / f'autoreg_epoch_{epoch}.mp4'
-        create_autoregression_video(gen_seq[:, context_len:, :], positions, ar_path)
+        # Align truth segment with generated horizon for side-by-side
+        truth_horizon = spikes[0:1, context_len:context_len + n_steps, :]
+        create_autoregression_video(gen_seq[:, context_len:, :], pos0, ar_path, truth=truth_horizon)
 
+
+# ---------------------------------------------- Main ----------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description='Train GBM on neuron sequences')
@@ -478,15 +539,13 @@ def main():
             user = yaml.safe_load(f)
         cfg = deep_update(cfg, user)
 
-    # Setup experiment dirs
+    # Dirs & logger
     base_dir = Path('experiments/gbm_neural')
     dirs = setup_experiment_dirs(base_dir, cfg['experiment']['name'])
     save_config(cfg, dirs['exp'] / 'config.yaml')
     logger = build_logger(dirs['logs'], cfg['logging'].get('log_level', 'INFO'))
 
     # Device & seeds
-    #torch.autograd.set_detect_anomaly(True)
-    
     device = torch.device('cuda' if (cfg['training']['use_gpu'] and torch.cuda.is_available()) else 'cpu')
     set_seeds(cfg['training']['seed'])
     if device.type == 'cuda':
@@ -496,21 +555,18 @@ def main():
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
 
-    # If not in distributed mode, stub minimal torch.distributed functions so Muon works in single-process
+    # If not distributed, stub minimal torch.distributed funcs so Muon works single-process
     try:
         import torch.distributed as dist
         if dist.is_available() and not dist.is_initialized():
             dist.get_world_size = lambda group=None: 1
             dist.get_rank = lambda group=None: 0
             def _fake_all_gather(tensor_list, tensor, group=None):
-                if tensor_list is None:
-                    return
-                if len(tensor_list) == 0:
+                if tensor_list is None or len(tensor_list) == 0:
                     return
                 if tensor_list[0].shape == tensor.shape:
                     tensor_list[0].copy_(tensor)
                 else:
-                    # Fallback: resize and copy if shape differs
                     tensor_list[0].resize_(tensor.shape).copy_(tensor)
             dist.all_gather = _fake_all_gather
     except Exception:
@@ -522,7 +578,7 @@ def main():
 
     # Model
     mcfg = cfg['model']
-    # Infer d_stimuli from data one-hot width if not provided (uses global padded width)
+    # Infer d_stimuli from data one-hot width if not provided
     inferred_d_stimuli: Optional[int] = None
     try:
         sample_batch = next(iter(train_loader))
@@ -530,14 +586,19 @@ def main():
     except Exception:
         pass
     d_stimuli = mcfg['d_stimuli'] if mcfg['d_stimuli'] is not None else (inferred_d_stimuli or 1)
-    model = GBM(d_model=mcfg['d_model'], d_stimuli=d_stimuli, n_heads=mcfg['n_heads'], n_layers=mcfg['n_layers']).to(device)
-    # If bf16 requested, move model to bf16 to ensure Linear weights match bf16 inputs under autocast
-    amp_dtype_cfg = (cfg['training'].get('amp_dtype') or 'bf16').lower()
-    if cfg['training'].get('mixed_precision', True) and amp_dtype_cfg == 'bf16' and device.type == 'cuda':
+
+    model = GBM(d_model=mcfg['d_model'], d_stimuli=d_stimuli,
+                n_heads=mcfg['n_heads'], n_layers=mcfg['n_layers']).to(device)
+
+    # Run the whole model in bf16 on CUDA (norms/centroids handled internally in fp32)
+    if device.type == 'cuda':
         model = model.to(dtype=torch.bfloat16)
+
+    # Optional torch.compile with dynamic shapes
     if cfg['training'].get('compile_model', False):
         try:
             model = torch.compile(model)
+            logger.info("torch.compile enabled.")
         except Exception as e:
             logger.warning(f"torch.compile failed: {e}")
 
@@ -550,33 +611,18 @@ def main():
                 dist.init_process_group(backend=cfg['training'].get('backend', 'nccl'))
             local_rank = int(os.environ.get('LOCAL_RANK', 0))
             torch.cuda.set_device(local_rank)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+            )
             logger.info("Initialized DistributedDataParallel")
         except Exception as e:
             logger.warning(f"Failed to initialize DDP, continuing single-process: {e}")
 
     # Optimizer & scheduler
     optimizer, scheduler = build_optimizer(model, cfg['training'])
-    amp_dtype_cfg = (cfg['training'].get('amp_dtype') or 'bf16').lower()
-    amp_dtype = torch.bfloat16 if amp_dtype_cfg == 'bf16' else (torch.float16 if amp_dtype_cfg == 'fp16' else torch.float32)
-    # Create GradScaler with broad compatibility across torch versions
-    scaler = None
-    if cfg['training'].get('mixed_precision', False) and amp_dtype is torch.float16:
-        try:
-            # New API (torch.amp): first positional device type
-            scaler = GradScaler('cuda', enabled=True)
-        except TypeError:
-            try:
-                # Some builds accept only enabled kwarg
-                scaler = GradScaler(enabled=True)
-            except Exception:
-                # Fallback to legacy CUDA AMP GradScaler
-                from torch.cuda.amp import GradScaler as CudaGradScaler
-                scaler = CudaGradScaler(enabled=True)
 
     # Metrics
-    tracker = CombinedMetricsTracker(log_dir=dirs['logs'], ema_alpha=0.05, val_threshold=0.5, enable_plots=True)
-    # Persist architecture summary once per run
+    tracker = CombinedMetricsTracker(log_dir=dirs['logs'], ema_alpha=0.01, val_threshold=0.5, enable_plots=True)
     try:
         write_architecture_file(model, dirs, cfg)
     except Exception as e:
@@ -590,16 +636,19 @@ def main():
         # Shuffle between epochs for distributed samplers
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+
         best_loss, best_ckpt = train_one_epoch(
-            model, train_loader, val_loader, device, optimizer, scheduler, scaler,
+            model, train_loader, val_loader, device, optimizer, scheduler,
             tracker, epoch, cfg['training'], best_loss, best_ckpt, dirs['ckpt'], dirs['videos']
         )
+
         val_metrics = validate(model, val_loader, device, tracker, epoch)
         logger.info(f"Epoch {epoch} - Val: {val_metrics}")
 
         # Save checkpoint
         ckpt_path = dirs['ckpt'] / f'epoch_{epoch}.pth'
-        torch.save({'epoch': epoch, 'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'config': cfg}, ckpt_path)
+        torch.save({'epoch': epoch, 'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(), 'config': sanitized_config(cfg)}, ckpt_path)
 
         # Videos on a small sampled batch
         try:
@@ -617,8 +666,6 @@ def main():
         tracker.plot_training()
 
     logger.info("Training complete.")
-    if prof is not None:
-        prof.__exit__(None, None, None)
     # Best checkpoint videos
     if best_ckpt is not None:
         logger.info(f"Loading best checkpoint: {best_ckpt}")
@@ -633,5 +680,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 
 
 class ExponentialMovingAverage:
-    def __init__(self, alpha: float = 0.1):
+    def __init__(self, alpha: float = 0.01):
         self.alpha = alpha
         self.value: Optional[float] = None
 

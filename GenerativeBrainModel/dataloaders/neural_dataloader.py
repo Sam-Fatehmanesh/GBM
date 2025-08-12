@@ -51,6 +51,8 @@ class NeuralDataset(Dataset):
         self.cached_spikes: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
         self.cached_positions: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
         self.cached_stimulus: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
+        # Offset of cached slices within original file (for fast index math)
+        self.cache_offset: Optional[Dict[str, int]] = {} if use_cache else None
 
         # Each worker process has its own set of open file handles
         self.worker_file_handles: Dict[str, h5py.File] = {}
@@ -78,24 +80,67 @@ class NeuralDataset(Dataset):
                     print(f"Skipping {Path(file_path).name}: not enough timepoints ({num_timepoints}) for sequence_length={self.sequence_length}")
                     continue
 
+                # --- Trim leading and trailing all-zero frames (rows) ---
+                def _first_nonzero_row(ds, a, b, chunk=256) -> int:
+                    i = a
+                    eps = 0.0
+                    while i < b:
+                        j = min(i + chunk, b)
+                        block = ds[i:j, :]
+                        # any value non-zero in row
+                        nz = np.any(np.abs(block) > eps, axis=1)
+                        if nz.any():
+                            return i + int(np.argmax(nz))
+                        i = j
+                    return b
+                def _last_nonzero_row(ds, a, b, chunk=256) -> int:
+                    i = b
+                    eps = 0.0
+                    while i > a:
+                        j = max(a, i - chunk)
+                        block = ds[j:i, :]
+                        nz = np.any(np.abs(block) > eps, axis=1)
+                        if nz.any():
+                            # last index in [j,i) having nz
+                            return j + (len(nz) - 1 - int(np.argmax(nz[::-1])))
+                        i = j
+                    return a - 1
+
+                nz_start = _first_nonzero_row(spikes_ds, start_point, end_point)
+                nz_last = _last_nonzero_row(spikes_ds, start_point, end_point)
+                if nz_start >= end_point or nz_last < nz_start:
+                    print(f"Skipping {Path(file_path).name}: all-zero in selected window [{start_point},{end_point})")
+                    continue
+                # convert last to exclusive end
+                trimmed_start = nz_start
+                trimmed_end = nz_last + 1
+                if trimmed_start > start_point or trimmed_end < end_point:
+                    lead = trimmed_start - start_point
+                    tail = end_point - trimmed_end
+                    print(f"Trimmed {Path(file_path).name}: lead_zero={lead}, tail_zero={tail}, kept={trimmed_end-trimmed_start}")
+                else:
+                    print(f"No margin zeros in {Path(file_path).name}")
+
                 # Cache required slices
                 if self.use_cache:
                     if file_path not in self.cached_spikes:
-                        self.cached_spikes[file_path] = spikes_ds[start_point:end_point].astype(np.float32)
+                        self.cached_spikes[file_path] = spikes_ds[trimmed_start:trimmed_end].astype(np.float32)
+                        if self.cache_offset is not None:
+                            self.cache_offset[file_path] = int(trimmed_start)
                     if file_path not in self.cached_positions:
                         pos = f['cell_positions'][:]  # (N, 3)
                         self.cached_positions[file_path] = pos.astype(np.float32)
                     # Stimulus: expect one-hot float dataset at 'stimulus_full'
                     if 'stimulus_full' in f:
-                        stim_oh = f['stimulus_full'][start_point:end_point]
+                        stim_oh = f['stimulus_full'][trimmed_start:trimmed_end]
                         self.cached_stimulus[file_path] = stim_oh.astype(np.float32)  # (T, K)
                     else:
                         # default to zeros with one channel
-                        self.cached_stimulus[file_path] = np.zeros((end_point - start_point, 1), dtype=np.float32)
+                        self.cached_stimulus[file_path] = np.zeros((trimmed_end - trimmed_start, 1), dtype=np.float32)
 
                 # Create sequence indices
-                max_start_idx = end_point - self.sequence_length
-                for start_idx in range(start_point, max_start_idx + 1, self.stride):
+                max_start_idx = trimmed_end - self.sequence_length
+                for start_idx in range(trimmed_start, max_start_idx + 1, self.stride):
                     self.sequences.append({'file_path': file_path, 'start_idx': start_idx})
 
     def __len__(self) -> int:
@@ -129,9 +174,12 @@ class NeuralDataset(Dataset):
 
         if self.use_cache:
             spikes_TN = self.cached_spikes[file_path]  # (T_slice, N)
-            segment = spikes_TN[start_idx - (self.start_timepoint or 0): end_idx - (self.start_timepoint or 0)]  # (L, N)
+            offset = self.cache_offset[file_path] if self.cache_offset is not None else (self.start_timepoint or 0)
+            rel_start = start_idx - offset
+            rel_end = end_idx - offset
+            segment = spikes_TN[rel_start:rel_end]  # (L, N)
             positions = self.cached_positions[file_path]  # (N, 3)
-            stimulus = self.cached_stimulus[file_path][start_idx - (self.start_timepoint or 0): end_idx - (self.start_timepoint or 0)]  # (L, K_file)
+            stimulus = self.cached_stimulus[file_path][rel_start:rel_end]  # (L, K_file)
         else:
             f = self._get_file_handle(file_path)
             spikes_ds = f['spike_probabilities']  # (T, N)
