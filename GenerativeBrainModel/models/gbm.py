@@ -112,21 +112,17 @@ class GBM(nn.Module):
             assert future_stimuli.shape[1] == n_steps, "future_stimuli must have n_steps steps"
             assert future_stimuli.shape[2] == self.d_stimuli, "future_stimuli must have d_stimuli features"
 
-        # Start with the initial sequence
+        # Start with the full context
         current_neuron_scalars = init_x
         current_stimuli = init_stimuli
 
-        # generate n_steps steps
+        # Generate n_steps by repeatedly using the last `context_len` frames as context
         for i in range(n_steps):
-            # get the context from the current sequence
             context = current_neuron_scalars[:, -context_len:]
             context_stim = current_stimuli[:, -context_len:, :]
-            # generate the next step using aligned context windows
-            next_step = self.forward(context, context_stim, point_positions, neuron_pad_mask, get_logits=False)[:, -1:]  # (B, 1, n_neurons)
-            # append the next step to the current sequence
+            next_step = self.forward(context, context_stim, point_positions, neuron_pad_mask, get_logits=False)[:, -1:]  # (B,1,N)
             current_neuron_scalars = torch.cat([current_neuron_scalars, next_step], dim=1)
-            # update the stimuli
             current_stimuli = torch.cat([current_stimuli, future_stimuli[:, i:i+1, :]], dim=1)
 
-        # Return the full sequence including the original init_x and the generated steps
+        # Return the full sequence (context + generated)
         return current_neuron_scalars

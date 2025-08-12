@@ -281,28 +281,36 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
     if not all_files:
         raise ValueError(f"No H5 files found in {data_dir}")
 
-    # Use all files. Sampling rate has been unified during preprocessing.
+    # Determine selected files: if only_test flag is set with explicit subjects, restrict to them
+    only_test = bool(training_config.get('only_test', False))
     selected_files = all_files
-    print(f"Selected all files: {len(selected_files)}")
+    print(f"Found total files: {len(all_files)}")
 
     # Train/test split
     test_subjects = data_config.get('test_subjects', [])
-    test_files = [str(data_dir / f"{s}.h5") for s in test_subjects if (data_dir / f"{s}.h5").exists() and str(data_dir / f"{s}.h5") in selected_files]
+    test_files = [str(data_dir / f"{s}.h5") for s in test_subjects if (data_dir / f"{s}.h5").exists() and str(data_dir / f"{s}.h5") in all_files]
+    if only_test and test_files:
+        selected_files = test_files
     train_files = [f for f in selected_files if f not in test_files]
 
     if not test_files and test_subjects:
         print(f"Warning: No valid files found for requested test subjects: {test_subjects}")
 
-    if not test_files:
+    if not test_files and not only_test:
         print("No valid test subjects provided. Creating a random 80/20 train/test split.")
         num_test = max(1, len(selected_files) // 5)
         random.seed(training_config.get('seed', 42))
         test_files = random.sample(selected_files, num_test)
         train_files = [f for f in selected_files if f not in test_files]
+    elif only_test and test_files:
+        # Mirror test set for train as well (eval-only usage); avoids touching unrelated files
+        train_files = test_files
 
-    # Compute padding sizes across selected files
+    # Compute padding sizes
+    # - Neuron padding is handled per-batch, but we keep this for logging/debug
     pad_neurons_to = _max_neurons_in_files(selected_files)
-    pad_stimuli_to = _max_stimuli_in_files(selected_files)
+    # - Stimulus padding should consider ALL subjects in the folder so selected subsets still align
+    pad_stimuli_to = _max_stimuli_in_files(all_files)
     print(f"Padding neuron dimension to: {pad_neurons_to}")
     print(f"Padding stimulus dimension to: {pad_stimuli_to}")
 

@@ -153,7 +153,8 @@ def create_autoregression_video(
         generated = generated.detach().to(torch.float32).cpu().numpy()
         positions = positions.detach().to(torch.float32).cpu().numpy()
         truth_np = None if truth is None else truth.detach().to(torch.float32).cpu().numpy()
-        B, T, N = generated.shape
+        B, T_gen, N = generated.shape
+        T = T_gen if truth_np is None else min(T_gen, truth_np.shape[1])
         if B == 0 or T == 0:
             return out_path
         font = cv2.FONT_HERSHEY_SIMPLEX

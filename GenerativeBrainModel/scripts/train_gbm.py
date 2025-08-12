@@ -484,7 +484,7 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         total_batches += 1
 
         probs = torch.sigmoid(logits)
-        tracker.log_validation(epoch, batch_idx, probs, x_tgt)
+        tracker.log_validation(epoch, batch_idx, probs, x_tgt, float(loss.detach().cpu().item()))
 
     avg_loss = total_loss / max(1, total_batches)
     return {'val_loss': avg_loss}
@@ -509,21 +509,32 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
     #pdb.set_trace()
     create_nextstep_video(x_tgt, probs, positions, nextstep_path)
 
-    # Autoregression demo: restrict to first example to avoid cat-size issues across batch
-    context_len = min(8, x_in.shape[1])
-    n_steps = min(16, spikes.shape[1] - context_len)
+    # Autoregression demo: restrict to first example and use full context; generate `context_len` frames
+    L_full = int(spikes.shape[1])
+    L_in = int(x_in.shape[1])
+    context_len = L_in
+    n_steps = context_len
     if n_steps > 0:
         init_x = spikes[0:1, :context_len, :]
         init_stim = stim[0:1, :context_len, :]
-        future_stim = stim[0:1, context_len:context_len + n_steps, :]
+        # Build future stimulus of length n_steps, padding with zeros if needed
+        K = stim.shape[-1]
+        future_real = stim[0:1, context_len: min(L_full, context_len + n_steps), :]
+        pad_len = n_steps - future_real.shape[1]
+        if pad_len > 0:
+            future_pad = torch.zeros((1, pad_len, K), device=stim.device, dtype=stim.dtype)
+            future_stim = torch.cat([future_real, future_pad], dim=1)
+        else:
+            future_stim = future_real
         pos0 = positions[0:1]
         mask0 = mask[0:1]
         gen_seq = model.autoregress(init_x, init_stim, pos0, mask0, future_stim,
                                      n_steps=n_steps, context_len=context_len)
         ar_path = videos_dir / f'autoreg_epoch_{epoch}.mp4'
-        # Align truth segment with generated horizon for side-by-side
-        truth_horizon = spikes[0:1, context_len:context_len + n_steps, :]
-        create_autoregression_video(gen_seq[:, context_len:, :], pos0, ar_path, truth=truth_horizon)
+        # Truth window to compare against: next `context_len` steps following context
+        truth_horizon = spikes[0:1, context_len:min(L_full, context_len + n_steps), :]
+        # Use only the generated portion (last n_steps) for side-by-side
+        create_autoregression_video(gen_seq[:, -n_steps:, :], pos0, ar_path, truth=truth_horizon)
 
 
 # ---------------------------------------------- Main ----------------------------------------------
