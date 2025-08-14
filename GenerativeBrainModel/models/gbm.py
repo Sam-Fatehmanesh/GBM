@@ -26,8 +26,8 @@ class GBM(nn.Module):
             nn.Linear(d_stimuli, d_model),
             RMSNorm(d_model),
         )
-        self.neuron_scalar_encoder = nn.Sequential(
-            nn.Linear(1, d_model),
+        self.neuron_scalar_position_encoder = nn.Sequential(
+            nn.Linear(4, d_model),
             RMSNorm(d_model),
         )
         self.neuron_scalar_decoder_head = nn.Sequential(
@@ -39,7 +39,7 @@ class GBM(nn.Module):
         # Treat encoders as "embed", attention stack as "body", decoder head as "head", muon optimizer is applied to the body only and adamw is applied to the embed and head
         self.embed = nn.ModuleDict({
             'stim': self.stimuli_encoder,
-            'neuron': self.neuron_scalar_encoder,
+            'neuron': self.neuron_scalar_position_encoder,
         })
         self.body = self.layers
         self.head = self.neuron_scalar_decoder_head
@@ -57,7 +57,15 @@ class GBM(nn.Module):
         # Keep dtype consistent with model weights (bf16 when enabled)
         if x.dtype != next(self.parameters()).dtype:
             x = x.to(next(self.parameters()).dtype)
-        x = self.neuron_scalar_encoder(x)
+
+        if point_positions != next(self.parameters()).dtype:
+            point_positions = point_positions.to(next(self.parameters()).dtype)
+
+        # Concatenate the neuron scalars and the point positions by repeating the point positions for the entire sequence of neuron states
+        x = torch.cat([x, point_positions.unsqueeze(1).repeat(1, T, 1, 1)], dim=3)
+
+        # Encode the neuron scalars and the point positions
+        x = self.neuron_scalar_position_encoder(x)
 
         # (B, T, d_stimuli) -> (B, T, 1, d_model), acts as a global stimulus embedding as a token for each time step
         x_stimuli = x_stimuli.to(next(self.parameters()).dtype).unsqueeze(2)
