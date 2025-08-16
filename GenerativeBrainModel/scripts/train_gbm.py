@@ -127,6 +127,19 @@ def create_default_config() -> Dict[str, Any]:
             'profile': False,
             'profile_steps': 50,
             'profile_dir': './tb_prof',
+            # Extra loss term weight: mean squared difference between per-timestep mean
+            # predicted activation and target activation (masked over valid neurons).
+            'mean_activation_mse_weight': 0.1,
+            # Scheduled sampling settings
+            'scheduled_sampling': {
+                'enable': False,
+                # Linear schedule over global steps from step 0 to final training step
+                'start_prob': 0.0,
+                'end_prob': 0.2,
+                # If True, sample Bernoulli from predicted probabilities when substituting.
+                # If False, feed raw probabilities.
+                'sample': True,
+            },
         },
         'logging': {
             'log_level': 'INFO',
@@ -218,7 +231,8 @@ def build_optimizer(model: GBM, cfg: Dict[str, Any]) -> Tuple[optim.Optimizer, O
     nonhidden_params = []
     for m in model.embed.values():
         nonhidden_params += [p for p in m.parameters() if p.requires_grad]
-    nonhidden_params += [p for p in model.head.parameters() if p.requires_grad]
+    for m in model.head.values():   
+        nonhidden_params += [p for p in m.parameters() if p.requires_grad]
 
     muon_lr = cfg.get('muon_lr', 0.02)
     muon_weight_decay = cfg.get('weight_decay', 1e-4)
@@ -340,8 +354,58 @@ def train_one_epoch(
         if batch_idx % grad_accum == 1:
             optimizer.zero_grad()
 
+        # Scheduled sampling: optionally replace part of x_in with model predictions from a
+        # teacher-forced pass (previous-step predictions only). Training-only.
+        ss_cfg = cfg.get('scheduled_sampling', {}) or {}
+        ss_enable = bool(ss_cfg.get('enable', False))
+        if ss_enable:
+            start_p = float(ss_cfg.get('start_prob', 0.0))
+            end_p = float(ss_cfg.get('end_prob', 0.2))
+            # Drive schedule by global batch step (increments every batch), spanning entire training
+            step_now = int(cfg.get('ss_global_step', 0))
+            train_len = int(cfg.get('train_loader_len', 0)) or int(len(loader))
+            total_steps = max(1, int(cfg.get('num_epochs', 1)) * train_len)
+            start_s = 0
+            end_s = total_steps
+            if step_now <= start_s:
+                ss_p = start_p
+            elif step_now >= end_s:
+                ss_p = end_p
+            else:
+                frac = (step_now - start_s) / max(1, (end_s - start_s))
+                ss_p = start_p + frac * (end_p - start_p)
+            if ss_p > 0.0:
+                with torch.no_grad():
+                    logits_tf = model(x_in, stim_in, positions, mask, get_logits=True)
+                    probs_tf = torch.sigmoid(logits_tf.float()).to(dtype=x_in.dtype)
+                # Build previous-step predictions aligned to inputs: at t>0 use pred for t from probs_tf[:, t-1]
+                prev_preds = torch.zeros_like(x_in)
+                prev_preds[:, 1:, :] = probs_tf[:, :-1, :]
+                if bool(ss_cfg.get('sample', True)):
+                    # Sample Bernoulli spikes from probabilities
+                    prev_sampled = torch.bernoulli(prev_preds.to(torch.float32)).to(dtype=x_in.dtype)
+                    substitute = prev_sampled
+                else:
+                    substitute = prev_preds
+                # Per-batch, per-time mask (not per-neuron) to replace entire frames; keep t=0 untouched
+                replace_mask = (torch.rand(x_in.shape[0], x_in.shape[1], 1, device=x_in.device) < ss_p).to(x_in.dtype)
+                replace_mask[:, 0, :] = 0  # never replace the first input step
+                x_in = x_in * (1 - replace_mask) + substitute * replace_mask
+            # Increment global step counter every batch
+            cfg['ss_global_step'] = step_now + 1
+
         logits = model(x_in, stim_in, positions, mask, get_logits=True)  # (B, L-1, N) bf16
-        loss = nn.BCEWithLogitsLoss()(logits.float(), x_tgt)             # fp32 loss
+        bce_loss = nn.BCEWithLogitsLoss()(logits.float(), x_tgt)         # fp32
+        # Mean activation MSE term
+        with torch.no_grad():
+            mask_rep = mask[:, None, :].expand(x_tgt.shape[0], x_tgt.shape[1], x_tgt.shape[2]).float()
+            denom = mask_rep.sum(dim=-1).clamp_min(1.0)
+        pred_mean = torch.sigmoid(logits.float())
+        pred_mean = (pred_mean * mask_rep).sum(dim=-1) / denom
+        targ_mean = (x_tgt * mask_rep).sum(dim=-1) / denom
+        mean_mse = torch.mean((pred_mean - targ_mean) ** 2)
+        alpha = float(cfg.get('mean_activation_mse_weight', 0.0) or 0.0)
+        loss = bce_loss + alpha * mean_mse
         (loss / grad_accum).backward()
 
         if batch_idx % grad_accum == 0:
@@ -394,7 +458,16 @@ def train_one_epoch(
                 stim_in_v = stim_v[:, :-1, :]
                 with torch.no_grad():
                     logits_v = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
-                    vloss = loss_fn(logits_v.float(), x_tgt_v)
+                    vloss_bce = loss_fn(logits_v.float(), x_tgt_v)
+                    # Validation mean activation MSE (same as train)
+                    with torch.no_grad():
+                        mask_rep_v = mask_v[:, None, :].expand(x_tgt_v.shape[0], x_tgt_v.shape[1], x_tgt_v.shape[2]).float()
+                        denom_v = mask_rep_v.sum(dim=-1).clamp_min(1.0)
+                        probs_v = torch.sigmoid(logits_v.float())
+                        pred_mean_v = (probs_v * mask_rep_v).sum(dim=-1) / denom_v
+                        targ_mean_v = (x_tgt_v * mask_rep_v).sum(dim=-1) / denom_v
+                        mean_mse_v = torch.mean((pred_mean_v - targ_mean_v) ** 2)
+                    vloss = vloss_bce + float(cfg.get('mean_activation_mse_weight', 0.0) or 0.0) * mean_mse_v
                     probs_v = torch.sigmoid(logits_v)
                 total_vloss += float(vloss.detach().cpu().item())
                 preds_all.append(probs_v.detach())
@@ -463,12 +536,17 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device,
-             tracker: CombinedMetricsTracker, epoch: int) -> Dict[str, float]:
+             tracker: CombinedMetricsTracker, epoch: int, training_cfg: Dict[str, Any]) -> Dict[str, float]:
+    """Run end-of-epoch validation and log a SINGLE aggregated entry to CSV/plots.
+    Computes average loss (with optional mean-activation MSE term) and PR-AUC over all batches.
+    """
     model.eval()
+    loss_fn = nn.BCEWithLogitsLoss()
     total_loss = 0.0
     total_batches = 0
-    loss_fn = nn.BCEWithLogitsLoss()
-    for batch_idx, batch in enumerate(tqdm(loader, desc=f"Validation E{epoch}"), 1):
+    preds_all = []
+    targs_all = []
+    for batch in tqdm(loader, desc=f"Validation E{epoch}"):
         spikes = batch['spikes'].to(device).to(torch.bfloat16)
         positions = batch['positions'].to(device)
         mask = batch['neuron_mask'].to(device)
@@ -479,14 +557,28 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         stim_in = stim[:, :-1, :]
 
         logits = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = loss_fn(logits.float(), x_tgt)
+        vloss_bce = loss_fn(logits.float(), x_tgt)
+        with torch.no_grad():
+            mask_rep = mask[:, None, :].expand(x_tgt.shape[0], x_tgt.shape[1], x_tgt.shape[2]).float()
+            denom = mask_rep.sum(dim=-1).clamp_min(1.0)
+        probs = torch.sigmoid(logits.float())
+        pred_mean = (probs * mask_rep).sum(dim=-1) / denom
+        targ_mean = (x_tgt * mask_rep).sum(dim=-1) / denom
+        mean_mse = torch.mean((pred_mean - targ_mean) ** 2)
+        alpha = float(training_cfg.get('mean_activation_mse_weight', 0.0) or 0.0)
+        loss = vloss_bce + alpha * mean_mse
         total_loss += float(loss.detach().cpu().item())
         total_batches += 1
 
-        probs = torch.sigmoid(logits)
-        tracker.log_validation(epoch, batch_idx, probs, x_tgt, float(loss.detach().cpu().item()))
+        preds_all.append(probs.detach())
+        targs_all.append(x_tgt.detach())
 
     avg_loss = total_loss / max(1, total_batches)
+    if preds_all and targs_all:
+        preds_all = torch.cat([p.reshape(-1) for p in preds_all], dim=0)
+        targs_all = torch.cat([t.reshape(-1) for t in targs_all], dim=0)
+        # Log a single aggregated row (batch_idx=1)
+        tracker.log_validation(epoch, 1, preds_all, targs_all, avg_loss)
     return {'val_loss': avg_loss}
 
 
@@ -509,17 +601,16 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
     #pdb.set_trace()
     create_nextstep_video(x_tgt, probs, positions, nextstep_path)
 
-    # Autoregression demo: restrict to first example and use full context; generate `context_len` frames
+    # Autoregression demo (double-panel): use half window as context, half as truth horizon
     L_full = int(spikes.shape[1])
-    L_in = int(x_in.shape[1])
-    context_len = L_in
+    context_len = max(1, L_full // 2)
     n_steps = context_len
     if n_steps > 0:
         init_x = spikes[0:1, :context_len, :]
         init_stim = stim[0:1, :context_len, :]
-        # Build future stimulus of length n_steps, padding with zeros if needed
+        # Build future stimulus of length n_steps from the second half; pad with zeros if needed
         K = stim.shape[-1]
-        future_real = stim[0:1, context_len: min(L_full, context_len + n_steps), :]
+        future_real = stim[0:1, context_len: context_len + n_steps, :]
         pad_len = n_steps - future_real.shape[1]
         if pad_len > 0:
             future_pad = torch.zeros((1, pad_len, K), device=stim.device, dtype=stim.dtype)
@@ -531,9 +622,7 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
         gen_seq = model.autoregress(init_x, init_stim, pos0, mask0, future_stim,
                                      n_steps=n_steps, context_len=context_len)
         ar_path = videos_dir / f'autoreg_epoch_{epoch}.mp4'
-        # Truth window to compare against: next `context_len` steps following context
-        truth_horizon = spikes[0:1, context_len:min(L_full, context_len + n_steps), :]
-        # Use only the generated portion (last n_steps) for side-by-side
+        truth_horizon = spikes[0:1, context_len: context_len + n_steps, :]
         create_autoregression_video(gen_seq[:, -n_steps:, :], pos0, ar_path, truth=truth_horizon)
 
 
@@ -653,7 +742,7 @@ def main():
             tracker, epoch, cfg['training'], best_loss, best_ckpt, dirs['ckpt'], dirs['videos']
         )
 
-        val_metrics = validate(model, val_loader, device, tracker, epoch)
+        val_metrics = validate(model, val_loader, device, tracker, epoch, cfg['training'])
         logger.info(f"Epoch {epoch} - Val: {val_metrics}")
 
         # Save checkpoint
