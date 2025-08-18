@@ -8,6 +8,7 @@ import random
 import torch
 import torch.multiprocessing as mp
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.sampler import WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
 # Align sharing strategy with neural_dataloader to reduce shared memory pressure
@@ -59,6 +60,10 @@ class BehaviorDataset(Dataset):
         self.start_timepoint = start_timepoint
         self.end_timepoint = end_timepoint
 
+        # Sequence settings: window length (L) and stride (default 6 and 1)
+        from typing import Any
+        self.sequence_length: int = 6
+        self.stride: int = 1
         self.sequences: List[Dict[str, int]] = []
         self.cached_spikes: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
         self.cached_positions: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
@@ -144,11 +149,21 @@ class BehaviorDataset(Dataset):
                     else:
                         print(f"Skipping {Path(file_path).name}: unexpected behavior_full ndim={beh.ndim}")
                         continue
+                    # Sanitize raw behavior
+                    try:
+                        beh_bt = np.nan_to_num(beh_bt, nan=0.0, posinf=0.0, neginf=0.0)
+                    except Exception:
+                        pass
                     B, Tb = int(beh_bt.shape[0]), int(beh_bt.shape[1])
                     T_slice = int(trimmed_end - trimmed_start)
                     beh_resampled = np.zeros((B, T_total), dtype=np.float32)
                     for b in range(B):
                         beh_resampled[b] = _resample_1d_series(beh_bt[b], T_total)
+                    # Sanitize after resampling
+                    try:
+                        beh_resampled = np.nan_to_num(beh_resampled, nan=0.0, posinf=0.0, neginf=0.0)
+                    except Exception:
+                        pass
                     beh_slice = beh_resampled[:, trimmed_start:trimmed_end]  # (B, T_slice)
                     # Pad/truncate behavior feature dimension to pad_behavior_to
                     if B != self.pad_behavior_to:
@@ -160,9 +175,11 @@ class BehaviorDataset(Dataset):
                     # Store as (T_slice, K)
                     self.cached_behavior[file_path] = beh_slice.T.astype(np.float32)
 
-                # Create index entries (sequence_length=1, stride=1)
-                for t in range(trimmed_start, trimmed_end):
-                    self.sequences.append({'file_path': file_path, 'start_idx': t})
+                # Create index entries for sliding window of length L with stride
+                L = int(self.sequence_length)
+                for s in range(trimmed_start, trimmed_end - L + 1, max(1, self.stride)):
+                    curr = s + L - 1
+                    self.sequences.append({'file_path': file_path, 'window_start': s, 'start_idx': curr})
 
     def __len__(self) -> int:
         return len(self.sequences)
@@ -183,21 +200,34 @@ class BehaviorDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         seq = self.sequences[idx]
         file_path = seq['file_path']
+        # Current time index and window start
         t = seq['start_idx']
+        s = seq.get('window_start', t)
 
         if self.use_cache:
             spikes_TN = self.cached_spikes[file_path]  # (T_slice, N)
             offset = self.cache_offset[file_path]
+            rel_s = s - offset
             rel_t = t - offset
-            spikes_1N = spikes_TN[rel_t:rel_t + 1]  # (1, N)
+            L = self.sequence_length
+            spikes_1N = spikes_TN[rel_s:rel_s + L]  # (L, N)
             positions = self.cached_positions[file_path]  # (N, 3)
             beh_TK = self.cached_behavior[file_path]      # (T_slice, K)
             beh_1K = beh_TK[rel_t]
         else:
             f = self._get_file_handle(file_path)
             spikes_ds = f['spike_probabilities']
-            spikes_1N = spikes_ds[t:t + 1].astype(np.float32)
+            L = self.sequence_length
+            spikes_1N = spikes_ds[s:s + L].astype(np.float32)
+            try:
+                spikes_1N = np.nan_to_num(spikes_1N, nan=0.0, posinf=0.0, neginf=0.0)
+            except Exception:
+                pass
             positions = f['cell_positions'][:].astype(np.float32)
+            try:
+                positions = np.nan_to_num(positions, nan=0.0, posinf=0.0, neginf=0.0)
+            except Exception:
+                pass
             beh = f['behavior_full'][()]
             # Normalize to (B, Tb)
             if beh.ndim == 1:
@@ -209,11 +239,20 @@ class BehaviorDataset(Dataset):
                     beh_bt = beh.astype(np.float32).T
             else:
                 raise RuntimeError(f"Unexpected behavior_full ndim={beh.ndim} in {file_path}")
+            # Sanitize raw behavior
+            try:
+                beh_bt = np.nan_to_num(beh_bt, nan=0.0, posinf=0.0, neginf=0.0)
+            except Exception:
+                pass
             B, Tb = int(beh_bt.shape[0]), int(beh_bt.shape[1])
             T_total = int(spikes_ds.shape[0])
             beh_resampled = np.zeros((B, T_total), dtype=np.float32)
             for b in range(B):
                 beh_resampled[b] = _resample_1d_series(beh_bt[b], T_total)
+            try:
+                beh_resampled = np.nan_to_num(beh_resampled, nan=0.0, posinf=0.0, neginf=0.0)
+            except Exception:
+                pass
             beh_1K = beh_resampled[:, t]
             beh_1K = self._pad_behavior_dim(beh_1K)
 
@@ -221,7 +260,7 @@ class BehaviorDataset(Dataset):
         N_valid = positions.shape[0]
         mask = np.ones((N_valid,), dtype=np.float32)
 
-        spikes_tensor = torch.from_numpy(spikes_1N.astype(np.float32))      # (1, N)
+        spikes_tensor = torch.from_numpy(spikes_1N.astype(np.float32))      # (L, N)
         positions_tensor = torch.from_numpy(positions.astype(np.float32))    # (N, 3)
         mask_tensor = torch.from_numpy(mask)
         behavior_tensor = torch.from_numpy(beh_1K.astype(np.float32))        # (K,)
@@ -309,7 +348,9 @@ def create_behavior_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, O
 
     # Train/test split
     test_subjects = data_config.get('test_subjects', [])
-    test_files = [str(data_dir / f"{s}.h5") for s in test_subjects if (data_dir / f"{s}.h5").exists()]
+    # Only keep requested subjects that also have behavior_full (i.e., are present in all_files)
+    requested = [str(data_dir / f"{s}.h5") for s in test_subjects]
+    test_files = [fp for fp in requested if fp in all_files]
     train_files = [f for f in all_files if f not in test_files]
     if not test_files:
         print("No valid test subjects provided. Creating a random 80/20 train/test split.")
@@ -399,7 +440,43 @@ def create_behavior_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, O
             'start_idx': torch.tensor([it['start_idx'] for it in batch], dtype=torch.long),
         }
 
-    train_loader = DataLoader(train_dataset, shuffle=True, sampler=None, collate_fn=collate_pad, **dl_kwargs)
+    # Build weighted sampler mixing uniform and magnitude-proportional sampling (50/50)
+    # Precompute per-sample weights for the train dataset
+    weights = None
+    try:
+        # magnitude score per sample = mean(|behavior|) at its index
+        # Build per-sequence mapping: file_path,start_idx -> magnitude
+        seq_weights = []
+        for seq in train_dataset.sequences:
+            fp = seq['file_path']
+            t = seq['start_idx']
+            if train_dataset.use_cache:
+                beh_TK = train_dataset.cached_behavior.get(fp, None)
+                if beh_TK is not None:
+                    rel_t = t - train_dataset.cache_offset[fp]
+                    if 0 <= rel_t < beh_TK.shape[0]:
+                        mag = float(np.mean(np.abs(beh_TK[rel_t])))
+                    else:
+                        mag = 0.0
+                else:
+                    mag = 0.0
+            else:
+                # Fallback: uniform if uncached
+                mag = 0.0
+            seq_weights.append(mag)
+        mags = np.array(seq_weights, dtype=np.float64)
+        mags = np.nan_to_num(mags, nan=0.0, posinf=0.0, neginf=0.0)
+        if mags.max() > 0:
+            mags = mags / (mags.max() + 1e-12)
+        # Mix 50/50 uniform and magnitude
+        uni = np.full_like(mags, 1.0 / max(1, len(mags)))
+        mix = 0.5 * uni + 0.5 * (mags / mags.sum() if mags.sum() > 0 else uni)
+        weights = torch.from_numpy(mix.astype(np.float64))
+        train_sampler = WeightedRandomSampler(weights, num_samples=len(train_dataset), replacement=True)
+    except Exception:
+        train_sampler = None
+
+    train_loader = DataLoader(train_dataset, shuffle=(train_sampler is None), sampler=train_sampler, collate_fn=collate_pad, **dl_kwargs)
     val_loader = DataLoader(val_dataset, shuffle=False, sampler=None, collate_fn=collate_pad, **dl_kwargs)
 
     return train_loader, val_loader, None, None

@@ -132,3 +132,4 @@ works.md
 create_volume_video.py
 *.ckpt
 lightning_logs/
+*.npz
