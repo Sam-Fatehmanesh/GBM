@@ -620,37 +620,49 @@ def index():
   <style>
     body { margin: 0; padding: 0; overflow: hidden; font-family: Arial, sans-serif; }
     #container { width: 100vw; height: 100vh; display: flex; }
-    #controls { width: 360px; background: #151521; color: #d8d8e6; padding: 15px; overflow-y: auto; box-sizing: border-box; }
+    #controls { width: 360px; background: transparent; color: #d6ecff; padding: 15px; overflow-y: auto; box-sizing: border-box; position: relative; z-index: 1001; }
     #viewport { flex: 1; position: relative; }
-    #canvas { width: 100%; height: 100%; display: block; }
+    #canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: block; z-index: 0; }
     .control-group { margin-bottom: 18px; }
-    .control-group h3 { margin: 0 0 10px 0; color: #8cffc4; }
+    .control-group h3 { margin: 0 0 10px 0; color: #66ccff; }
     label { font-size: 12px; }
     input[type="range"] { width: 100%; }
-    button { background: linear-gradient(90deg, #20332b, #1c2b26); color: #f2f7f4; border: 1px solid #00e6a8; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin: 2px; box-shadow: 0 0 10px rgba(0,230,168,0.26), 0 0 14px rgba(90,200,220,0.10); }
-    button:hover { filter: brightness(1.07); box-shadow: 0 0 12px rgba(0,255,193,0.34), 0 0 16px rgba(90,200,220,0.16); border-color: #00ffc1; }
-    .region-list { max-height: 240px; overflow-y: auto; border: 1px solid #2a2a3a; padding: 10px; border-radius: 6px; background: rgba(13,13,20,0.6); }
+    button { background: linear-gradient(90deg, #0e2030, #0f2638); color: #ecf8ff; border: 1px solid #33c2ff; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin: 2px; box-shadow: 0 0 10px rgba(51,194,255,0.28), 0 0 14px rgba(255,120,80,0.12); }
+    button:hover { filter: brightness(1.07); box-shadow: 0 0 12px rgba(51,194,255,0.36), 0 0 16px rgba(255,120,80,0.20); border-color: #55d2ff; }
+    .region-list { max-height: 240px; overflow-y: auto; border: 1px solid rgba(51,194,255,0.35); padding: 10px; border-radius: 6px; background: transparent; box-shadow: inset 0 0 12px rgba(255,120,80,0.08); }
     .region-item { margin: 3px 0; font-size: 11px; }
     #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); background: rgba(0,0,0,0.8); color: white; padding: 20px; border-radius: 10px; z-index: 1000; }
  
-    /* Subtle neon-green sliders */
+    /* Neon blue sliders with subtle orange hints */
     input[type="range"] { -webkit-appearance: none; height: 6px; border-radius: 4px; background: #2a2a3a; outline: none; }
-    input[type="range"]::-webkit-slider-runnable-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,230,168,0.55), rgba(120,255,220,0.35)); }
-    input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #0e0e16; border: 2px solid #00e6a8; box-shadow: 0 0 10px rgba(0,230,168,0.34), 0 0 12px rgba(120,255,220,0.18); margin-top: -6px; }
-    input[type="range"]::-moz-range-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,230,168,0.55), rgba(120,255,220,0.35)); }
-    input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: #0e0e16; border: 2px solid #00e6a8; box-shadow: 0 0 10px rgba(0,230,168,0.34), 0 0 12px rgba(120,255,220,0.18); }
+    input[type="range"]::-webkit-slider-runnable-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,191,255,0.6), rgba(102,204,255,0.4)); box-shadow: inset 0 0 6px rgba(255,120,80,0.12); }
+    input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #0e0e16; border: 2px solid #33c2ff; box-shadow: 0 0 10px rgba(51,194,255,0.34), 0 0 12px rgba(255,120,80,0.16); margin-top: -6px; }
+    input[type="range"]::-moz-range-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,191,255,0.6), rgba(102,204,255,0.4)); box-shadow: inset 0 0 6px rgba(255,120,80,0.12); }
+    input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: #0e0e16; border: 2px solid #33c2ff; box-shadow: 0 0 10px rgba(51,194,255,0.34), 0 0 12px rgba(255,120,80,0.16); }
  
     /* Checkbox accent color */
-    input[type="checkbox"] { accent-color: #00e6a8; }
+    input[type="checkbox"] { accent-color: #33c2ff; }
  
     /* Scrollbar styling for region list (WebKit) */
     .region-list::-webkit-scrollbar { width: 10px; }
-    .region-list::-webkit-scrollbar-track { background: rgba(20,20,28,0.45); border-radius: 6px; }
-    .region-list::-webkit-scrollbar-thumb { background: linear-gradient(180deg, rgba(0,230,168,0.7), rgba(120,255,220,0.5)); border-radius: 6px; }
+    .region-list::-webkit-scrollbar-track { background: rgba(20,20,28,0.25); border-radius: 6px; }
+    .region-list::-webkit-scrollbar-thumb { background: linear-gradient(180deg, rgba(0,191,255,0.7), rgba(102,204,255,0.5)); border-radius: 6px; box-shadow: inset 0 0 6px rgba(255,120,80,0.12); }
  
     /* Video controls bar styling */
     #video-controls { background: linear-gradient(0deg, rgba(10,10,14,0.92), rgba(10,10,14,0.68)); border-top: 1px solid #2a2a3a; }
     #time-display { color: #c8cce0; }
+
+    /* Neon orange/red hint accents for interactivity */
+    button:focus-visible, button:active { outline: 2px solid #ff784d; outline-offset: 2px; box-shadow: 0 0 10px rgba(255,120,77,0.35), 0 0 14px rgba(255,120,77,0.2); }
+    input[type="range"]:focus-visible { box-shadow: 0 0 10px rgba(255,120,77,0.28), inset 0 0 6px rgba(255,120,77,0.16); }
+    input[type="checkbox"]:focus-visible { outline: 2px solid #ff784d; outline-offset: 2px; }
+    .region-list { transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+    .region-list:hover { border-color: rgba(255,120,77,0.55); box-shadow: inset 0 0 14px rgba(255,120,77,0.12), 0 0 10px rgba(51,194,255,0.14); }
+    .region-item label { transition: color 0.12s ease, text-shadow 0.12s ease; }
+    .region-item label:hover { color: #ffb199; text-shadow: 0 0 6px rgba(255,120,77,0.35); }
+    .region-item input[type="checkbox"]:checked + label { color: #ffd0c4; text-shadow: 0 0 6px rgba(255,120,77,0.25); }
+    #controls .control-group h3 { position: relative; }
+    #controls .control-group h3::after { content: ""; position: absolute; left: 0; bottom: -6px; width: 36px; height: 2px; background: linear-gradient(90deg, #33c2ff, #ff784d); border-radius: 2px; box-shadow: 0 0 6px rgba(51,194,255,0.25), 0 0 6px rgba(255,120,77,0.25); }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
@@ -702,7 +714,7 @@ def index():
       </div>
     </div>
 
-    <div id="viewport">
+    <div id="viewport" style="position:relative; z-index: 1;">
       <div id="loading">Loading...</div>
       <canvas id="canvas"></canvas>
       <div id="heatmap-overlay" style="position:absolute; top:10%; left:10%; width:80%; height:80%; background:rgba(0,0,0,0.85); border:1px solid #444; border-radius:6px; display:none; z-index: 1002; padding:8px; box-sizing:border-box;">
@@ -718,12 +730,12 @@ def index():
         </div>
       </div>
         <div id="status-text" style="position:absolute; bottom:56px; left:50%; transform:translateX(-50%); color:#aaaaaa; font-size:24px; background:rgba(0,0,0,0.4); padding:4px 8px; border-radius:4px;">Viewing initial brain activity</div>
-        <div id="video-controls" style="position:absolute; bottom:0; left:0; right:0; background:rgba(0,0,0,0.6); padding:6px 8px; display:flex; align-items:center; gap:8px; z-index: 1001;">
+        <div id="video-controls" style="position:absolute; bottom:0; left:0; right:0; background:linear-gradient(0deg, rgba(10,10,14,0.92), rgba(10,10,14,0.68)); padding:6px 8px; display:flex; align-items:center; gap:8px; z-index: 1001;">
           <button id="play-pause">Pause</button>
           <input type="range" id="progress" min="0" max="0" step="0.001" value="0" style="flex:1;">
-          <span id="time-display" style="color:#cccccc; font-size:12px; width:120px; text-align:right;">00:00 / 00:00</span>
+          <span id="time-display" style="color:#c8cce0; font-size:12px; width:120px; text-align:right;">00:00 / 00:00</span>
         </div>
-        <div style="position:absolute; top:8px; right:12px; z-index:1001;">
+        <div style="position:absolute; top:8px; right:12px; z-index:1002;">
           <button id="reset-view">Reset to Initial</button>
         </div>
       </div>
@@ -746,22 +758,21 @@ def index():
 
     function initThree() {
       const canvas = document.getElementById('canvas');
-      const viewport = document.getElementById('viewport');
       scene = new THREE.Scene();
       scene.background = new THREE.Color(0x000000);
-      camera = new THREE.PerspectiveCamera(75, viewport.clientWidth / viewport.clientHeight, 0.1, 10000);
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 10000);
       camera.position.set(150,150,150);
       renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
-      renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+      renderer.setSize(window.innerWidth, window.innerHeight);
       renderer.setPixelRatio(window.devicePixelRatio);
       controls = new THREE.OrbitControls(camera, renderer.domElement);
       controls.target.set(50,50,50);
       controls.update();
       const light = new THREE.AmbientLight(0x404040, 0.8); scene.add(light);
       window.addEventListener('resize', () => {
-        camera.aspect = viewport.clientWidth / viewport.clientHeight;
+        camera.aspect = window.innerWidth / window.innerHeight;
         camera.updateProjectionMatrix();
-        renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+        renderer.setSize(window.innerWidth, window.innerHeight);
       });
       animate();
     }
@@ -1334,8 +1345,17 @@ def main():
             MODEL = MODEL.to(dtype=torch.float32)
 
     # Load good sample and mask
-    sample_path = CFG.data.good_sample_h5 or CFG.data.best_sample_h5
-    assert sample_path and os.path.exists(sample_path), f"Good sample H5 not found: {sample_path}"
+    sample_path = None
+    for cand in [CFG.data.good_sample_h5, CFG.data.best_sample_h5]:
+        if not cand:
+            continue
+        try:
+            sample_path = resolve_good_sample_h5_path(cand)
+            break
+        except Exception:
+            continue
+    if not sample_path:
+        raise ValueError("Please set data.good_sample_h5 (preferred) or data.best_sample_h5 in the config to a good/best *_data.h5 file or to an eval run directory containing videos/.")
     BEST = load_good_sample_h5(sample_path)
     assert os.path.exists(CFG.data.mask_h5), f"Mask H5 not found: {CFG.data.mask_h5}"
     MASK = load_mask_h5(CFG.data.mask_h5)
