@@ -624,7 +624,7 @@ def index():
     #viewport { flex: 1; position: relative; }
     #canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: block; z-index: 0; }
     .control-group { margin-bottom: 18px; }
-    .control-group h3 { margin: 0 0 10px 0; color: #66ccff; }
+    .control-group h3 { margin: 0 0 10px 0; color: #00e8ff; }
     label { font-size: 12px; }
     input[type="range"] { width: 100%; }
     button { background: linear-gradient(90deg, #0e2030, #0f2638); color: #ecf8ff; border: 1px solid #33c2ff; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin: 2px; box-shadow: 0 0 10px rgba(51,194,255,0.28), 0 0 14px rgba(255,120,80,0.12); }
@@ -633,11 +633,11 @@ def index():
     .region-item { margin: 3px 0; font-size: 11px; }
     #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); background: rgba(0,0,0,0.8); color: white; padding: 20px; border-radius: 10px; z-index: 1000; }
  
-    /* Neon blue sliders with subtle orange hints */
+    /* Neon cyan sliders with subtle orange hints */
     input[type="range"] { -webkit-appearance: none; height: 6px; border-radius: 4px; background: #2a2a3a; outline: none; }
-    input[type="range"]::-webkit-slider-runnable-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,191,255,0.6), rgba(102,204,255,0.4)); box-shadow: inset 0 0 6px rgba(255,120,80,0.12); }
+    input[type="range"]::-webkit-slider-runnable-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,232,255,0.7), rgba(102,204,255,0.45)); box-shadow: inset 0 0 6px rgba(255,120,80,0.12); }
     input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #0e0e16; border: 2px solid #33c2ff; box-shadow: 0 0 10px rgba(51,194,255,0.34), 0 0 12px rgba(255,120,80,0.16); margin-top: -6px; }
-    input[type="range"]::-moz-range-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,191,255,0.6), rgba(102,204,255,0.4)); box-shadow: inset 0 0 6px rgba(255,120,80,0.12); }
+    input[type="range"]::-moz-range-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,232,255,0.7), rgba(102,204,255,0.45)); box-shadow: inset 0 0 6px rgba(255,120,80,0.12); }
     input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: #0e0e16; border: 2px solid #33c2ff; box-shadow: 0 0 10px rgba(51,194,255,0.34), 0 0 12px rgba(255,120,80,0.16); }
  
     /* Checkbox accent color */
@@ -651,18 +651,16 @@ def index():
     /* Video controls bar styling */
     #video-controls { background: linear-gradient(0deg, rgba(10,10,14,0.92), rgba(10,10,14,0.68)); border-top: 1px solid #2a2a3a; }
     #time-display { color: #c8cce0; }
-
-    /* Neon orange/red hint accents for interactivity */
-    button:focus-visible, button:active { outline: 2px solid #ff784d; outline-offset: 2px; box-shadow: 0 0 10px rgba(255,120,77,0.35), 0 0 14px rgba(255,120,77,0.2); }
-    input[type="range"]:focus-visible { box-shadow: 0 0 10px rgba(255,120,77,0.28), inset 0 0 6px rgba(255,120,77,0.16); }
-    input[type="checkbox"]:focus-visible { outline: 2px solid #ff784d; outline-offset: 2px; }
+ 
+    /* Orange/red hint accents for interactivity (stronger, always visible on focus/active) */
+    button:focus-visible, button:active { outline: 2px solid #ff6a3d; outline-offset: 2px; box-shadow: 0 0 12px rgba(255,106,61,0.40), 0 0 16px rgba(255,106,61,0.22); }
+    input[type="range"]:focus-visible { box-shadow: 0 0 10px rgba(255,106,61,0.30), inset 0 0 8px rgba(255,106,61,0.18); }
+    input[type="checkbox"]:focus-visible { outline: 2px solid #ff6a3d; outline-offset: 2px; }
     .region-list { transition: border-color 0.15s ease, box-shadow 0.15s ease; }
-    .region-list:hover { border-color: rgba(255,120,77,0.55); box-shadow: inset 0 0 14px rgba(255,120,77,0.12), 0 0 10px rgba(51,194,255,0.14); }
+    .region-list:hover { border-color: rgba(255,106,61,0.55); box-shadow: inset 0 0 16px rgba(255,106,61,0.14), 0 0 10px rgba(51,194,255,0.14); }
     .region-item label { transition: color 0.12s ease, text-shadow 0.12s ease; }
-    .region-item label:hover { color: #ffb199; text-shadow: 0 0 6px rgba(255,120,77,0.35); }
-    .region-item input[type="checkbox"]:checked + label { color: #ffd0c4; text-shadow: 0 0 6px rgba(255,120,77,0.25); }
-    #controls .control-group h3 { position: relative; }
-    #controls .control-group h3::after { content: ""; position: absolute; left: 0; bottom: -6px; width: 36px; height: 2px; background: linear-gradient(90deg, #33c2ff, #ff784d); border-radius: 2px; box-shadow: 0 0 6px rgba(51,194,255,0.25), 0 0 6px rgba(255,120,77,0.25); }
+    .region-item label:hover { color: #ffc2ae; text-shadow: 0 0 6px rgba(255,106,61,0.35); }
+    .region-item input[type="checkbox"]:checked + label { color: #ffe0d6; text-shadow: 0 0 6px rgba(255,106,61,0.25); }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
@@ -676,7 +674,7 @@ def index():
         <h3>Playback</h3>
          <div class="slider-container">
            <label for="point-size">Point Size</label>
-           <input type="range" id="point-size" min="0.5" max="4.0" value="2.0" step="0.1" />
+           <input type="range" id="point-size" min="0.5" max="4.0" value="2.0gi" step="0.1" />
          </div>
          <div class="slider-container">
            <label for="opacity">Opacity</label>
@@ -829,8 +827,9 @@ def index():
       positionsAttr = geometry.getAttribute('position');
       colorsAttr = geometry.getAttribute('color');
 
+      const initialPointSize = parseFloat((document.getElementById('point-size') || {}).value) || 2.5;
       const uniforms = {
-        uPointSize: { value: 1.0 },
+        uPointSize: { value: initialPointSize },
         uGlobalOpacity: { value: 0.85 }
       };
 
