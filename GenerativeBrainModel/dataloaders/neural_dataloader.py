@@ -37,6 +37,7 @@ class NeuralDataset(Dataset):
         use_cache: bool = False,
         start_timepoint: Optional[int] = None,
         end_timepoint: Optional[int] = None,
+        spikes_dataset_name: str = 'spike_probabilities',
     ) -> None:
         self.data_files = data_files
         self.pad_stimuli_to = pad_stimuli_to
@@ -46,6 +47,7 @@ class NeuralDataset(Dataset):
         self.use_cache = use_cache
         self.start_timepoint = start_timepoint
         self.end_timepoint = end_timepoint
+        self.spikes_dataset_name = spikes_dataset_name
 
         self.sequences: List[Dict[str, int]] = []
         self.cached_spikes: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
@@ -64,7 +66,9 @@ class NeuralDataset(Dataset):
         print(f"Building neural sequence index... Caching: {self.use_cache}")
         for file_path in self.data_files:
             with h5py.File(file_path, 'r') as f:
-                spikes_ds = f['spike_probabilities']  # (T, N)
+                if self.spikes_dataset_name not in f:
+                    raise ValueError(f"Dataset '{self.spikes_dataset_name}' not found in {file_path}")
+                spikes_ds = f[self.spikes_dataset_name]  # (T, N)
                 T_total, N = spikes_ds.shape
 
                 # Determine start/end bounds
@@ -182,7 +186,9 @@ class NeuralDataset(Dataset):
             stimulus = self.cached_stimulus[file_path][rel_start:rel_end]  # (L, K_file)
         else:
             f = self._get_file_handle(file_path)
-            spikes_ds = f['spike_probabilities']  # (T, N)
+            if self.spikes_dataset_name not in f:
+                raise ValueError(f"Dataset '{self.spikes_dataset_name}' not found in {file_path}")
+            spikes_ds = f[self.spikes_dataset_name]  # (T, N)
             positions = f['cell_positions'][:]    # (N, 3)
             segment = spikes_ds[start_idx:end_idx].astype(np.float32)
             if 'stimulus_full' in f:
@@ -322,6 +328,14 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
     start_timepoint = training_config.get('start_timepoint', None)
     end_timepoint = training_config.get('end_timepoint', None)
 
+    # Determine which spikes dataset to read (probabilities vs rates)
+    spikes_dataset_name = 'spike_probabilities'
+    try:
+        if bool(data_config.get('spikes_are_rates', False)):
+            spikes_dataset_name = 'spike_rates_hz'
+    except Exception:
+        pass
+
     train_dataset = NeuralDataset(
         train_files,
         pad_stimuli_to=pad_stimuli_to,
@@ -331,6 +345,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
         use_cache=use_cache,
         start_timepoint=start_timepoint,
         end_timepoint=end_timepoint,
+        spikes_dataset_name=spikes_dataset_name,
     )
 
     test_dataset = NeuralDataset(
@@ -342,6 +357,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
         use_cache=use_cache,
         start_timepoint=start_timepoint,
         end_timepoint=end_timepoint,
+        spikes_dataset_name=spikes_dataset_name,
     )
 
     # Safer defaults for memory usage

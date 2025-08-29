@@ -64,12 +64,10 @@ class GBM(nn.Module):
         # Keep dtype consistent with model weights (bf16 when enabled)
         if x.dtype != next(self.parameters()).dtype:
             x = x.to(next(self.parameters()).dtype)
-
-        if point_positions != next(self.parameters()).dtype:
+        # Ensure point_positions dtype matches as well
+        if point_positions.dtype != next(self.parameters()).dtype:
             point_positions = point_positions.to(next(self.parameters()).dtype)
 
-        # # Sample x
-        # x = torch.bernoulli(x)
 
         # Concatenate the neuron scalars and the point positions by repeating the point positions for the entire sequence of neuron states
         x = torch.cat([x, point_positions.unsqueeze(1).repeat(1, T, 1, 1)], dim=3)
@@ -109,7 +107,13 @@ class GBM(nn.Module):
         if get_logits:
             return x
 
-        return torch.sigmoid(x)
+        # When not returning logits, choose output domain based on model flag
+        # - Probabilities mode (default): sigmoid(logits)
+        # - Rates mode: exp(logits) where logits represent log-rate
+        if getattr(self, 'spikes_are_rates', False):
+            return torch.exp(x)
+        else:
+            return torch.sigmoid(x)
 
     def autoregress(self, init_x, init_stimuli, point_positions, neuron_pad_mask, future_stimuli=None, n_steps=10, context_len=12):
         # init_x: (B, T, n_neurons)

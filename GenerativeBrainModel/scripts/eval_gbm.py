@@ -2,9 +2,10 @@
 """
 Neuron-based GBM Evaluation Script
 
-Evaluates a trained GBM model on neuron-level spike probability data produced by
-unified_spike_processing.py. Computes loss and PR-AUC, writes CSV logs, and
-produces comparison videos (next-step and autoregression) using the median-Z plane.
+Evaluates a trained GBM model on neuron-level spike data produced by
+unified_spike_processing.py. Computes losses and spike-rate metrics, writes CSV logs,
+and produces comparison videos (next-step and autoregression) using the median-Z plane.
+Includes relative performance vs a copy-last-timestep baseline.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import h5py
 
 from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
-from GenerativeBrainModel.metrics import CombinedMetricsTracker, pr_auc_binned
+from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
 import numpy as np
 import torch.nn.functional as F
@@ -42,6 +43,7 @@ def create_default_config() -> Dict[str, Any]:
             'data_dir': 'processed_spike_voxels_2018',
             'test_subjects': [],               # if empty: random split used by dataloader
             'use_cache': False,
+            'spikes_are_rates': False,
         },
         'model': {
             'checkpoint': None,                # REQUIRED: path to checkpoint saved by train_gbm.py
@@ -53,12 +55,15 @@ def create_default_config() -> Dict[str, Any]:
             'num_workers': 2,
             'use_gpu': True,
             'threshold': 0.5,
-            'sampling_rate_hz': 3.0,           # lambda for spike-rate conversion r = -lambda * ln(1-p)
+            'sampling_rate_hz': 3.0,           # used to compute rate metrics from probabilities
             'num_batches_nextstep': None,      # batches to use for next-step eval/embeddings (None=all)
             'num_batches_ar': None,            # batches to use for AR metrics (None=all)
             'make_videos': True,               # also controls H5 saving when True
             'load_from': None,                 # reuse saved eval dir (videos/*.h5) to recompute plots/metrics
             'pca_umap_max_samples': 20000,     # cap timepoints to embed
+            # spike trace plots (truth over full 2L, AR preds over horizon)
+            'num_trace_images': 100,
+            'neurons_per_trace_image': 4,
         },
         'logging': {
             'log_level': 'INFO',
@@ -176,6 +181,11 @@ def load_model_from_checkpoint(ckpt_path: Path, device: torch.device) -> GBM:
         n_heads = model_cfg['n_heads']
 
     model = GBM(d_model=d_model, d_stimuli=d_stimuli, n_heads=n_heads, n_layers=n_layers).to(device)
+    # Propagate rates mode into model for forward(get_logits=False)
+    try:
+        model.spikes_are_rates = bool(cfg['data'].get('spikes_are_rates', False))
+    except Exception:
+        model.spikes_are_rates = False
 
     # Pre-shape routing centroid buffers to match checkpoint (avoid size-mismatch errors)
     try:
@@ -225,11 +235,13 @@ def load_model_from_checkpoint(ckpt_path: Path, device: torch.device) -> GBM:
 
 
 @torch.no_grad()
-def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, tracker: CombinedMetricsTracker, threshold: float, num_batches: Optional[int] = None) -> Dict[str, float]:
+def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, tracker: CombinedMetricsTracker, threshold: float, num_batches: Optional[int] = None, *, spikes_are_rates: bool = False, sampling_rate_hz: float = 3.0) -> Dict[str, float]:
     model.eval()
     loss_fn = nn.BCEWithLogitsLoss()
     total_loss = 0.0
     total_batches = 0
+    mae_rate_sums = 0.0
+    mae_rate_counts = 0
     for batch_idx, batch in enumerate(tqdm(loader, desc='Eval'), 1):
         if num_batches and batch_idx > num_batches:
             break
@@ -242,19 +254,41 @@ def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         x_tgt = spikes[:, 1:, :]
         stim_in = stim[:, :-1, :]
         logits = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = loss_fn(logits.float(), x_tgt.float())
+        if spikes_are_rates:
+            # targets are rates; model logits are log-rates
+            loss = torch.nn.functional.poisson_nll_loss(logits.float(), x_tgt.float(), log_input=True, reduction='mean')
+            # Use rates directly for tracker; it will skip AUC if asked
+            probs = torch.exp(logits.float())
+            targs_for_tracker = x_tgt.float()
+            # MAE between spike rates (rates mode): |exp(logits) - target_rate|
+            abs_err = (probs - x_tgt.float()).abs()
+            mae_rate_sums += float(abs_err.mean().detach().cpu().item())
+            mae_rate_counts += 1
+        else:
+            loss = loss_fn(logits.float(), x_tgt.float())
+            probs = torch.sigmoid(logits)
+            targs_for_tracker = x_tgt.float()
+            # Convert probabilities to rates for MAE-rate
+            eps = 1e-7
+            p_pred = probs.clamp(0.0, 1.0 - eps)
+            p_true = x_tgt.float().clamp(0.0, 1.0 - eps)
+            r_pred = -float(sampling_rate_hz) * torch.log1p(-p_pred)
+            r_true = -float(sampling_rate_hz) * torch.log1p(-p_true)
+            abs_err = (r_pred - r_true).abs()
+            mae_rate_sums += float(abs_err.mean().detach().cpu().item())
+            mae_rate_counts += 1
         total_loss += float(loss.detach().cpu().item())
         total_batches += 1
 
-        probs = torch.sigmoid(logits)
-        tracker.log_validation(epoch=0, batch_idx=batch_idx, predictions=probs, targets=x_tgt.float(), val_loss=float(loss.detach().cpu().item()))
+        tracker.log_validation(epoch=0, batch_idx=batch_idx, predictions=probs, targets=targs_for_tracker, val_loss=float(loss.detach().cpu().item()), compute_auc=False)
 
     avg_loss = total_loss / max(1, total_batches)
-    return {'val_loss': avg_loss}
+    avg_mae_rate = (mae_rate_sums / max(1, mae_rate_counts)) if mae_rate_counts > 0 else float('nan')
+    return {'val_loss': avg_loss, 'mae_rate': avg_mae_rate}
 
 
 @torch.no_grad()
-def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, videos_dir: Path, sequence_length: int, num_batches: int = 1, use_double_window_for_ar: bool = False) -> None:
+def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, videos_dir: Path, sequence_length: int, num_batches: int = 1, use_double_window_for_ar: bool = False, *, spikes_are_rates: bool = False, sampling_rate_hz: float = 3.0) -> None:
     # Use a few batches to render videos
     it = iter(loader)
     # Aggregators for a single unified H5 output
@@ -277,8 +311,14 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
         x_tgt = spikes[:, 1:, :]
         stim_in = stim[:, :-1, :]
         logits = model(x_in, stim_in, positions, mask, get_logits=True)
-        probs = torch.sigmoid(logits)
-        create_nextstep_video(x_tgt, probs, positions, videos_dir / f'nextstep_batch{i+1}.mp4')
+        if spikes_are_rates:
+            # Visualize rates directly
+            probs = torch.exp(logits.float())
+            truth_probs = x_tgt.float()
+        else:
+            probs = torch.sigmoid(logits)
+            truth_probs = x_tgt
+        create_nextstep_video(truth_probs, probs, positions, videos_dir / f'nextstep_batch{i+1}.mp4')
 
         # Accumulate next-step truth/pred/positions
         ns_truth_list.append(x_tgt.detach().cpu())
@@ -306,8 +346,12 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
             else:
                 future_stim = future_real
             gen_seq = model.autoregress(init_x, init_stim, positions, mask, future_stim, n_steps=n_steps, context_len=context_len)
-            gen_only = gen_seq[:, -n_steps:, :]
-            truth_only = spikes[:, context_len:context_len + n_steps, :]
+            if spikes_are_rates:
+                gen_only = gen_seq[:, -n_steps:, :].float()
+                truth_only = spikes[:, context_len:context_len + n_steps, :].float()
+            else:
+                gen_only = gen_seq[:, -n_steps:, :]
+                truth_only = spikes[:, context_len:context_len + n_steps, :]
             create_autoregression_video(gen_only, positions, videos_dir / f'autoreg_batch{i+1}.mp4', truth=truth_only)
             # Accumulate AR truth/pred and metadata
             ar_truth_list.append(truth_only.detach().cpu())
@@ -320,21 +364,21 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
         out_h5 = videos_dir / 'eval_data.h5'
         with h5py.File(out_h5, 'w') as f:
             if ns_truth_list:
-                f.create_dataset('truth_next_step', data=torch.cat(ns_truth_list, dim=0).numpy(), compression='gzip', compression_opts=1)
-                f.create_dataset('pred_next_step', data=torch.cat(ns_pred_list, dim=0).numpy(), compression='gzip', compression_opts=1)
+                f.create_dataset('truth_next_step', data=torch.cat(ns_truth_list, dim=0).to(torch.float32).numpy(), compression='gzip', compression_opts=1)
+                f.create_dataset('pred_next_step', data=torch.cat(ns_pred_list, dim=0).to(torch.float32).numpy(), compression='gzip', compression_opts=1)
                 # For positions, keep only the first (assumed constant per subject); else stack
                 try:
-                    pos_cat = torch.cat(ns_pos_list, dim=0).numpy()
+                    pos_cat = torch.cat(ns_pos_list, dim=0).to(torch.float32).numpy()
                     f.create_dataset('positions', data=pos_cat, compression='gzip', compression_opts=1)
                 except Exception:
-                    f.create_dataset('positions', data=ns_pos_list[0].numpy(), compression='gzip', compression_opts=1)
+                    f.create_dataset('positions', data=ns_pos_list[0].to(torch.float32).numpy(), compression='gzip', compression_opts=1)
                 try:
                     f.create_dataset('neuron_mask', data=torch.cat(ns_mask_list, dim=0).numpy(), compression='gzip', compression_opts=1)
                 except Exception:
                     pass
             if ar_truth_list:
-                f.create_dataset('truth_future', data=torch.cat(ar_truth_list, dim=0).numpy(), compression='gzip', compression_opts=1)
-                f.create_dataset('pred_future', data=torch.cat(ar_pred_list, dim=0).numpy(), compression='gzip', compression_opts=1)
+                f.create_dataset('truth_future', data=torch.cat(ar_truth_list, dim=0).to(torch.float32).numpy(), compression='gzip', compression_opts=1)
+                f.create_dataset('pred_future', data=torch.cat(ar_pred_list, dim=0).to(torch.float32).numpy(), compression='gzip', compression_opts=1)
                 f.create_dataset('ar_context_len', data=np.array(ar_context_list, dtype=np.int32))
                 f.create_dataset('ar_n_steps', data=np.array(ar_nsteps_list, dtype=np.int32))
     except Exception:
@@ -342,16 +386,24 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
 
 
 @torch.no_grad()
-def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, threshold: float, logs_dir: Path, num_batches: Optional[int] = None, use_double_window: bool = True, sampling_rate_hz: float = 3.0) -> Dict[str, List[float]]:
+def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, threshold: float, logs_dir: Path, num_batches: Optional[int] = None, use_double_window: bool = True, sampling_rate_hz: float = 3.0, *, spikes_are_rates: bool = False) -> Dict[str, List[float]]:
     """
-    Compute per-horizon autoregression metrics (BCE and PR-AUC) to assess degradation
-    as steps increase. Uses half of the available sequence as context by default.
+    Compute per-horizon autoregression metrics to assess degradation as steps increase.
+    Also compute relative performance vs a baseline that copies the last context frame.
+    Uses half of the available sequence as context by default.
+    Also tracks the best performing AR sample across all batches.
     """
-    per_step_loss_sums: List[float] = []
-    per_step_auc_sums: List[float] = []
+    per_step_loss_sums: List[float] = []  # BCE in prob mode; left empty in rates mode
+    # PR AUC removed
     per_step_counts: List[int] = []
     # Additional spike-rate metric (MAE only)
     per_step_mae_rate_sums: List[float] = []
+    # Baseline (copy-last) spike-rate MAE sums
+    per_step_mae_rate_baseline_sums: List[float] = []
+
+    # Best AR sample tracking
+    best_sample_score = float('inf')  # Lower is better (mean MAE rate)
+    best_sample_data = None
 
     for batch_idx, batch in enumerate(tqdm(loader, desc='Eval AR'), 1):
         if num_batches and batch_idx > num_batches:
@@ -383,72 +435,336 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
         if len(per_step_loss_sums) < n_steps:
             extend_by = n_steps - len(per_step_loss_sums)
             per_step_loss_sums.extend([0.0] * extend_by)
-            per_step_auc_sums.extend([0.0] * extend_by)
+            # no PR AUC accumulator
             per_step_counts.extend([0] * extend_by)
             per_step_mae_rate_sums.extend([0.0] * extend_by)
+            per_step_mae_rate_baseline_sums.extend([0.0] * extend_by)
+
+        # Per-sample tracking for best AR sample
+        for b in range(B):
+            # Compute overall performance score for this sample (mean MAE rate across all steps)
+            sample_mae_rates = []
+            for k in range(n_steps):
+                pred_k = gen_only[b:b+1, k, :].detach()  # Keep batch dim for consistency
+                targ_k = tgt_only[b:b+1, k, :].detach()
+                
+                # Convert to rates if needed
+                eps = 1e-7
+                if spikes_are_rates:
+                    pred_rate = pred_k.float()
+                    true_rate = targ_k.float()
+                else:
+                    pred_clamped = pred_k.clamp(0.0, 1.0 - eps)
+                    targ_clamped = targ_k.clamp(0.0, 1.0 - eps)
+                    pred_rate = -sampling_rate_hz * torch.log1p(-pred_clamped)
+                    true_rate = -sampling_rate_hz * torch.log1p(-targ_clamped)
+                
+                # Compute MAE rate for this step, considering mask
+                if 'neuron_mask' in batch:
+                    sample_mask = mask[b:b+1, :]  # (1, N)
+                    valid_mae = ((pred_rate - true_rate).abs() * sample_mask.float()).sum() / sample_mask.sum().clamp_min(1)
+                else:
+                    valid_mae = (pred_rate - true_rate).abs().mean()
+                sample_mae_rates.append(valid_mae.item())
+            
+            # Overall score for this sample (mean across all steps)
+            sample_score = np.mean(sample_mae_rates) if sample_mae_rates else float('inf')
+            
+            # Update best sample if this one is better
+            if sample_score < best_sample_score:
+                best_sample_score = sample_score
+                best_sample_data = {
+                    'initial_context': init_x[b:b+1, :, :].detach().cpu(),  # (1, context_len, N)
+                    'true_future': tgt_only[b:b+1, :, :].detach().cpu(),    # (1, n_steps, N) 
+                    'pred_future': gen_only[b:b+1, :, :].detach().cpu(),    # (1, n_steps, N)
+                    'positions': positions[b:b+1, :, :].detach().cpu(),     # (1, N, 3)
+                    'neuron_mask': mask[b:b+1, :].detach().cpu() if 'neuron_mask' in batch else torch.ones(1, init_x.shape[-1], dtype=torch.bool),  # (1, N)
+                    'stimulus_context': init_stim[b:b+1, :, :].detach().cpu() if init_stim is not None else None,  # (1, context_len, K)
+                    'stimulus_future': future_stim[b:b+1, :n_steps, :].detach().cpu() if future_stim is not None and future_stim.shape[1] >= n_steps else None,  # (1, n_steps, K)
+                    'context_len': context_len,
+                    'n_steps': n_steps,
+                    'sample_score': sample_score,
+                    'batch_idx': batch_idx,
+                    'sample_idx': b
+                }
 
         # Per-horizon metrics
         for k in range(n_steps):
             preds_k = gen_only[:, k, :].detach()
             targs_k = tgt_only[:, k, :].detach()
-            # BCE on probabilities
-            loss_k = F.binary_cross_entropy(preds_k, targs_k, reduction='mean').item()
-            # PR AUC using binned computation
-            auc_k = pr_auc_binned(preds_k.flatten(), targs_k.flatten(), threshold=threshold)
-            per_step_loss_sums[k] += loss_k
-            per_step_auc_sums[k] += auc_k
+            # BCE only valid in probability mode
+            if not spikes_are_rates:
+                loss_k = F.binary_cross_entropy(preds_k, targs_k, reduction='mean').item()
+                per_step_loss_sums[k] += loss_k
             per_step_counts[k] += 1
 
             # Spike-rate metrics from probabilities: r = -lambda * ln(1 - p)
             eps = 1e-7
-            preds_k_clamped = preds_k.clamp(0.0, 1.0 - eps)
-            targs_k_clamped = targs_k.clamp(0.0, 1.0 - eps)
-            pred_rate = -sampling_rate_hz * torch.log1p(-preds_k_clamped)
-            true_rate = -sampling_rate_hz * torch.log1p(-targs_k_clamped)
+            if spikes_are_rates:
+                # Inputs are already rates
+                pred_rate = preds_k.float()
+                true_rate = targs_k.float()
+            else:
+                preds_k_clamped = preds_k.clamp(0.0, 1.0 - eps)
+                targs_k_clamped = targs_k.clamp(0.0, 1.0 - eps)
+                pred_rate = -sampling_rate_hz * torch.log1p(-preds_k_clamped)
+                true_rate = -sampling_rate_hz * torch.log1p(-targs_k_clamped)
             abs_err = (pred_rate - true_rate).abs()
             mae_rate_k = abs_err.mean().item()
             per_step_mae_rate_sums[k] += mae_rate_k
+            # Baseline: copy last context frame forward
+            last_ctx = init_x[:, -1, :]  # (B, N) probs or rates, matching mode
+            if spikes_are_rates:
+                last_ctx_rate = last_ctx.float()
+            else:
+                last_ctx_clamped = last_ctx.clamp(0.0, 1.0 - eps)
+                last_ctx_rate = -sampling_rate_hz * torch.log1p(-last_ctx_clamped)
+            # Broadcast to (B, N) against true_rate
+            abs_err_baseline = (last_ctx_rate - true_rate).abs()
+            mae_rate_baseline_k = abs_err_baseline.mean().item()
+            per_step_mae_rate_baseline_sums[k] += mae_rate_baseline_k
             
 
     # Averages
-    per_step_loss = [per_step_loss_sums[k] / max(1, per_step_counts[k]) for k in range(len(per_step_counts))]
-    per_step_auc = [per_step_auc_sums[k] / max(1, per_step_counts[k]) for k in range(len(per_step_counts))]
+    per_step_loss = [
+        (per_step_loss_sums[k] / max(1, per_step_counts[k])) if (not spikes_are_rates and k < len(per_step_loss_sums)) else float('nan')
+        for k in range(len(per_step_counts))
+    ]
     per_step_mae_rate = [per_step_mae_rate_sums[k] / max(1, per_step_counts[k]) for k in range(len(per_step_counts))]
+    per_step_mae_rate_baseline = [per_step_mae_rate_baseline_sums[k] / max(1, per_step_counts[k]) for k in range(len(per_step_counts))]
+    # Relative performance: 1 - (model MAE / baseline MAE)
+    per_step_relative = []
+    for m, b in zip(per_step_mae_rate, per_step_mae_rate_baseline):
+        if b is not None and float(b) > 1e-12 and np.isfinite(b) and np.isfinite(m):
+            per_step_relative.append(1.0 - (float(m) / float(b)))
+        else:
+            per_step_relative.append(float('nan'))
 
     # Write CSV
     out_csv = logs_dir / 'autoregression_per_step.csv'
     with open(out_csv, 'w') as f:
-        f.write('step,bce,pr_auc,mae_rate,count\n')
+        f.write('step,bce,mae_rate,rel_perf,count\n')
         for k in range(len(per_step_counts)):
-            f.write(f"{k+1},{per_step_loss[k]:.6f},{per_step_auc[k]:.6f},{per_step_mae_rate[k]:.6f},{per_step_counts[k]}\n")
+            rp = per_step_relative[k]
+            rp_str = f"{rp:.6f}" if np.isfinite(rp) else 'nan'
+            f.write(f"{k+1},{per_step_loss[k]:.6f},{per_step_mae_rate[k]:.6f},{rp_str},{per_step_counts[k]}\n")
 
     # Optional quick plot
     try:
         import matplotlib.pyplot as plt
-        import numpy as np
         steps = np.arange(1, len(per_step_counts) + 1)
         fig, ax1 = plt.subplots(figsize=(8, 4))
         color = 'tab:red'
         ax1.set_xlabel('Horizon (steps)')
-        ax1.set_ylabel('BCE', color=color)
-        ax1.plot(steps, per_step_loss, color=color)
-        ax1.tick_params(axis='y', labelcolor=color)
-        ax2 = ax1.twinx()
-        color = 'tab:green'
-        ax2.set_ylabel('PR AUC', color=color)
-        ax2.plot(steps, per_step_auc, color=color)
-        ax2.tick_params(axis='y', labelcolor=color)
+        if not spikes_are_rates:
+            ax1.set_ylabel('BCE', color=color)
+            ax1.plot(steps, per_step_loss, color=color)
+            ax1.tick_params(axis='y', labelcolor=color)
+            ax2 = ax1.twinx()
+            color = 'tab:green'
+            ax2.set_ylabel('MAE rate', color=color)
+            ax2.plot(steps, per_step_mae_rate, color=color)
+            ax2.tick_params(axis='y', labelcolor=color)
+        else:
+            # Only MAE in rates mode
+            ax1.set_ylabel('MAE rate', color='tab:green')
+            ax1.plot(steps, per_step_mae_rate, color='tab:green')
+            ax1.tick_params(axis='y', labelcolor='tab:green')
         fig.tight_layout()
         fig.savefig(logs_dir / 'autoregression_per_step.png', dpi=120, bbox_inches='tight')
         plt.close(fig)
+
+        # Relative performance plot
+        fig2, ax = plt.subplots(figsize=(8, 4))
+        ax.set_xlabel('Horizon (steps)')
+        ax.set_ylabel('Relative performance (1 - model/baseline)')
+        ax.plot(steps, per_step_relative, color='tab:blue')
+        ax.axhline(0.0, color='k', linestyle='--', linewidth=1)
+        fig2.tight_layout()
+        fig2.savefig(logs_dir / 'autoregression_relative_per_step.png', dpi=120, bbox_inches='tight')
+        plt.close(fig2)
     except Exception:
         pass
 
     return {
         'per_step_bce': per_step_loss,
-        'per_step_pr_auc': per_step_auc,
         'per_step_mae_rate': per_step_mae_rate,
+        'per_step_rel_perf': per_step_relative,
+        'best_sample_data': best_sample_data,
+        'best_sample_score': best_sample_score,
     }
+
+
+@torch.no_grad()
+def create_best_ar_sample_video(best_sample_data: Dict[str, Any], videos_dir: Path) -> bool:
+    """
+    Create a video specifically for the best performing AR sample.
+    Shows the full sequence: initial context + true future + predicted future.
+    """
+    if best_sample_data is None:
+        return False
+    
+    try:
+        # Extract data
+        init_context = best_sample_data['initial_context']  # (1, context_len, N)
+        true_future = best_sample_data['true_future']       # (1, n_steps, N)
+        pred_future = best_sample_data['pred_future']       # (1, n_steps, N)
+        positions = best_sample_data['positions']           # (1, N, 3)
+        neuron_mask = best_sample_data['neuron_mask']       # (1, N)
+        context_len = best_sample_data['context_len']
+        n_steps = best_sample_data['n_steps']
+        sample_score = best_sample_data['sample_score']
+        batch_idx = best_sample_data['batch_idx']
+        sample_idx = best_sample_data['sample_idx']
+        
+        # Import the video creation function
+        from GenerativeBrainModel.visualizations import create_autoregression_video
+        
+        # Create video filename with performance info
+        video_name = f'best_ar_sample_batch{batch_idx}_idx{sample_idx}_score{sample_score:.4f}.mp4'
+        video_path = videos_dir / video_name
+        
+        # Ensure batched shapes expected by create_autoregression_video: (B, T, N) and (B, N, 3)
+        if pred_future.ndim == 2:
+            pred_future = pred_future.unsqueeze(0)
+        if true_future is not None and true_future.ndim == 2:
+            true_future = true_future.unsqueeze(0)
+        if positions.ndim == 2:
+            positions = positions.unsqueeze(0)
+
+        # Create the video - show predicted future against ground truth
+        create_autoregression_video(
+            pred_future,           # (B, n_steps, N)
+            positions,             # (B, N, 3)
+            video_path,
+            truth=true_future      # (B, n_steps, N)
+        )
+        
+        # Also save the data as an H5 file for further analysis
+        try:
+            import h5py
+            h5_path = videos_dir / f'best_ar_sample_batch{batch_idx}_idx{sample_idx}_data.h5'
+            with h5py.File(h5_path, 'w') as f:
+                f.create_dataset('initial_context', data=init_context.to(torch.float32).numpy(), compression='gzip', compression_opts=1)
+                f.create_dataset('true_future', data=true_future.to(torch.float32).numpy(), compression='gzip', compression_opts=1)
+                f.create_dataset('pred_future', data=pred_future.to(torch.float32).numpy(), compression='gzip', compression_opts=1)
+                f.create_dataset('positions', data=positions.to(torch.float32).numpy(), compression='gzip', compression_opts=1)
+                f.create_dataset('neuron_mask', data=neuron_mask.numpy(), compression='gzip', compression_opts=1)
+                
+                # Save stimulus data if available
+                if best_sample_data.get('stimulus_context') is not None:
+                    f.create_dataset('stimulus_context', data=best_sample_data['stimulus_context'].to(torch.float32).numpy(), compression='gzip', compression_opts=1)
+                if best_sample_data.get('stimulus_future') is not None:
+                    f.create_dataset('stimulus_future', data=best_sample_data['stimulus_future'].to(torch.float32).numpy(), compression='gzip', compression_opts=1)
+                
+                # Save metadata
+                f.attrs['context_len'] = context_len
+                f.attrs['n_steps'] = n_steps
+                f.attrs['sample_score'] = sample_score
+                f.attrs['batch_idx'] = batch_idx
+                f.attrs['sample_idx'] = sample_idx
+                f.attrs['description'] = f'Best performing AR sample from batch {batch_idx}, sample {sample_idx} with MAE rate score {sample_score:.6f}'
+                
+        except Exception as e:
+            print(f"Warning: Could not save best sample H5 data: {e}")
+            
+    except Exception as e:
+        print(f"Warning: Could not create best AR sample video: {e}")
+        return False
+
+    return True
+
+
+@torch.no_grad()
+def save_spike_trace_plots(
+    model: GBM,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    out_dir: Path,
+    num_images: int = 10,
+    neurons_per_image: int = 4,
+) -> None:
+    """Save line plots of spike probabilities for individual neurons.
+    Each image contains 4 subplots. For each selected neuron, plot:
+      - Truth over the full 2L window
+      - AR prediction over the horizon (second L), aligned to the same x-axis
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except Exception:
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    images_saved = 0
+
+    for batch in tqdm(loader, desc='Spike trace plots'):
+        if images_saved >= num_images:
+            break
+        spikes = batch['spikes'].to(device).to(torch.bfloat16)   # (B, 2L, N)
+        positions = batch['positions'].to(device)
+        mask = batch['neuron_mask'].to(device).bool()
+        stim = batch['stimulus'].to(device).to(torch.bfloat16)
+
+        B, Ltot, N = spikes.shape
+        context_len = int(Ltot // 2)
+        n_steps = int(context_len)
+        if n_steps <= 0:
+            continue
+
+        init_x = spikes[:, :context_len, :]
+        init_stim = stim[:, :context_len, :]
+        future_stim = stim[:, context_len:, :]
+        gen_seq = model.autoregress(init_x, init_stim, positions, mask, future_stim, n_steps=n_steps, context_len=context_len)
+        gen_only = gen_seq[:, -n_steps:, :]  # (B, L, N) preds in [0,1]
+
+        for b in range(B):
+            if images_saved >= num_images:
+                break
+            valid_idx = torch.where(mask[b])[0].detach().cpu().numpy()
+            if valid_idx.size == 0:
+                continue
+            k = int(min(neurons_per_image, valid_idx.size))
+            chosen = np.random.choice(valid_idx, size=k, replace=False)
+
+            fig, axes = plt.subplots(2, 2, figsize=(10, 6), sharex=True)
+            axes = axes.reshape(-1)
+            t_full = np.arange(Ltot)
+            t_pred = np.arange(context_len, context_len + n_steps)
+            for ax_idx, neuron_id in enumerate(chosen):
+                ax = axes[ax_idx]
+                truth_np = spikes[b, :, neuron_id].detach().to(torch.float32).cpu().numpy()
+                pred_np = gen_only[b, :, neuron_id].detach().to(torch.float32).cpu().numpy()
+                ax.plot(t_full, truth_np, label='Truth', color='tab:green', linewidth=1.5)
+                ax.plot(t_pred, pred_np, label='AR Pred', color='tab:orange', linewidth=1.5)
+                ax.axvline(context_len - 0.5, color='k', linestyle='--', linewidth=1)
+                ax.set_ylabel('Spike prob')
+                ax.set_title(f'Neuron {int(neuron_id)}')
+                ymin = float(min(np.min(truth_np), np.min(pred_np)))
+                ymax = float(max(np.max(truth_np), np.max(pred_np)))
+                if not np.isfinite(ymin) or not np.isfinite(ymax) or ymax <= ymin:
+                    ymin, ymax = 0.0, 1.0
+                # Add small padding for visibility
+                pad = 0.02 * max(1e-6, (ymax - ymin))
+                ax.set_ylim(ymin - pad, ymax + pad)
+            # Hide unused axes if fewer than 4
+            for j in range(k, 4):
+                fig.delaxes(axes[j])
+            axes_to_label = axes[:k]
+            for ax in axes_to_label:
+                ax.legend(loc='upper right', fontsize=8)
+            axes_to_label[-1].set_xlabel('Time (steps)')
+            fig.suptitle('Spike probability: Truth vs AR Prediction')
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+            out_path = out_dir / f'spike_traces_{images_saved + 1:02d}.png'
+            fig.savefig(out_path, dpi=140, bbox_inches='tight')
+            plt.close(fig)
+            images_saved += 1
+
+        # Free memory sooner
+        del spikes, positions, mask, stim, gen_seq, gen_only
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def main():
@@ -531,7 +847,16 @@ def main():
 
     tracker = CombinedMetricsTracker(log_dir=dirs['logs'], ema_alpha=0.0, val_threshold=cfg['eval']['threshold'], enable_plots=True)
     if not offline_mode:
-        metrics = evaluate(model, ns_loader, device, tracker, threshold=cfg['eval']['threshold'], num_batches=cfg['eval']['num_batches_nextstep'])
+        metrics = evaluate(
+            model,
+            ns_loader,
+            device,
+            tracker,
+            threshold=cfg['eval']['threshold'],
+            num_batches=cfg['eval']['num_batches_nextstep'],
+            spikes_are_rates=bool(cfg['data'].get('spikes_are_rates', False)),
+            sampling_rate_hz=float(cfg['eval'].get('sampling_rate_hz', 3.0)),
+        )
         logger.info(f"Evaluation metrics: {metrics}")
         tracker.plot_training()
 
@@ -547,17 +872,63 @@ def main():
                 num_batches=cfg['eval']['num_batches_ar'],
                 use_double_window=True,
                 sampling_rate_hz=float(cfg['eval'].get('sampling_rate_hz', 3.0)),
+                spikes_are_rates=bool(cfg['data'].get('spikes_are_rates', False)),
             )
-            logger.info(f"Autoregression per-step metrics saved. First steps: BCE={ar_metrics['per_step_bce'][:3]}, AUC={ar_metrics['per_step_pr_auc'][:3]}")
+            logger.info(f"Autoregression per-step metrics saved. First steps: BCE={ar_metrics['per_step_bce'][:3]}, MAE_rate={ar_metrics['per_step_mae_rate'][:3]}")
+            
+            # Create video for best performing AR sample
+            if ar_metrics.get('best_sample_data') is not None:
+                best_score = ar_metrics.get('best_sample_score', float('inf'))
+                best_data = ar_metrics['best_sample_data']
+                logger.info(f"Best AR sample found: batch {best_data['batch_idx']}, sample {best_data['sample_idx']} with MAE rate score {best_score:.6f}")
+                
+                # Create video for the best AR sample
+                try:
+                    created = create_best_ar_sample_video(best_data, dirs['videos'])
+                    video_filename = f"best_ar_sample_batch{best_data['batch_idx']}_idx{best_data['sample_idx']}_score{best_score:.4f}.mp4"
+                    if created:
+                        logger.info(f"Created video for best AR sample: {dirs['videos'] / video_filename}")
+                    else:
+                        logger.warning("Best AR sample video creation reported failure.")
+                except Exception as e:
+                    logger.warning(f"Failed to create best AR sample video: {e}")
+            else:
+                logger.warning("No best AR sample data found")
+                
         except Exception as e:
             logger.warning(f"Autoregression metrics failed: {e}")
 
     if cfg['eval']['make_videos'] and not offline_mode:
         try:
             # Use AR loader so the unified H5 contains both next-step and AR using 2L windows
-            make_videos(model, ar_loader, device, dirs['videos'], sequence_length=cfg['eval']['sequence_length'], num_batches=1, use_double_window_for_ar=True)
+            make_videos(
+                model,
+                ar_loader,
+                device,
+                dirs['videos'],
+                sequence_length=cfg['eval']['sequence_length'],
+                num_batches=1,
+                use_double_window_for_ar=True,
+                spikes_are_rates=bool(cfg['data'].get('spikes_are_rates', False)),
+                sampling_rate_hz=float(cfg['eval'].get('sampling_rate_hz', 3.0)),
+            )
         except Exception as e:
             logger.warning(f"Video generation failed: {e}")
+
+    # Spike trace plots: 10 images, 4 neurons each (truth full 2L, AR preds over horizon)
+    if not offline_mode:
+        try:
+            plots_dir = dirs['logs'] / 'plots'
+            save_spike_trace_plots(
+                model,
+                ar_loader,
+                device,
+                plots_dir,
+                num_images=int(cfg['eval'].get('num_trace_images', 10)),
+                neurons_per_image=int(cfg['eval'].get('neurons_per_trace_image', 4)),
+            )
+        except Exception as e:
+            logger.warning(f"Spike trace plotting failed: {e}")
 
     # Next-step: loss vs context size (per output position)
     try:
@@ -569,6 +940,8 @@ def main():
         step_loss_counts = torch.zeros(Tpos, dtype=torch.float64)
         # Spike-rate metric accumulator (MAE only)
         step_mae_rate_sums = torch.zeros(Tpos, dtype=torch.float64)
+        # Baseline (copy-last) spike-rate MAE accumulator
+        step_mae_rate_baseline_sums = torch.zeros(Tpos, dtype=torch.float64)
         sampling_rate_hz = float(cfg['eval'].get('sampling_rate_hz', 3.0))
 
         if offline_mode and load_from and Path(load_from).exists():
@@ -580,20 +953,30 @@ def main():
                     mask_rep = mask[:, None, :].expand(t.shape[0], t.shape[1], t.shape[2])
                 else:
                     mask_rep = torch.ones_like(t, dtype=torch.bool)
-                # BCE on probabilities
-                bce = F.binary_cross_entropy(p, t, reduction='none')
+                # BCE only when not in rates mode
+                bce = F.binary_cross_entropy(p, t, reduction='none') if not bool(cfg['data'].get('spikes_are_rates', False)) else torch.zeros_like(t)
                 # Spike-rate errors
                 eps = 1e-7
-                p_clamped = p.clamp(0.0, 1.0 - eps)
-                t_clamped = t.clamp(0.0, 1.0 - eps)
-                p_rate = -sampling_rate_hz * torch.log1p(-p_clamped)
-                t_rate = -sampling_rate_hz * torch.log1p(-t_clamped)
+                if bool(cfg['data'].get('spikes_are_rates', False)):
+                    p_rate = p
+                    t_rate = t
+                else:
+                    p_clamped = p.clamp(0.0, 1.0 - eps)
+                    t_clamped = t.clamp(0.0, 1.0 - eps)
+                    p_rate = -sampling_rate_hz * torch.log1p(-p_clamped)
+                    t_rate = -sampling_rate_hz * torch.log1p(-t_clamped)
                 abs_err = (p_rate - t_rate).abs()
+                # Baseline: copy previous timestep truth rate to predict next (defined for j>=1)
+                baseline_rate = t_rate[:, :-1, :]  # (Bsum, Tpos-1, N)
                 for j in range(min(Tpos, bce.shape[1])):
                     sel = mask_rep[:, j, :]
-                    step_loss_sums[j] += bce[:, j, :][sel].sum().double().cpu()
+                    if not bool(cfg['data'].get('spikes_are_rates', False)):
+                        step_loss_sums[j] += bce[:, j, :][sel].sum().double().cpu()
                     step_loss_counts[j] += sel.sum().double().cpu()
                     step_mae_rate_sums[j] += abs_err[:, j, :][sel].sum().double().cpu()
+                    if j - 1 >= 0 and j - 1 < baseline_rate.shape[1]:
+                        abs_err_bl = (baseline_rate[:, j - 1, :] - t_rate[:, j, :]).abs()
+                        step_mae_rate_baseline_sums[j] += abs_err_bl[sel].sum().double().cpu()
         else:
             with torch.no_grad():
                 used = 0
@@ -605,21 +988,32 @@ def main():
                     x_in = spikes[:, :-1, :]
                     x_tgt = spikes[:, 1:, :].float()
                     logits = model(x_in, stim[:, :-1, :], batch['positions'].to(device), mask, get_logits=True)
-                    bce = F.binary_cross_entropy_with_logits(logits.float(), x_tgt, reduction='none')  # (B, Tpos, N)
+                    # BCE only when not in rates mode
+                    bce = F.binary_cross_entropy_with_logits(logits.float(), x_tgt, reduction='none') if not bool(cfg['data'].get('spikes_are_rates', False)) else torch.zeros_like(x_tgt)
                     mask_rep = mask[:, None, :].expand(bce.shape[0], bce.shape[1], bce.shape[2])
                     # Spike-rate errors from probabilities
-                    probs = torch.sigmoid(logits.float())
                     eps = 1e-7
-                    p_clamped = probs.clamp(0.0, 1.0 - eps)
-                    t_clamped = x_tgt.clamp(0.0, 1.0 - eps)
-                    p_rate = -sampling_rate_hz * torch.log1p(-p_clamped)
-                    t_rate = -sampling_rate_hz * torch.log1p(-t_clamped)
+                    if bool(cfg['data'].get('spikes_are_rates', False)):
+                        p_rate = torch.exp(logits.float())
+                        t_rate = x_tgt.float()
+                    else:
+                        probs = torch.sigmoid(logits.float())
+                        p_clamped = probs.clamp(0.0, 1.0 - eps)
+                        t_clamped = x_tgt.clamp(0.0, 1.0 - eps)
+                        p_rate = -sampling_rate_hz * torch.log1p(-p_clamped)
+                        t_rate = -sampling_rate_hz * torch.log1p(-t_clamped)
                     abs_err = (p_rate - t_rate).abs()
+                    # Baseline: copy previous timestep truth rate to predict next
+                    baseline_rate = t_rate[:, :-1, :]  # aligns with next-step positions j>=1
                     for j in range(min(Tpos, bce.shape[1])):
                         sel = mask_rep[:, j, :]
-                        step_loss_sums[j] += bce[:, j, :][sel].sum().double().cpu()
+                        if not bool(cfg['data'].get('spikes_are_rates', False)):
+                            step_loss_sums[j] += bce[:, j, :][sel].sum().double().cpu()
                         step_loss_counts[j] += sel.sum().double().cpu()
                         step_mae_rate_sums[j] += abs_err[:, j, :][sel].sum().double().cpu()
+                        if j - 1 >= 0 and j - 1 < baseline_rate.shape[1]:
+                            abs_err_bl = (baseline_rate[:, j - 1, :] - t_rate[:, j, :]).abs()
+                            step_mae_rate_baseline_sums[j] += abs_err_bl[sel].sum().double().cpu()
                     used += 1
                     if limit and used >= int(limit):
                         break
@@ -627,11 +1021,17 @@ def main():
         ctx_sizes = np.arange(1, Tpos + 1)
         step_loss = (step_loss_sums / step_loss_counts.clamp_min(1)).cpu().numpy()
         step_mae_rate = (step_mae_rate_sums / step_loss_counts.clamp_min(1)).cpu().numpy()
+        step_mae_rate_baseline = (step_mae_rate_baseline_sums / step_loss_counts.clamp_min(1)).cpu().numpy()
+        # Relative performance per position
+        rel_perf = np.full_like(step_mae_rate, np.nan, dtype=np.float64)
+        valid = (step_mae_rate_baseline > 1e-12) & np.isfinite(step_mae_rate_baseline) & np.isfinite(step_mae_rate)
+        rel_perf[valid] = 1.0 - (step_mae_rate[valid] / step_mae_rate_baseline[valid])
         # Save CSV
         with open(dirs['logs'] / 'nextstep_loss_vs_context.csv', 'w') as fcsv:
-            fcsv.write('context,loss,mae_rate,count\n')
-            for c, loss, mae_r, cnt in zip(ctx_sizes, step_loss, step_mae_rate, step_loss_counts.cpu().numpy()):
-                fcsv.write(f"{int(c)},{float(loss):.6f},{float(mae_r):.6f},{int(cnt)}\n")
+            fcsv.write('context,loss,mae_rate,rel_perf,count\n')
+            for c, loss, mae_r, rp, cnt in zip(ctx_sizes, step_loss, step_mae_rate, rel_perf, step_loss_counts.cpu().numpy()):
+                rp_str = f"{float(rp):.6f}" if np.isfinite(rp) else 'nan'
+                fcsv.write(f"{int(c)},{float(loss):.6f},{float(mae_r):.6f},{rp_str},{int(cnt)}\n")
         # Plot scatter
         plt.figure(figsize=(6,4))
         plt.scatter(ctx_sizes, step_loss, s=16, alpha=0.8)
@@ -650,6 +1050,19 @@ def main():
             plt.title('Next-step spike-rate MAE vs context size')
             plt.tight_layout()
             plt.savefig(dirs['logs'] / 'nextstep_mae_rate_vs_context.png', dpi=120, bbox_inches='tight')
+            plt.close()
+        except Exception:
+            pass
+        # Plot relative performance vs context
+        try:
+            plt.figure(figsize=(6,4))
+            plt.scatter(ctx_sizes, rel_perf, s=16, alpha=0.8)
+            plt.axhline(0.0, color='k', linestyle='--', linewidth=1)
+            plt.xlabel('Context length (tokens)')
+            plt.ylabel('Relative performance (1 - model/baseline)')
+            plt.title('Next-step relative performance vs context size')
+            plt.tight_layout()
+            plt.savefig(dirs['logs'] / 'nextstep_relative_vs_context.png', dpi=120, bbox_inches='tight')
             plt.close()
         except Exception:
             pass

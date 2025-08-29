@@ -92,6 +92,7 @@ def create_default_config() -> Dict[str, Any]:
             'data_dir': 'processed_spike_voxels_2018',
             'test_subjects': [],
             'use_cache': False,
+            'spikes_are_rates': False,
         },
         'model': {
             'd_model': 256,
@@ -127,9 +128,8 @@ def create_default_config() -> Dict[str, Any]:
             'profile': False,
             'profile_steps': 50,
             'profile_dir': './tb_prof',
-            # Extra loss term weight: mean squared difference between per-timestep mean
-            # predicted activation and target activation (masked over valid neurons).
-            'mean_activation_mse_weight': 0.1,
+            # Mean activation MSE removed; training uses only primary loss per mode
+            # No sampling rate needed; pipeline is domain-pure (probs or rates)
             # Scheduled sampling settings
             'scheduled_sampling': {
                 'enable': False,
@@ -341,14 +341,14 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(pbar, 1):
         # Batches are already on device and in bf16 via the prefetcher
-        spikes = batch['spikes']           # (B, L, N) bf16
+        spikes = batch['spikes']           # (B, L, N) bf16 when probs; fp32 or bf16 when rates
         positions = batch['positions']     # (B, N, 3) fp32
         mask = batch['neuron_mask']        # (B, N) bool/int
         stim = batch['stimulus']           # (B, L, K) bf16
 
         # Prepare seq2seq (input: 0..L-2, target: 1..L-1)
         x_in = spikes[:, :-1, :]
-        x_tgt = spikes[:, 1:, :].float()   # cast to fp32 for loss
+        x_tgt = spikes[:, 1:, :].float()   # target (prob or rate depending on data mode)
         stim_in = stim[:, :-1, :]
 
         if batch_idx % grad_accum == 1:
@@ -358,7 +358,8 @@ def train_one_epoch(
         # teacher-forced pass (previous-step predictions only). Training-only.
         ss_cfg = cfg.get('scheduled_sampling', {}) or {}
         ss_enable = bool(ss_cfg.get('enable', False))
-        if ss_enable:
+        # Disable scheduled sampling in rates mode (Bernoulli substitution not defined on rates)
+        if ss_enable and not bool(cfg.get('spikes_are_rates', False)):
             start_p = float(ss_cfg.get('start_prob', 0.0))
             end_p = float(ss_cfg.get('end_prob', 0.2))
             # Drive schedule by global batch step (increments every batch), spanning entire training
@@ -395,17 +396,13 @@ def train_one_epoch(
             cfg['ss_global_step'] = step_now + 1
 
         logits = model(x_in, stim_in, positions, mask, get_logits=True)  # (B, L-1, N) bf16
-        bce_loss = nn.BCEWithLogitsLoss()(logits.float(), x_tgt)         # fp32
-        # Mean activation MSE term
-        with torch.no_grad():
-            mask_rep = mask[:, None, :].expand(x_tgt.shape[0], x_tgt.shape[1], x_tgt.shape[2]).float()
-            denom = mask_rep.sum(dim=-1).clamp_min(1.0)
-        pred_mean = torch.sigmoid(logits.float())
-        pred_mean = (pred_mean * mask_rep).sum(dim=-1) / denom
-        targ_mean = (x_tgt * mask_rep).sum(dim=-1) / denom
-        mean_mse = torch.mean((pred_mean - targ_mean) ** 2)
-        alpha = float(cfg.get('mean_activation_mse_weight', 0.0) or 0.0)
-        loss = bce_loss + alpha * mean_mse
+        if bool(cfg.get('spikes_are_rates', False) or cfg.get('data', {}).get('spikes_are_rates', False)):
+            # Interpret logits as log-rate (unbounded). Use Poisson NLL with log_input=True
+            log_rate = logits.float()                 # fp32 for stability
+            target_rate = x_tgt                       # already fp32
+            loss = torch.nn.functional.poisson_nll_loss(log_rate, target_rate, log_input=True, reduction='mean')
+        else:
+            loss = nn.BCEWithLogitsLoss()(logits.float(), x_tgt)
         (loss / grad_accum).backward()
 
         if batch_idx % grad_accum == 0:
@@ -458,20 +455,18 @@ def train_one_epoch(
                 stim_in_v = stim_v[:, :-1, :]
                 with torch.no_grad():
                     logits_v = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
-                    vloss_bce = loss_fn(logits_v.float(), x_tgt_v)
-                    # Validation mean activation MSE (same as train)
-                    with torch.no_grad():
-                        mask_rep_v = mask_v[:, None, :].expand(x_tgt_v.shape[0], x_tgt_v.shape[1], x_tgt_v.shape[2]).float()
-                        denom_v = mask_rep_v.sum(dim=-1).clamp_min(1.0)
-                        probs_v = torch.sigmoid(logits_v.float())
-                        pred_mean_v = (probs_v * mask_rep_v).sum(dim=-1) / denom_v
-                        targ_mean_v = (x_tgt_v * mask_rep_v).sum(dim=-1) / denom_v
-                        mean_mse_v = torch.mean((pred_mean_v - targ_mean_v) ** 2)
-                    vloss = vloss_bce + float(cfg.get('mean_activation_mse_weight', 0.0) or 0.0) * mean_mse_v
-                    probs_v = torch.sigmoid(logits_v)
+                    if bool(cfg.get('spikes_are_rates', False)):
+                        log_rate_v = logits_v.float()
+                        vloss = torch.nn.functional.poisson_nll_loss(log_rate_v, x_tgt_v, log_input=True, reduction='mean')
+                        probs_v = torch.exp(log_rate_v)
+                        targs_prob_v = x_tgt_v
+                    else:
+                        vloss = loss_fn(logits_v.float(), x_tgt_v)
+                        probs_v = torch.sigmoid(logits_v)
+                        targs_prob_v = x_tgt_v
                 total_vloss += float(vloss.detach().cpu().item())
                 preds_all.append(probs_v.detach())
-                targs_all.append(x_tgt_v.detach())
+                targs_all.append(targs_prob_v.detach())
                 vb += 1
                 if vb >= val_sample_batches:
                     break
@@ -479,7 +474,9 @@ def train_one_epoch(
                 avg_vloss = total_vloss / vb
                 preds_all = torch.cat([p.flatten() for p in preds_all], dim=0)
                 targs_all = torch.cat([t.flatten() for t in targs_all], dim=0)
-                tracker.log_validation(epoch, batch_idx, preds_all, targs_all, avg_vloss)
+                # PR-AUC disabled
+                compute_auc = False
+                tracker.log_validation(epoch, batch_idx, preds_all, targs_all, avg_vloss, compute_auc=False)
                 # Sample video
                 try:
                     sample_batch = next(iter(val_loader))
@@ -499,7 +496,7 @@ def train_one_epoch(
                     spikes0 = spikes0[:, :L]
                     stim0 = stim0[:, :L]
                     sample_batch = {
-                        'spikes': spikes0,
+                        'spikes': spikes0.float(),
                         'positions': pos0,
                         'neuron_mask': mask0,
                         'stimulus': stim0,
@@ -557,16 +554,8 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         stim_in = stim[:, :-1, :]
 
         logits = model(x_in, stim_in, positions, mask, get_logits=True)
-        vloss_bce = loss_fn(logits.float(), x_tgt)
-        with torch.no_grad():
-            mask_rep = mask[:, None, :].expand(x_tgt.shape[0], x_tgt.shape[1], x_tgt.shape[2]).float()
-            denom = mask_rep.sum(dim=-1).clamp_min(1.0)
+        loss = loss_fn(logits.float(), x_tgt)
         probs = torch.sigmoid(logits.float())
-        pred_mean = (probs * mask_rep).sum(dim=-1) / denom
-        targ_mean = (x_tgt * mask_rep).sum(dim=-1) / denom
-        mean_mse = torch.mean((pred_mean - targ_mean) ** 2)
-        alpha = float(training_cfg.get('mean_activation_mse_weight', 0.0) or 0.0)
-        loss = vloss_bce + alpha * mean_mse
         total_loss += float(loss.detach().cpu().item())
         total_batches += 1
 
@@ -577,8 +566,8 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
     if preds_all and targs_all:
         preds_all = torch.cat([p.reshape(-1) for p in preds_all], dim=0)
         targs_all = torch.cat([t.reshape(-1) for t in targs_all], dim=0)
-        # Log a single aggregated row (batch_idx=1)
-        tracker.log_validation(epoch, 1, preds_all, targs_all, avg_loss)
+        # Log a single aggregated row (batch_idx=1); PR-AUC disabled
+        tracker.log_validation(epoch, 1, preds_all, targs_all, avg_loss, compute_auc=False)
     return {'val_loss': avg_loss}
 
 
@@ -596,10 +585,15 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
     x_tgt = spikes[:, 1:, :]
     stim_in = stim[:, :-1, :]
     logits = model(x_in, stim_in, positions, mask, get_logits=True)
-    probs = torch.sigmoid(logits)
+    if bool(cfg.get('spikes_are_rates', False) or cfg.get('data', {}).get('spikes_are_rates', False)):
+        preds_vis = torch.exp(logits)
+        truth_vis = x_tgt
+    else:
+        preds_vis = torch.sigmoid(logits)
+        truth_vis = x_tgt
     nextstep_path = videos_dir / f'nextstep_epoch_{epoch}.mp4'
     #pdb.set_trace()
-    create_nextstep_video(x_tgt, probs, positions, nextstep_path)
+    create_nextstep_video(truth_vis, preds_vis, positions, nextstep_path)
 
     # Autoregression demo (double-panel): use half window as context, half as truth horizon
     L_full = int(spikes.shape[1])
@@ -622,6 +616,7 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
         gen_seq = model.autoregress(init_x, init_stim, pos0, mask0, future_stim,
                                      n_steps=n_steps, context_len=context_len)
         ar_path = videos_dir / f'autoreg_epoch_{epoch}.mp4'
+        # In rates mode, spikes already hold rates; in prob mode spikes hold probabilities
         truth_horizon = spikes[0:1, context_len: context_len + n_steps, :]
         create_autoregression_video(gen_seq[:, -n_steps:, :], pos0, ar_path, truth=truth_horizon)
 
@@ -689,6 +684,11 @@ def main():
 
     model = GBM(d_model=mcfg['d_model'], d_stimuli=d_stimuli,
                 n_heads=mcfg['n_heads'], n_layers=mcfg['n_layers']).to(device)
+    # Propagate rates mode into model for forward(get_logits=False)
+    try:
+        model.spikes_are_rates = bool(cfg['data'].get('spikes_are_rates', False))
+    except Exception:
+        model.spikes_are_rates = False
 
     # Run the whole model in bf16 on CUDA (norms/centroids handled internally in fp32)
     if device.type == 'cuda':

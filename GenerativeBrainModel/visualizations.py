@@ -96,23 +96,25 @@ def create_nextstep_video(
                     print(f"[VideoGen] orig invalid at b={b} t={t}: shape={orig_vals.shape} minmax={[float(np.nanmin(orig_vals)) if orig_vals.size else None, float(np.nanmax(orig_vals)) if orig_vals.size else None]}")
                 if not np.isfinite(pred_vals).all() or pred_vals.size == 0:
                     print(f"[VideoGen] pred invalid at b={b} t={t}: shape={pred_vals.shape} minmax={[float(np.nanmin(pred_vals)) if pred_vals.size else None, float(np.nanmax(pred_vals)) if pred_vals.size else None]}")
-                # Normalize each independently to [0,255]
-                def _to_u8(a: np.ndarray) -> np.ndarray:
+                # Normalize Truth and Pred together to a shared [0,255] per-frame
+                def _scale_to_u8_shared(a: np.ndarray, amin: float, amax: float) -> np.ndarray:
                     if a.size == 0:
                         return a.astype(np.uint8)
-                    a = a.astype(np.float32)
-                    amin = float(a.min())
-                    amax = float(a.max())
-                    if not np.isfinite(amin) or not np.isfinite(amax):
+                    if not np.isfinite(amin) or not np.isfinite(amax) or amax <= amin + 1e-12:
                         return np.zeros_like(a, dtype=np.uint8)
-                    if amax <= amin + 1e-12:
-                        # If completely flat, produce a faint 1-LSB image to make presence visible
-                        return np.full_like(a, 1, dtype=np.uint8)
-                    a = (a - amin) / (amax - amin)
-                    a = np.clip(a * 255.0, 0.0, 255.0)
-                    return a.astype(np.uint8)
-                orig_u8 = _to_u8(orig_vals)
-                pred_u8 = _to_u8(pred_vals)
+                    a = ((a.astype(np.float32) - amin) / (amax - amin))
+                    return np.clip(a * 255.0, 0.0, 255.0).astype(np.uint8)
+
+                # Compute shared min/max across both panels for this frame
+                o_min = float(np.nanmin(orig_vals)) if orig_vals.size else 0.0
+                o_max = float(np.nanmax(orig_vals)) if orig_vals.size else 0.0
+                p_min = float(np.nanmin(pred_vals)) if pred_vals.size else 0.0
+                p_max = float(np.nanmax(pred_vals)) if pred_vals.size else 0.0
+                shared_min = min(o_min, p_min)
+                shared_max = max(o_max, p_max)
+
+                orig_u8 = _scale_to_u8_shared(orig_vals, shared_min, shared_max)
+                pred_u8 = _scale_to_u8_shared(pred_vals, shared_min, shared_max)
                 orig_img = _render_frame_2d(xy, orig_u8, panel_width, panel_height)
                 pred_img = _render_frame_2d(xy, pred_u8, panel_width, panel_height)
                 frame = np.concatenate([orig_img, pred_img], axis=1)
@@ -163,19 +165,30 @@ def create_autoregression_video(
             xy = pos_b[:, :2]
             for t in range(T):
                 vals_pred = generated[b, t]
-                # Normalize to [0,255]
-                def to_img(u: np.ndarray) -> np.ndarray:
-                    if u.size == 0:
-                        return np.zeros((panel_height, panel_width), dtype=np.uint8)
-                    amin = float(u.min()); amax = float(u.max())
-                    if not np.isfinite(amin) or not np.isfinite(amax) or amax <= amin + 1e-12:
-                        return np.zeros((panel_height, panel_width), dtype=np.uint8)
-                    u8 = ((u - amin) / (amax - amin) * 255.0).clip(0,255).astype(np.uint8)
-                    return _render_frame_2d(xy, u8, panel_width, panel_height)
-                pred_img = to_img(vals_pred)
+                # Compute shared min/max across Truth and Pred (if truth provided) per-frame
                 if two_panel:
                     vals_truth = truth_np[b, t]
-                    truth_img = to_img(vals_truth)
+                    t_min = float(np.nanmin(vals_truth)) if vals_truth.size else 0.0
+                    t_max = float(np.nanmax(vals_truth)) if vals_truth.size else 0.0
+                    p_min = float(np.nanmin(vals_pred)) if vals_pred.size else 0.0
+                    p_max = float(np.nanmax(vals_pred)) if vals_pred.size else 0.0
+                    shared_min = min(t_min, p_min)
+                    shared_max = max(t_max, p_max)
+                else:
+                    shared_min = float(np.nanmin(vals_pred)) if vals_pred.size else 0.0
+                    shared_max = float(np.nanmax(vals_pred)) if vals_pred.size else 0.0
+
+                def to_img_with_shared(u: np.ndarray, umin: float, umax: float) -> np.ndarray:
+                    if u.size == 0:
+                        return np.zeros((panel_height, panel_width), dtype=np.uint8)
+                    if not np.isfinite(umin) or not np.isfinite(umax) or umax <= umin + 1e-12:
+                        return np.zeros((panel_height, panel_width), dtype=np.uint8)
+                    u8 = ((u.astype(np.float32) - umin) / (umax - umin) * 255.0).clip(0,255).astype(np.uint8)
+                    return _render_frame_2d(xy, u8, panel_width, panel_height)
+
+                pred_img = to_img_with_shared(vals_pred, shared_min, shared_max)
+                if two_panel:
+                    truth_img = to_img_with_shared(vals_truth, shared_min, shared_max)
                     frame = np.concatenate([truth_img, pred_img], axis=1)
                 else:
                     frame = pred_img
