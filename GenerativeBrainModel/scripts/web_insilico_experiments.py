@@ -2,7 +2,7 @@
 """
 Web In-Silico Experiments for GBM
 
-- Loads a trained GBM and a AR sample H5 produced by eval_gbm.py
+- Loads a trained GBM and a good AR sample H5 produced by eval_gbm.py
 - Serves a Flask + Three.js UI to visualize initial context and AR outputs at 3 Hz
 - Lets users select brain regions and add a spike-rate delta to the last context frame
 - Clips the full initial sequence to [0,1] before AR (when configured)
@@ -44,7 +44,8 @@ class ServerConfig:
 
 @dataclass
 class DataConfig:
-    best_sample_h5: str = ''
+    good_sample_h5: str = ''  # preferred name
+    best_sample_h5: str = ''   # backward-compat alias
     mask_h5: str = ''
     spikes_are_rates: bool = False
     sampling_rate_hz: float = 3.0
@@ -218,26 +219,28 @@ class BestSample:
 # Path resolution helpers
 # --------------------------
 
-def resolve_best_sample_h5_path(path: str) -> str:
-    """Resolve a usable best-sample H5 path.
+def resolve_good_sample_h5_path(path: str) -> str:
+    """Resolve a usable good-sample H5 path.
     Accepts:
-      - Direct path to best_ar_sample_*_data.h5
+      - Direct path to *_data.h5 (best_ar_sample_* or good_ar_sample_*)
       - Direct path to any H5: if it lacks required datasets, try sibling matches
-      - Directory path to an eval run: search videos/ for best_ar_sample_*_data.h5
+      - Directory path to an eval run: search videos/ for good_ar_sample_*_data.h5 then best_ar_sample_*_data.h5
     Returns a valid file path or raises a ValueError with guidance.
     """
     if os.path.isdir(path):
-        # Search videos/ for best_ar_sample_*_data.h5
+        # prefer good sample, fallback to best sample
+        patterns = ('good_ar_sample_', 'best_ar_sample_')
         candidates: List[Tuple[float, str]] = []
         for root, _dirs, files in os.walk(path):
             if os.path.basename(root) != 'videos':
                 continue
-            for fn in files:
-                if fn.startswith('best_ar_sample_') and fn.endswith('_data.h5'):
-                    full = os.path.join(root, fn)
-                    candidates.append((os.path.getmtime(full), full))
+            for prefix in patterns:
+                for fn in files:
+                    if fn.startswith(prefix) and fn.endswith('_data.h5'):
+                        full = os.path.join(root, fn)
+                        candidates.append((os.path.getmtime(full), full))
         if not candidates:
-            raise ValueError(f"No best_ar_sample_*_data.h5 found under directory: {path}. Run eval_gbm.py to produce best sample outputs.")
+            raise ValueError(f"No good/best *_data.h5 found under directory: {path}. Run eval_gbm.py to produce sample outputs.")
         candidates.sort(reverse=True)
         return candidates[0][1]
 
@@ -246,29 +249,28 @@ def resolve_best_sample_h5_path(path: str) -> str:
             with h5py.File(path, 'r') as f:
                 if 'initial_context' in f:
                     return path
-                # Try siblings
         except Exception:
             pass
         parent = os.path.dirname(path)
-        sibs = [fn for fn in os.listdir(parent) if fn.startswith('best_ar_sample_') and fn.endswith('_data.h5')]
+        sibs = [fn for fn in os.listdir(parent) if (fn.startswith('good_ar_sample_') or fn.startswith('best_ar_sample_')) and fn.endswith('_data.h5')]
         if sibs:
             sibs_full = [os.path.join(parent, fn) for fn in sibs]
             sibs_full.sort(key=lambda p: os.path.getmtime(p), reverse=True)
             return sibs_full[0]
         raise ValueError(
-            f"H5 at {path} does not contain 'initial_context'. Expected a file like 'best_ar_sample_*_data.h5' produced by eval_gbm.py."
+            f"H5 at {path} does not contain 'initial_context'. Expected a file like 'good_ar_sample_*_data.h5' (or 'best_ar_sample_*_data.h5') produced by eval_gbm.py."
         )
 
     raise ValueError(f"Path not found: {path}")
 
 
-def load_best_sample_h5(path: str) -> BestSample:
-    resolved = resolve_best_sample_h5_path(path)
+def load_good_sample_h5(path: str) -> BestSample:
+    resolved = resolve_good_sample_h5_path(path)
     with h5py.File(resolved, 'r') as f:
         if 'initial_context' not in f or 'positions' not in f or 'neuron_mask' not in f:
             available = list(f.keys())
             raise ValueError(
-                "Best-sample H5 missing required datasets. Required: 'initial_context', 'positions', 'neuron_mask'. "
+                "Good-sample H5 missing required datasets. Required: 'initial_context', 'positions', 'neuron_mask'. "
                 f"Available: {available}. File: {resolved}"
             )
         init_ctx = f['initial_context'][()]  # (1, L, N)
@@ -622,33 +624,33 @@ def index():
     #viewport { flex: 1; position: relative; }
     #canvas { width: 100%; height: 100%; display: block; }
     .control-group { margin-bottom: 18px; }
-    .control-group h3 { margin: 0 0 10px 0; color: #ffb38a; }
+    .control-group h3 { margin: 0 0 10px 0; color: #8cffc4; }
     label { font-size: 12px; }
     input[type="range"] { width: 100%; }
-    button { background: linear-gradient(90deg, #3a273a, #402a2a); color: #f7f3f0; border: 1px solid #ff9f6e; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin: 2px; box-shadow: 0 0 10px rgba(255,159,110,0.22), 0 0 14px rgba(255,155,209,0.16); }
-    button:hover { filter: brightness(1.08); box-shadow: 0 0 12px rgba(255,179,130,0.30), 0 0 16px rgba(255,155,209,0.22); border-color: #ffc08e; }
+    button { background: linear-gradient(90deg, #20332b, #1c2b26); color: #f2f7f4; border: 1px solid #00e6a8; padding: 8px 12px; border-radius: 6px; cursor: pointer; margin: 2px; box-shadow: 0 0 10px rgba(0,230,168,0.26), 0 0 14px rgba(90,200,220,0.10); }
+    button:hover { filter: brightness(1.07); box-shadow: 0 0 12px rgba(0,255,193,0.34), 0 0 16px rgba(90,200,220,0.16); border-color: #00ffc1; }
     .region-list { max-height: 240px; overflow-y: auto; border: 1px solid #2a2a3a; padding: 10px; border-radius: 6px; background: rgba(13,13,20,0.6); }
     .region-item { margin: 3px 0; font-size: 11px; }
     #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); background: rgba(0,0,0,0.8); color: white; padding: 20px; border-radius: 10px; z-index: 1000; }
  
-    /* Warm neon sliders */
+    /* Subtle neon-green sliders */
     input[type="range"] { -webkit-appearance: none; height: 6px; border-radius: 4px; background: #2a2a3a; outline: none; }
-    input[type="range"]::-webkit-slider-runnable-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(255,120,160,0.5), rgba(255,180,90,0.35)); }
-    input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #0e0e16; border: 2px solid #ff9bd1; box-shadow: 0 0 10px rgba(255,155,209,0.32), 0 0 12px rgba(255,179,90,0.20); margin-top: -6px; }
-    input[type="range"]::-moz-range-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(255,120,160,0.5), rgba(255,180,90,0.35)); }
-    input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: #0e0e16; border: 2px solid #ff9bd1; box-shadow: 0 0 10px rgba(255,155,209,0.32), 0 0 12px rgba(255,179,90,0.20); }
+    input[type="range"]::-webkit-slider-runnable-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,230,168,0.55), rgba(120,255,220,0.35)); }
+    input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #0e0e16; border: 2px solid #00e6a8; box-shadow: 0 0 10px rgba(0,230,168,0.34), 0 0 12px rgba(120,255,220,0.18); margin-top: -6px; }
+    input[type="range"]::-moz-range-track { height: 6px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,230,168,0.55), rgba(120,255,220,0.35)); }
+    input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: #0e0e16; border: 2px solid #00e6a8; box-shadow: 0 0 10px rgba(0,230,168,0.34), 0 0 12px rgba(120,255,220,0.18); }
  
     /* Checkbox accent color */
-    input[type="checkbox"] { accent-color: #ff9bd1; }
+    input[type="checkbox"] { accent-color: #00e6a8; }
  
     /* Scrollbar styling for region list (WebKit) */
     .region-list::-webkit-scrollbar { width: 10px; }
     .region-list::-webkit-scrollbar-track { background: rgba(20,20,28,0.45); border-radius: 6px; }
-    .region-list::-webkit-scrollbar-thumb { background: linear-gradient(180deg, rgba(255,155,209,0.7), rgba(255,179,90,0.5)); border-radius: 6px; }
+    .region-list::-webkit-scrollbar-thumb { background: linear-gradient(180deg, rgba(0,230,168,0.7), rgba(120,255,220,0.5)); border-radius: 6px; }
  
     /* Video controls bar styling */
     #video-controls { background: linear-gradient(0deg, rgba(10,10,14,0.92), rgba(10,10,14,0.68)); border-top: 1px solid #2a2a3a; }
-    #time-display { color: #e6d8cf; }
+    #time-display { color: #c8cce0; }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
@@ -1331,9 +1333,10 @@ def main():
         else:
             MODEL = MODEL.to(dtype=torch.float32)
 
-    # Load best sample and mask
-    assert os.path.exists(CFG.data.best_sample_h5), f"Best sample H5 not found: {CFG.data.best_sample_h5}"
-    BEST = load_best_sample_h5(CFG.data.best_sample_h5)
+    # Load good sample and mask
+    sample_path = CFG.data.good_sample_h5 or CFG.data.best_sample_h5
+    assert sample_path and os.path.exists(sample_path), f"Good sample H5 not found: {sample_path}"
+    BEST = load_good_sample_h5(sample_path)
     assert os.path.exists(CFG.data.mask_h5), f"Mask H5 not found: {CFG.data.mask_h5}"
     MASK = load_mask_h5(CFG.data.mask_h5)
     REGION_TO_NEURON = map_neurons_to_regions(BEST.positions_norm, MASK)
