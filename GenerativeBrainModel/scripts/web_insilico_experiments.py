@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 from flask import Flask, request, jsonify, render_template_string, send_file, session, make_response
 import yaml
+import requests
 
 from GenerativeBrainModel.models.gbm import GBM
 
@@ -41,6 +42,7 @@ class ServerConfig:
     port: int = 8054
     debug: bool = False
     secret_key: str = 'change-me'
+    turnstile_site_key: str = ''  # optional; if set, UI renders Turnstile widget
 
 @dataclass
 class DataConfig:
@@ -344,6 +346,7 @@ class ExperimentJob:
     error: Optional[str] = None
     result_npz_path: Optional[str] = None
     heatmap_path: Optional[str] = None
+    heatmap_info: Optional[Dict[str, Any]] = None
     result_frames: Optional[np.ndarray] = None  # (Tgen, N)
 
 
@@ -587,6 +590,10 @@ def worker_loop():
                             fig.savefig(heatmap_path, dpi=130, bbox_inches='tight')
                             plt.close(fig)
                             job.heatmap_path = heatmap_path
+                            try:
+                                job.heatmap_info = {'requested_steps': int(Texp), 'baseline_steps': int(Tbase), 'used_steps': int(T)}
+                            except Exception:
+                                job.heatmap_info = None
                         else:
                             job.heatmap_path = None
                     except Exception as e:
@@ -661,12 +668,33 @@ def index():
     .region-item label { transition: color 0.12s ease, text-shadow 0.12s ease; }
     .region-item label:hover { color: #ffc2ae; text-shadow: 0 0 6px rgba(255,106,61,0.35); }
     .region-item input[type="checkbox"]:checked + label { color: #ffe0d6; text-shadow: 0 0 6px rgba(255,106,61,0.25); }
+ 
+    /* Mobile layout */
+    #toggle-controls { display: none; position: fixed; top: 10px; left: 10px; z-index: 1003; background: rgba(14,32,48,0.9); color: #ecf8ff; border: 1px solid #33c2ff; border-radius: 8px; padding: 8px 10px; font-size: 14px; }
+    @media (max-width: 768px) {
+      #controls { width: 100vw; max-height: 70vh; position: fixed; left: 0; top: 0; transform: translateY(-100%); transition: transform 200ms ease-in-out; padding: 12px 14px; background: rgba(0,0,0,0.65); backdrop-filter: blur(4px); }
+      #controls.open { transform: translateY(0); }
+      #toggle-controls { display: inline-block; }
+      .control-group h3 { font-size: 16px; }
+      button { padding: 10px 14px; font-size: 14px; }
+      input[type="range"] { height: 8px; }
+      input[type="range"]::-webkit-slider-thumb { width: 20px; height: 20px; margin-top: -8px; }
+      input[type="range"]::-moz-range-thumb { width: 20px; height: 20px; }
+      .region-list { max-height: 40vh; }
+      #status-text { bottom: 72px; font-size: 18px; }
+      #video-controls { gap: 10px; padding: 8px 10px; }
+      #time-display { width: 140px; font-size: 13px; }
+    }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  {% if ts_key %}
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+  {% endif %}
 </head>
 <body>
   <div id="container"> 
+    <button id="toggle-controls">Menu</button>
     <div id="controls">
       <h2 style="margin-top:0;">Zebrafish Brain In-Silico Experiment Platform</h2>
 
@@ -674,7 +702,7 @@ def index():
         <h3>Playback</h3>
          <div class="slider-container">
            <label for="point-size">Point Size</label>
-           <input type="range" id="point-size" min="0.5" max="4.0" value="2.0gi" step="0.1" />
+           <input type="range" id="point-size" min="0.5" max="4.0" value="2.0" step="0.1" />
          </div>
          <div class="slider-container">
            <label for="opacity">Opacity</label>
@@ -701,6 +729,11 @@ def index():
           <label>AR Steps:</label>
           <input type="number" id="ar-steps" value="{{ ar_default }}" step="1" min="1" />
         </div>
+        {% if ts_key %}
+        <div style="margin:6px 0;">
+          <div class="cf-turnstile" data-sitekey="{{ ts_key }}" data-theme="auto" data-action="run_experiment"></div>
+        </div>
+        {% endif %}
         <div>
           <button id="run-experiment">Run Experiment</button>
         </div>
@@ -720,6 +753,7 @@ def index():
           <span>Autoregression Heatmap (scroll to zoom, drag to pan)</span>
           <button id="close-heatmap">Close</button>
         </div>
+        <div id="heatmap-note" style="color:#cccccc; font-size:12px; margin: 2px 0 6px 0; display:none;"></div>
         <div id="heatmap-viewport" style="position:relative; width:100%; height:calc(100% - 32px); overflow:hidden; background:#111; cursor:grab;">
           <div id="heatmap-content" style="position:absolute; top:0; left:0; transform-origin: 0 0;">
             <img id="heatmap-img" alt="Heatmap" style="display:none; user-select:none; pointer-events:none;" />
@@ -730,7 +764,10 @@ def index():
         <div id="status-text" style="position:absolute; bottom:56px; left:50%; transform:translateX(-50%); color:#aaaaaa; font-size:24px; background:rgba(0,0,0,0.4); padding:4px 8px; border-radius:4px;">Viewing initial brain activity</div>
         <div id="video-controls" style="position:absolute; bottom:0; left:0; right:0; background:linear-gradient(0deg, rgba(10,10,14,0.92), rgba(10,10,14,0.68)); padding:6px 8px; display:flex; align-items:center; gap:8px; z-index: 1001;">
           <button id="play-pause">Pause</button>
-          <input type="range" id="progress" min="0" max="0" step="0.001" value="0" style="flex:1;">
+          <div id="progress-wrap" style="position:relative; flex:1; display:flex; align-items:center;">
+            <div id="progress-segments" style="position:absolute; left:6px; right:6px; height:4px; border-radius:3px; background:linear-gradient(90deg, #4ea3ff 0%, #4ea3ff 100%); z-index:0;"></div>
+            <input type="range" id="progress" min="0" max="0" step="0.001" value="0" style="flex:1; position:relative; z-index:1; background:transparent;">
+          </div>
           <span id="time-display" style="color:#c8cce0; font-size:12px; width:120px; text-align:right;">00:00 / 00:00</span>
         </div>
         <div style="position:absolute; top:8px; right:12px; z-index:1002;">
@@ -911,6 +948,18 @@ def index():
       progress.value = playbackTimeSec.toFixed(3);
       const td = document.getElementById('time-display');
       td.textContent = `${formatTime(playbackTimeSec)} / ${formatTime(totalDurationSec)}`;
+      // Update segment bar to indicate initial vs generated
+      try {
+        const seg = document.getElementById('progress-segments');
+        if (seg) {
+          const initLen = (initialFrames && initialFrames.length) ? initialFrames.length : 0;
+          const totalLen = (playbackFrames && playbackFrames.length) ? playbackFrames.length : initLen;
+          const ratio = totalLen > 0 ? Math.max(0, Math.min(1, initLen / totalLen)) : 1;
+          const pct = (ratio * 100).toFixed(2) + '%';
+          // Left (initial) neon blue, right (generated) orange hint
+          seg.style.background = `linear-gradient(90deg, #4ea3ff 0%, #4ea3ff ${pct}, #ff8a5c ${pct}, #ff8a5c 100%)`;
+        }
+      } catch (e) {}
     }
 
     function renderFrameAtTime(tSec) {
@@ -1022,7 +1071,22 @@ def index():
       const selected = Array.from(document.querySelectorAll('#region-list input[type=checkbox]:checked')).map(cb => parseInt(cb.value));
       const rateDelta = parseFloat(document.getElementById('rate-delta').value);
       const arSteps = parseInt(document.getElementById('ar-steps').value);
+      // Turnstile token (if widget rendered)
+      let cfToken = null;
+      const tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+      if (tokenInput) { cfToken = tokenInput.value || null; }
+      if (tokenInput && !cfToken) {
+        alert('Please complete the verification.');
+        return;
+      }
       const resp = await fetch('/api/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ regions: selected, add_rate_hz: rateDelta, ar_steps: arSteps }) });
+      // Re-send including token if present (backward compatible server may ignore)
+      if (resp.status === 400 || resp.status === 403) {
+        const resp2 = await fetch('/api/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ regions: selected, add_rate_hz: rateDelta, ar_steps: arSteps, cf_turnstile_token: cfToken }) });
+        const data2 = await resp2.json();
+        if (!resp2.ok) { alert(data2.error || 'Submit failed'); return; }
+        pollStatus(data2.job_id); return;
+      }
       const data = await resp.json();
       if (!resp.ok) { alert(data.error || 'Submit failed'); return; }
       pollStatus(data.job_id);
@@ -1040,7 +1104,7 @@ def index():
         else if (r.status === 'running') { qs.textContent = 'Running...'; }
         else if (r.status === 'complete') {
           clearInterval(timer);
-          qs.textContent = 'Complete';
+          qs.textContent = 'Complete (loading results...)';
           const fr = await fetchJSON(`/api/result_frames/${jobId}`);
           generatedFrames = fr.generated_frames;
           playbackFrames = initialFrames.concat(generatedFrames);
@@ -1049,11 +1113,13 @@ def index():
           statusText.textContent = 'Viewing initial + generated activity';
           links.style.display = 'block';
           const heatmapName = r.heatmap || `${jobId}.png`;
+          const heatmapInfo = r.heatmap_info || null;
           document.getElementById('download-npz').onclick = () => window.location = `/api/download/${jobId}.npz`;
           document.getElementById('open-heatmap').onclick = async () => {
             const overlay = document.getElementById('heatmap-overlay');
             const img = document.getElementById('heatmap-img');
             const err = document.getElementById('heatmap-error');
+            const note = document.getElementById('heatmap-note');
             const candidates = [`/api/heatmap/${heatmapName}`, `/api/heatmap/${jobId}.png`];
             let loaded = false;
             for (const url of candidates) {
@@ -1064,6 +1130,12 @@ def index():
                   img.src = URL.createObjectURL(blob);
                   img.style.display = 'inline-block';
                   err.style.display = 'none';
+                  if (heatmapInfo && heatmapInfo.baseline_steps && heatmapInfo.requested_steps && heatmapInfo.baseline_steps < heatmapInfo.requested_steps) {
+                    note.textContent = `Note: baseline data is limited to ${heatmapInfo.baseline_steps} steps; showing first ${heatmapInfo.used_steps} of ${heatmapInfo.requested_steps} requested steps.`;
+                    note.style.display = 'block';
+                  } else {
+                    note.style.display = 'none';
+                  }
                   overlay.style.display = 'block';
                   loaded = true;
                   // Reset zoom/pan
@@ -1093,9 +1165,12 @@ def index():
             if (!loaded) {
               img.style.display = 'none';
               err.style.display = 'block';
+              if (note) note.style.display = 'none';
               overlay.style.display = 'block';
             }
           };
+          // Now mark queue status as complete
+          qs.textContent = 'Complete';
         } else if (r.status === 'error') {
           clearInterval(timer); qs.textContent = 'Error: ' + (r.error || '');
           statusText.textContent = 'Viewing initial brain activity';
@@ -1109,6 +1184,26 @@ def index():
     document.addEventListener('DOMContentLoaded', () => {
       initThree();
       loadInit();
+      // Mobile controls toggle
+      const toggleBtn = document.getElementById('toggle-controls');
+      const controlsPanel = document.getElementById('controls');
+      if (toggleBtn && controlsPanel) {
+        const isMobile = window.matchMedia('(max-width: 768px)').matches;
+        if (isMobile) {
+          controlsPanel.classList.remove('open');
+          toggleBtn.addEventListener('click', () => {
+            controlsPanel.classList.toggle('open');
+          });
+          // Close on outside tap
+          document.addEventListener('click', (e) => {
+            if (!controlsPanel.contains(e.target) && e.target !== toggleBtn) {
+              controlsPanel.classList.remove('open');
+            }
+          }, true);
+        } else {
+          controlsPanel.classList.add('open');
+        }
+      }
       document.getElementById('play-pause').onclick = () => { isPlaying = !isPlaying; document.getElementById('play-pause').textContent = isPlaying ? 'Pause' : 'Play'; };
       document.getElementById('progress').oninput = (e) => {
         const t = parseFloat(e.target.value);
@@ -1156,7 +1251,7 @@ def index():
 </body>
 </html>
 """
-    response = make_response(render_template_string(html_template, ts=ts, ar_default=int(CFG.ar.default_ar_steps), fps=float(CFG.data.sampling_rate_hz)))
+    response = make_response(render_template_string(html_template, ts=ts, ar_default=int(CFG.ar.default_ar_steps), fps=float(CFG.data.sampling_rate_hz), ts_key=getattr(CFG.server, 'turnstile_site_key', '') or None))
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
@@ -1191,6 +1286,25 @@ def api_submit():
     selected_regions = body.get('regions', [])
     add_rate_hz = float(body.get('add_rate_hz', 0.0))
     ar_steps = int(body.get('ar_steps', CFG.ar.default_ar_steps))
+    # Turnstile verification (if configured)
+    try:
+        ts_secret = os.environ.get('TURNSTILE_SECRET', '').strip()
+        ts_site = getattr(CFG.server, 'turnstile_site_key', '')
+        cf_token = body.get('cf_turnstile_token')
+        if ts_secret and ts_site:
+            if not cf_token:
+                return jsonify({'error': 'verification_required'}), 403
+            v = requests.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', data={
+                'secret': ts_secret,
+                'response': cf_token,
+                'remoteip': request.remote_addr
+            }, timeout=5)
+            vj = v.json() if v.ok else {'success': False}
+            if not vj.get('success'):
+                return jsonify({'error': 'verification_failed'}), 403
+    except Exception:
+        # On verification error, fail closed only if secret/site are set
+        return jsonify({'error': 'verification_error'}), 403
 
     # One job at a time per session
     sid = session.get('sid')
@@ -1234,7 +1348,7 @@ def api_status():
     if job.status == 'running':
         return jsonify({'job_id': job_id, 'status': job.status})
     if job.status == 'complete':
-        return jsonify({'job_id': job_id, 'status': job.status, 'heatmap': os.path.basename(job.heatmap_path) if job.heatmap_path else None})
+        return jsonify({'job_id': job_id, 'status': job.status, 'heatmap': os.path.basename(job.heatmap_path) if job.heatmap_path else None, 'heatmap_info': job.heatmap_info})
     return jsonify({'job_id': job_id, 'status': job.status, 'error': job.error})
 
 
