@@ -29,6 +29,7 @@ import torch.nn as nn
 from flask import Flask, request, jsonify, render_template_string, send_file, session, make_response
 import yaml
 import requests
+import shutil
 
 from GenerativeBrainModel.models.gbm import GBM
 
@@ -52,6 +53,7 @@ class DataConfig:
     spikes_are_rates: bool = False
     sampling_rate_hz: float = 3.0
     clip_01_before_ar: bool = True
+    baseline_npz: str = ''  # optional path to precomputed baseline NPZ with key 'baseline_future'
 
 @dataclass
 class ModelConfig:
@@ -391,6 +393,12 @@ class ExperimentQueue:
 # --------------------------
 
 app = Flask(__name__)
+# Secure session cookie flags
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax'
+)
 
 # Global runtime objects (populated in main)
 CFG: AppConfig
@@ -402,6 +410,33 @@ REGION_TO_NEURON: Dict[int, np.ndarray]
 QUEUE_OBJ: ExperimentQueue
 SESSION_TO_JOB: Dict[str, str] = {}
 RUNTIME_LOCK = threading.Lock()
+BASELINE_FUTURE: Optional[np.ndarray] = None  # (Tbase, N) baseline used for heatmap/NPZ
+
+
+def cleanup_old_experiment_dirs(root_dir: str, max_age_hours: int = 4) -> None:
+    """Delete subdirectories under root_dir older than max_age_hours.
+    Safe-guards: only removes directories directly under root_dir.
+    """
+    try:
+        now = time.time()
+        cutoff = now - float(max_age_hours) * 3600.0
+        if not os.path.isdir(root_dir):
+            return
+        for entry in os.listdir(root_dir):
+            full = os.path.join(root_dir, entry)
+            if not os.path.isdir(full):
+                continue
+            try:
+                mtime = os.path.getmtime(full)
+            except Exception:
+                continue
+            if mtime < cutoff:
+                try:
+                    shutil.rmtree(full)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def to_torch(x: np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -516,16 +551,25 @@ def worker_loop():
             for j_idx, job in enumerate(batch):
                 try:
                     gen_future = results_per_job[j_idx]  # (n_steps, N)
+                    # If no regions selected, use the external baseline for exact equality (regardless of rate delta)
+                    try:
+                        no_regions = (not job.selected_region_ids) or (np.size(job.selected_region_ids) == 0)
+                        if no_regions and BASELINE_FUTURE is not None and isinstance(BASELINE_FUTURE, np.ndarray):
+                            n_steps = int(job.ar_steps)
+                            if BASELINE_FUTURE.ndim == 2 and BASELINE_FUTURE.shape[0] >= n_steps:
+                                gen_future = BASELINE_FUTURE[:n_steps].astype(np.float32)
+                    except Exception:
+                        pass
                     job.result_frames = gen_future
-                    # Save NPZ
-                    out_dir = os.path.join(CFG.storage.output_root, time.strftime('%Y%m%d_%H%M%S'))
+                    # Save NPZ: make directory unique with timestamp + job_id
+                    out_dir = os.path.join(CFG.storage.output_root, f"{time.strftime('%Y%m%d_%H%M%S')}_{job.job_id}")
                     os.makedirs(out_dir, exist_ok=True)
                     npz_path = os.path.join(out_dir, f'{job.job_id}.npz')
                     np.savez_compressed(
                         npz_path,
                         initial_context=BEST.initial_context[0],
                         generated_future=gen_future,
-                        baseline_future=BEST.pred_future[0] if BEST.pred_future is not None else np.zeros((0, BEST.initial_context.shape[2]), dtype=np.float32),
+                        baseline_future=(BASELINE_FUTURE if BASELINE_FUTURE is not None else (BEST.pred_future[0] if BEST.pred_future is not None else np.zeros((0, BEST.initial_context.shape[2]), dtype=np.float32))),
                         positions=BEST.positions_norm[0],
                         neuron_mask=BEST.neuron_mask[0],
                         selected_regions=np.array(job.selected_region_ids, dtype=np.int32),
@@ -541,67 +585,70 @@ def worker_loop():
                         matplotlib.use('Agg')
                         import matplotlib.pyplot as plt
                         # Compute baseline vs generated sums for selected regions
-                        if BEST.pred_future is not None:
-                            base = BEST.pred_future[0]  # (Tbase, N)
-                            Texp = gen_future.shape[0]
-                            Tbase = base.shape[0]
-                            T = min(Texp, Tbase)
-                            base = base[:T]
-                            exp = gen_future[:T]
-                            # Build heatmap matrix (R x T)
-                            rows = []
-                            row_labels = []
-                            eps = 1e-6
-                            # Whole brain (all valid neurons by mask)
-                            try:
-                                valid_idx = np.where(BEST.neuron_mask[0].astype(bool))[0]
-                            except Exception:
-                                valid_idx = np.arange(base.shape[1], dtype=np.int64)
-                            if valid_idx.size > 0:
-                                base_sum_wb = base[:, valid_idx].sum(axis=1)
-                                exp_sum_wb = exp[:, valid_idx].sum(axis=1)
-                                rel_wb = (exp_sum_wb - base_sum_wb) / np.maximum(base_sum_wb, eps)
-                                rows.append(rel_wb.astype(np.float32))
-                            else:
-                                rows.append(np.zeros((T,), dtype=np.float32))
-                            row_labels.append('Whole brain')
-
-                            # All regions
-                            for rid in range(1, len(MASK.region_names) + 1):
-                                idxs = REGION_TO_NEURON.get(rid, np.array([], dtype=np.int64))
-                                if idxs.size == 0:
-                                    rows.append(np.zeros((T,), dtype=np.float32))
-                                    row_labels.append(f'{MASK.region_names[rid - 1]} (empty)')
-                                    continue
-                                base_sum = base[:, idxs].sum(axis=1)
-                                exp_sum = exp[:, idxs].sum(axis=1)
-                                rel = (exp_sum - base_sum) / np.maximum(base_sum, eps)
-                                rows.append(rel.astype(np.float32))
-                                row_labels.append(MASK.region_names[rid - 1])
-                            mat = np.stack(rows, axis=0) if rows else np.zeros((1, 1), dtype=np.float32)
-                            fig, ax = plt.subplots(figsize=(max(6, T * 0.25), max(4, len(row_labels) * 0.22)))
-                            im = ax.imshow(mat, aspect='auto', cmap='bwr', vmin=-1.0, vmax=1.0, interpolation='nearest')
-                            ax.set_xlabel('AR timestep')
-                            ax.set_ylabel('Region')
-                            ax.set_yticks(np.arange(len(row_labels)))
-                            ax.set_yticklabels(row_labels)
-                            fig.colorbar(im, ax=ax, shrink=0.8, label='(exp - base)/base')
-                            fig.tight_layout()
-                            fig.savefig(heatmap_path, dpi=130, bbox_inches='tight')
-                            plt.close(fig)
-                            job.heatmap_path = heatmap_path
-                            try:
-                                job.heatmap_info = {'requested_steps': int(Texp), 'baseline_steps': int(Tbase), 'used_steps': int(T)}
-                            except Exception:
-                                job.heatmap_info = None
+                        # Always use external baseline
+                        base = BASELINE_FUTURE
+                        Texp = gen_future.shape[0]
+                        Tbase = base.shape[0]
+                        T = min(Texp, Tbase)
+                        base = base[:T]
+                        exp = gen_future[:T]
+                        # Build heatmap matrix (R x T)
+                        rows = []
+                        row_labels = []
+                        eps = 1e-6
+                        # Whole brain (all valid neurons by mask)
+                        try:
+                            valid_idx = np.where(BEST.neuron_mask[0].astype(bool))[0]
+                        except Exception:
+                            valid_idx = np.arange(base.shape[1], dtype=np.int64)
+                        if valid_idx.size > 0:
+                            base_sum_wb = base[:, valid_idx].sum(axis=1)
+                            exp_sum_wb = exp[:, valid_idx].sum(axis=1)
+                            rel_wb = (exp_sum_wb - base_sum_wb) / np.maximum(base_sum_wb, eps)
+                            rows.append(rel_wb.astype(np.float32))
                         else:
-                            job.heatmap_path = None
+                            rows.append(np.zeros((T,), dtype=np.float32))
+                        row_labels.append('Whole brain')
+
+                        # All regions
+                        for rid in range(1, len(MASK.region_names) + 1):
+                            idxs = REGION_TO_NEURON.get(rid, np.array([], dtype=np.int64))
+                            if idxs.size == 0:
+                                rows.append(np.zeros((T,), dtype=np.float32))
+                                row_labels.append(f'{MASK.region_names[rid - 1]} (empty)')
+                                continue
+                            base_sum = base[:, idxs].sum(axis=1)
+                            exp_sum = exp[:, idxs].sum(axis=1)
+                            rel = (exp_sum - base_sum) / np.maximum(base_sum, eps)
+                            rows.append(rel.astype(np.float32))
+                            row_labels.append(MASK.region_names[rid - 1])
+                        mat = np.stack(rows, axis=0) if rows else np.zeros((1, 1), dtype=np.float32)
+                        fig, ax = plt.subplots(figsize=(max(6, T * 0.25), max(4, len(row_labels) * 0.22)))
+                        im = ax.imshow(mat, aspect='auto', cmap='bwr', vmin=-1.0, vmax=1.0, interpolation='nearest')
+                        ax.set_xlabel('AR timestep')
+                        ax.set_ylabel('Region')
+                        ax.set_yticks(np.arange(len(row_labels)))
+                        ax.set_yticklabels(row_labels)
+                        fig.colorbar(im, ax=ax, shrink=0.8, label='(exp - base)/base')
+                        fig.tight_layout()
+                        fig.savefig(heatmap_path, dpi=130, bbox_inches='tight')
+                        plt.close(fig)
+                        job.heatmap_path = heatmap_path
+                        try:
+                            job.heatmap_info = {'requested_steps': int(Texp), 'baseline_steps': int(Tbase), 'used_steps': int(T)}
+                        except Exception:
+                            job.heatmap_info = None
                     except Exception as e:
                         job.heatmap_path = None
                     job.status = 'complete'
                 except Exception as e:
                     job.status = 'error'
                     job.error = str(e)
+            # Periodic cleanup after processing a batch job
+            try:
+                cleanup_old_experiment_dirs(CFG.storage.output_root, max_age_hours=24)
+            except Exception:
+                pass
         except Exception as e:
             # Mark all as error
             for job in batch:
@@ -685,6 +732,9 @@ def index():
       #video-controls { gap: 10px; padding: 8px 10px; }
       #time-display { width: 140px; font-size: 13px; }
     }
+    
+    /* Invert-colors toggle */
+    body.invert-colors { filter: invert(1) hue-rotate(180deg); }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
@@ -708,6 +758,9 @@ def index():
            <label for="opacity">Opacity</label>
            <input type="range" id="opacity" min="0.1" max="1.0" value="0.85" step="0.05" />
          </div>
+         <div style="margin-top:8px;">
+           <button id="toggle-invert">Invert Colors</button>
+         </div>
        </div>
 
       <div class="control-group">
@@ -722,7 +775,7 @@ def index():
       <div class="control-group">
         <h3>Experiment</h3>
         <div>
-          <label>Spike-rate delta (Hz):</label>
+          <label>Spike-probability delta:</label>
           <input type="number" id="rate-delta" value="0.2" step="0.05" min="0" />
         </div>
         <div>
@@ -731,7 +784,7 @@ def index():
         </div>
         {% if ts_key %}
         <div style="margin:6px 0;">
-          <div class="cf-turnstile" data-sitekey="{{ ts_key }}" data-theme="auto" data-action="run_experiment"></div>
+          <div id="turnstile-widget" class="cf-turnstile" data-sitekey="{{ ts_key }}" data-theme="auto" data-action="run_experiment" data-callback="onTsSuccess" data-expired-callback="onTsExpired" data-error-callback="onTsError"></div>
         </div>
         {% endif %}
         <div>
@@ -739,8 +792,8 @@ def index():
         </div>
         <div id="queue-status" style="margin-top:8px;font-size:12px;color:#ccc;">Queue: idle</div>
         <div id="result-links" style="display:none;margin-top:8px;">
-          <button id="download-npz">Download NPZ</button>
-          <button id="open-heatmap">Open Heatmap</button>
+          <button id="download-npz">Download initial and predicted activity data (NPZ)</button>
+          <button id="open-heatmap">Open Region Activity Heatmap</button>
         </div>
       </div>
     </div>
@@ -765,9 +818,16 @@ def index():
         <div id="video-controls" style="position:absolute; bottom:0; left:0; right:0; background:linear-gradient(0deg, rgba(10,10,14,0.92), rgba(10,10,14,0.68)); padding:6px 8px; display:flex; align-items:center; gap:8px; z-index: 1001;">
           <button id="play-pause">Pause</button>
           <div id="progress-wrap" style="position:relative; flex:1; display:flex; align-items:center;">
-            <div id="progress-segments" style="position:absolute; left:6px; right:6px; height:4px; border-radius:3px; background:linear-gradient(90deg, #4ea3ff 0%, #4ea3ff 100%); z-index:0;"></div>
-            <input type="range" id="progress" min="0" max="0" step="0.001" value="0" style="flex:1; position:relative; z-index:1; background:transparent;">
-          </div>
+            <div id="progress-segments" style="position:absolute; left:6px; right:6px; height:10px; border-radius:5px; z-index:0; pointer-events:none; background:#0f0f1a; border:1px solid #333;">
+              <div id="seg-initial" style="position:absolute; left:0; top:0; bottom:0; width:100%; background:linear-gradient(90deg, #4ea3ff, #66ccff); border-radius:5px; box-shadow: inset 0 0 4px rgba(78,163,255,0.5);"></div>
+              <div id="seg-generated" style="position:absolute; right:0; top:0; bottom:0; width:0%; background:#bb33ff; border-radius:5px; box-shadow: 0 0 12px rgba(187,51,255,1.0); display:none;"></div>
+            </div>
+             <input type="range" id="progress" min="0" max="0" step="0.001" value="0" style="flex:1; position:relative; z-index:1; background:transparent;">
+             <div id="progress-legend" style="position:absolute; left:6px; right:6px; bottom:-16px; display:flex; justify-content:space-between; font-size:11px; color:#c8cce0; pointer-events:none;">
+               <span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#4ea3ff;margin-right:6px;"></span>Initial</span>
+              <span>Generated<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#bb33ff;margin-left:6px;"></span></span>
+             </div>
+           </div>
           <span id="time-display" style="color:#c8cce0; font-size:12px; width:120px; text-align:right;">00:00 / 00:00</span>
         </div>
         <div style="position:absolute; top:8px; right:12px; z-index:1002;">
@@ -950,14 +1010,24 @@ def index():
       td.textContent = `${formatTime(playbackTimeSec)} / ${formatTime(totalDurationSec)}`;
       // Update segment bar to indicate initial vs generated
       try {
-        const seg = document.getElementById('progress-segments');
-        if (seg) {
-          const initLen = (initialFrames && initialFrames.length) ? initialFrames.length : 0;
-          const totalLen = (playbackFrames && playbackFrames.length) ? playbackFrames.length : initLen;
-          const ratio = totalLen > 0 ? Math.max(0, Math.min(1, initLen / totalLen)) : 1;
-          const pct = (ratio * 100).toFixed(2) + '%';
-          // Left (initial) neon blue, right (generated) orange hint
-          seg.style.background = `linear-gradient(90deg, #4ea3ff 0%, #4ea3ff ${pct}, #ff8a5c ${pct}, #ff8a5c 100%)`;
+        const initLen = (initialFrames && initialFrames.length) ? initialFrames.length : 0;
+        const totalLen = (playbackFrames && playbackFrames.length) ? playbackFrames.length : initLen;
+        const ratio = totalLen > 0 ? Math.max(0, Math.min(1, initLen / totalLen)) : 1;
+        const pct = (ratio * 100).toFixed(2) + '%';
+        const segInit = document.getElementById('seg-initial');
+        const segGen = document.getElementById('seg-generated');
+        if (segInit && segGen) {
+          const hasGen = (totalLen > initLen);
+          if (hasGen) {
+            // Show both segments: initial takes left portion, generated takes right
+            segInit.style.width = pct;
+            segGen.style.width = (100 - ratio * 100).toFixed(2) + '%';
+            segGen.style.display = 'block';
+          } else {
+            // Only initial segment, full width
+            segInit.style.width = '100%';
+            segGen.style.display = 'none';
+          }
         }
       } catch (e) {}
     }
@@ -1039,10 +1109,18 @@ def index():
       const rl = document.getElementById('region-list');
       rl.innerHTML = '';
       for (let i=0;i<regionNames.length;i++) {
-        const div = document.createElement('div');
-        div.className = 'region-item';
-        div.innerHTML = `<input type="checkbox" value="${i+1}" id="region-${i+1}"/> <label for="region-${i+1}">${regionNames[i]}</label>`
-        rl.appendChild(div);
+        const wrap = document.createElement('div');
+        wrap.className = 'region-item';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = String(i+1);
+        cb.id = `region-${i+1}`;
+        const label = document.createElement('label');
+        label.setAttribute('for', cb.id);
+        label.textContent = String(regionNames[i] ?? `Region ${i+1}`);
+        wrap.appendChild(cb);
+        wrap.appendChild(label);
+        rl.appendChild(wrap);
       }
       document.getElementById('select-all').onclick = async () => {
         document.querySelectorAll('#region-list input[type=checkbox]').forEach(cb => cb.checked = true);
@@ -1067,28 +1145,52 @@ def index():
       document.getElementById('loading').style.display = 'none';
     }
 
+    // ---- Turnstile helpers ----
+    let tsLastToken = null;
+    function onTsSuccess(token) { tsLastToken = token; }
+    function onTsExpired() { tsLastToken = null; }
+    function onTsError() { tsLastToken = null; }
+    function getTurnstileToken() {
+      try {
+        if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+          const token = window.turnstile.getResponse(); // first widget
+          if (token && token.length > 0) return token;
+        }
+      } catch (e) { /* ignore */ }
+      const input = document.querySelector('input[name="cf-turnstile-response"]');
+      return (input && input.value) ? input.value : tsLastToken;
+    }
+    function resetTurnstile() {
+      try { if (window.turnstile && typeof window.turnstile.reset === 'function') window.turnstile.reset(); } catch (e) { /* ignore */ }
+      tsLastToken = null;
+    }
+
     async function submitExperiment() {
       const selected = Array.from(document.querySelectorAll('#region-list input[type=checkbox]:checked')).map(cb => parseInt(cb.value));
       const rateDelta = parseFloat(document.getElementById('rate-delta').value);
       const arSteps = parseInt(document.getElementById('ar-steps').value);
-      // Turnstile token (if widget rendered)
-      let cfToken = null;
-      const tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-      if (tokenInput) { cfToken = tokenInput.value || null; }
-      if (tokenInput && !cfToken) {
-        alert('Please complete the verification.');
+      const cfToken = getTurnstileToken();
+      if (!cfToken) { alert('Please complete the verification.'); return; }
+      let resp, data;
+      try {
+        resp = await fetch('/api/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ regions: selected, add_rate_hz: rateDelta, ar_steps: arSteps, cf_turnstile_token: cfToken }) });
+        data = await resp.json();
+      } catch (e) {
+        resetTurnstile();
+        alert('Network error submitting experiment');
+        return;
+      } finally {
+        // Always refresh token after an attempt (tokens are single-use)
+        resetTurnstile();
+      }
+      if (!resp.ok) {
+        if (resp.status === 403 && (data && (data.error === 'verification_failed' || data.error === 'verification_error' || data.error === 'verification_required'))) {
+          alert('Verification failed or expired. Please complete the verification again.');
+        } else {
+          alert((data && data.error) || 'Submit failed');
+        }
         return;
       }
-      const resp = await fetch('/api/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ regions: selected, add_rate_hz: rateDelta, ar_steps: arSteps }) });
-      // Re-send including token if present (backward compatible server may ignore)
-      if (resp.status === 400 || resp.status === 403) {
-        const resp2 = await fetch('/api/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ regions: selected, add_rate_hz: rateDelta, ar_steps: arSteps, cf_turnstile_token: cfToken }) });
-        const data2 = await resp2.json();
-        if (!resp2.ok) { alert(data2.error || 'Submit failed'); return; }
-        pollStatus(data2.job_id); return;
-      }
-      const data = await resp.json();
-      if (!resp.ok) { alert(data.error || 'Submit failed'); return; }
       pollStatus(data.job_id);
     }
 
@@ -1114,7 +1216,7 @@ def index():
           links.style.display = 'block';
           const heatmapName = r.heatmap || `${jobId}.png`;
           const heatmapInfo = r.heatmap_info || null;
-          document.getElementById('download-npz').onclick = () => window.location = `/api/download/${jobId}.npz`;
+          document.getElementById('download-npz').onclick = () => window.location = `/api/download/${jobId}`;
           document.getElementById('open-heatmap').onclick = async () => {
             const overlay = document.getElementById('heatmap-overlay');
             const img = document.getElementById('heatmap-img');
@@ -1171,12 +1273,16 @@ def index():
           };
           // Now mark queue status as complete
           qs.textContent = 'Complete';
+          // Refresh verification token for next submission
+          resetTurnstile();
         } else if (r.status === 'error') {
           clearInterval(timer); qs.textContent = 'Error: ' + (r.error || '');
           statusText.textContent = 'Viewing initial brain activity';
+          resetTurnstile();
         } else {
           qs.textContent = 'Queue: idle';
           statusText.textContent = 'Viewing initial brain activity';
+          resetTurnstile();
         }
       }, 1000);
     }
@@ -1214,6 +1320,13 @@ def index():
       };
       document.getElementById('point-size').oninput = (e) => { if (material) material.uniforms.uPointSize.value = parseFloat(e.target.value); };
       document.getElementById('opacity').oninput = (e) => { if (material) material.uniforms.uGlobalOpacity.value = parseFloat(e.target.value); };
+      const invertBtn = document.getElementById('toggle-invert');
+      if (invertBtn) {
+        invertBtn.onclick = () => {
+          const inverted = document.body.classList.toggle('invert-colors');
+          invertBtn.textContent = inverted ? 'Normal Colors' : 'Invert Colors';
+        };
+      }
       document.getElementById('run-experiment').onclick = () => { submitExperiment(); };
       document.getElementById('reset-view').onclick = () => {
         generatedFrames = null;
@@ -1283,27 +1396,51 @@ def api_init_data():
 @app.route('/api/submit', methods=['POST'])
 def api_submit():
     body = request.get_json(force=True)
-    selected_regions = body.get('regions', [])
-    add_rate_hz = float(body.get('add_rate_hz', 0.0))
-    ar_steps = int(body.get('ar_steps', CFG.ar.default_ar_steps))
-    # Turnstile verification (if configured)
+    # Input structure validation
+    if not isinstance(body, dict):
+        return jsonify({'error': 'invalid_json'}), 400
+    selected_regions = body.get('regions')
+    add_rate_hz_raw = body.get('add_rate_hz')
+    ar_steps_raw = body.get('ar_steps')
+    if not isinstance(selected_regions, list):
+        return jsonify({'error': 'invalid_regions'}), 400
+    if any((not isinstance(r, (int, float))) for r in selected_regions):
+        return jsonify({'error': 'invalid_region_ids'}), 400
     try:
-        ts_secret = os.environ.get('TURNSTILE_SECRET', '').strip()
-        ts_site = getattr(CFG.server, 'turnstile_site_key', '')
-        cf_token = body.get('cf_turnstile_token')
-        if ts_secret and ts_site:
-            if not cf_token:
-                return jsonify({'error': 'verification_required'}), 403
-            v = requests.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', data={
-                'secret': ts_secret,
-                'response': cf_token,
-                'remoteip': request.remote_addr
-            }, timeout=5)
-            vj = v.json() if v.ok else {'success': False}
-            if not vj.get('success'):
-                return jsonify({'error': 'verification_failed'}), 403
+        add_rate_hz = float(add_rate_hz_raw)
     except Exception:
-        # On verification error, fail closed only if secret/site are set
+        return jsonify({'error': 'invalid_add_rate_hz'}), 400
+    try:
+        ar_steps = int(ar_steps_raw if ar_steps_raw is not None else CFG.ar.default_ar_steps)
+    except Exception:
+        return jsonify({'error': 'invalid_ar_steps'}), 400
+    # Hard caps
+    if add_rate_hz < 0.0:
+        return jsonify({'error': 'invalid_add_rate_range'}), 400
+    MAX_AR_STEPS = 128
+    if ar_steps < 1 or ar_steps > MAX_AR_STEPS:
+        return jsonify({'error': f'ar_steps_out_of_range_max_{MAX_AR_STEPS}'}), 400
+    if len(selected_regions) > 1024:
+        return jsonify({'error': 'too_many_regions'}), 400
+    # Unconditional Turnstile verification
+    ts_secret = os.environ.get('TURNSTILE_SECRET', '').strip()
+    ts_site = getattr(CFG.server, 'turnstile_site_key', '')
+    cf_token = body.get('cf_turnstile_token')
+    if not ts_secret or not ts_site:
+        return jsonify({'error': 'verification_not_configured'}), 503
+    if not cf_token:
+        return jsonify({'error': 'verification_required'}), 403
+    try:
+        v = requests.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', data={
+            'secret': ts_secret,
+            'response': cf_token,
+            'remoteip': request.remote_addr
+        }, timeout=5)
+        v.raise_for_status()
+        vj = v.json()
+        if not vj.get('success'):
+            return jsonify({'error': 'verification_failed'}), 403
+    except Exception:
         return jsonify({'error': 'verification_error'}), 403
 
     # One job at a time per session
@@ -1360,17 +1497,18 @@ def api_result_frames(job_id: str):
     return jsonify({'generated_frames': job.result_frames.tolist()})
 
 
-@app.route('/api/download/<path:filename>')
-def api_download_npz(filename: str):
-    full_path = os.path.join(CFG.storage.output_root, filename)
+@app.route('/api/download/<job_id>')
+def api_download_npz(job_id: str):
+    job = QUEUE_OBJ.find(job_id)
+    if not job or not job.result_npz_path:
+        return jsonify({'error': 'Not available'}), 404
+    # Path safety: ensure file exists and is under the configured output root
+    full_path = os.path.realpath(job.result_npz_path)
+    root_real = os.path.realpath(CFG.storage.output_root)
+    if not full_path.startswith(root_real + os.sep) and full_path != root_real:
+        return jsonify({'error': 'invalid_path'}), 400
     if not os.path.exists(full_path):
-        # Also search dated subdirs
-        for root, _dirs, files in os.walk(CFG.storage.output_root):
-            if filename in files:
-                full_path = os.path.join(root, filename)
-                break
-    if not os.path.exists(full_path):
-        return jsonify({'error': 'File not found'}), 404
+        return jsonify({'error': 'missing_file'}), 404
     return send_file(full_path, as_attachment=True)
 
 
@@ -1437,7 +1575,7 @@ def main():
     parser.add_argument('--config', required=True, help='Path to YAML config')
     args = parser.parse_args()
 
-    global CFG, DEVICE, MODEL, BEST, MASK, REGION_TO_NEURON, QUEUE_OBJ
+    global CFG, DEVICE, MODEL, BEST, MASK, REGION_TO_NEURON, QUEUE_OBJ, BASELINE_FUTURE
 
     CFG = load_yaml_config(args.config)
 
@@ -1476,6 +1614,17 @@ def main():
 
     # Ensure output root
     os.makedirs(CFG.storage.output_root, exist_ok=True)
+
+    # Require external baseline NPZ for heatmap/NPZ outputs
+    BASELINE_FUTURE = None
+    base_npz = (getattr(CFG.data, 'baseline_npz', '') or '').strip()
+    assert base_npz, "data.baseline_npz must be set to a baseline NPZ containing 'baseline_future'"
+    assert os.path.exists(base_npz), f"Baseline NPZ not found: {base_npz}"
+    data_npz = np.load(base_npz)
+    assert 'baseline_future' in data_npz, f"Baseline NPZ missing key 'baseline_future': {base_npz}"
+    bf = data_npz['baseline_future']
+    assert isinstance(bf, np.ndarray) and bf.ndim == 2, f"Baseline 'baseline_future' must be 2D (T,N). Got shape: {getattr(bf, 'shape', None)}"
+    BASELINE_FUTURE = bf.astype(np.float32)
 
     # Start worker thread
     QUEUE_OBJ = ExperimentQueue(max_batch_size=int(CFG.ui.max_batch_size))

@@ -248,8 +248,10 @@ class RoutingFlashMHA(nn.Module):
         out_h = out_h / counts.clamp_min(1.0).view(-1, 1, 1)
 
         # DDP-safe EMA update (single pass across batch)
-        with torch.no_grad():
-            self._ema_update_ddp(ema_sums, ema_counts, k_needed)
+        # Freeze centroid EMA during inference to ensure deterministic eval behavior
+        if self.training:
+            with torch.no_grad():
+                self._ema_update_ddp(ema_sums, ema_counts, k_needed)
 
         return self.out_proj(out_h.reshape(Ttot, D))
 
