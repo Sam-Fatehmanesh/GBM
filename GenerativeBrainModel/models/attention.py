@@ -51,6 +51,9 @@ class RoutingFlashMHA(nn.Module):
         # Fused QKV
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-4)
+        if self.out_proj.bias is not None:
+            nn.init.normal_(self.out_proj.bias, mean=0.0, std=1e-4)
 
         # Spherical routing norm over shared routing features (per-token Dh)
         self.route_ln = nn.LayerNorm(self.head_dim, elementwise_affine=False)
