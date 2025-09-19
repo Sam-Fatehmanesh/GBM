@@ -236,7 +236,7 @@ def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_
 
 def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path, 
                              num_neurons=10, stim=None, behavior=None, eye=None, 
-                             is_probability=True):
+                             is_probability=True, value_label=None):
     """
     Create visualization PDF showing calcium traces and spike probabilities.
     
@@ -446,7 +446,7 @@ def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path,
                 ax[1].set_title('Spike Probabilities (CASCADE)')
                 ax[1].set_ylabel('Probability')
             else:
-                ax[1].set_title('Processed Calcium (baseline-corrected)')
+                ax[1].set_title(value_label if value_label is not None else 'Processed Calcium (baseline-corrected)')
                 ax[1].set_ylabel('Signal')
             ax[1].set_xlabel('Frame')
             
@@ -468,7 +468,7 @@ def process_subject(subject_dir, config):
     subject_name = os.path.basename(os.path.normpath(subject_dir))
     
     # Process raw calcium data
-    print(f"\nProcessing subject: {subject_name} using {'CASCADE' if not config['processing'].get('skip_cascade', False) else 'baseline-only (skip CASCADE)'}")
+    print(f"\nProcessing subject: {subject_name} using {'CASCADE' if not config['processing'].get('skip_cascade', False) else 'z-scored calcium (skip CASCADE)'}")
         
     # Create output directory
     os.makedirs(config['data']['output_dir'], exist_ok=True)
@@ -754,23 +754,23 @@ def process_subject(subject_dir, config):
         # Use actual sampling rate for further processing
         effective_sampling_rate = target_rate or orig_rate or fpsec
 
-        # Apply baseline correction based on configuration
-        processed_calcium = compute_baseline_correction(
-            calcium,
-            config['data']['window_length'],
-            config['data']['baseline_percentile'],
-            effective_sampling_rate,
-            config['data']['is_raw'],
-            config['data']['apply_baseline_subtraction']
-        )
-        
-        # Clean up calcium to free memory
-        del calcium
-        gc.collect()
-
-        # Depending on config, either run CASCADE to get probabilities, or skip and use processed calcium directly
+        # Depending on config, either run CASCADE (with baseline correction) or skip and use z-scored calcium directly
         skip_cascade = bool(config['processing'].get('skip_cascade', False))
         if not skip_cascade:
+            # Apply baseline correction based on configuration (for CASCADE mode only)
+            processed_calcium = compute_baseline_correction(
+                calcium,
+                config['data']['window_length'],
+                config['data']['baseline_percentile'],
+                effective_sampling_rate,
+                config['data']['is_raw'],
+                config['data']['apply_baseline_subtraction']
+            )
+
+            # Clean up calcium to free memory
+            del calcium
+            gc.collect()
+
             prob_data = run_cascade_inference(
                 processed_calcium,
                 config['processing']['batch_size'],
@@ -780,10 +780,20 @@ def process_subject(subject_dir, config):
             # Clean up after CASCADE
             del processed_calcium
             gc.collect()
+            zscore_mean = None
+            zscore_std = None
         else:
-            # Use baseline-corrected calcium as the output (N, T) expected downstream
-            prob_data = processed_calcium.T  # (N, T)
-            processed_calcium = None
+            # No baseline correction in no-cascade mode; z-score normalize calcium per neuron
+            # calcium shape: (T, N) → compute per-neuron params along axis=0
+            zscore_mean = np.mean(calcium, axis=0).astype(np.float32)
+            zscore_std = np.std(calcium, axis=0).astype(np.float32)
+            std_safe = np.where(zscore_std == 0.0, 1.0, zscore_std)
+            z_calcium = (calcium - zscore_mean) / std_safe
+            # Output is (N, T)
+            prob_data = z_calcium.T
+            # Clean up
+            del z_calcium, calcium
+            gc.collect()
         
         # Optionally downsample neural data back to original rate
         if return_to_original and orig_rate is not None and target_rate is not None and orig_rate != target_rate:
@@ -863,6 +873,17 @@ def process_subject(subject_dir, config):
 
             # Sampling rate information (always included)
             f.create_dataset('original_sampling_rate_hz', data=fpsec)
+
+            # Save z-score parameters if in no-cascade mode
+            if skip_cascade and zscore_mean is not None and zscore_std is not None:
+                f.create_dataset('zscore_mean',
+                                 data=zscore_mean.astype(output_dtype),
+                                 compression='gzip',
+                                 compression_opts=1)
+                f.create_dataset('zscore_std',
+                                 data=zscore_std.astype(output_dtype),
+                                 compression='gzip',
+                                 compression_opts=1)
 
             # Save additional datasets if requested
             if config['output'].get('include_additional_data', True):
@@ -945,6 +966,7 @@ def process_subject(subject_dir, config):
             behavior=behavior_full,
             eye=eye_full,
             is_probability=(not skip_cascade),
+            value_label=('Z-scored Calcium' if skip_cascade else None),
         )
             
             # Clean up memory
