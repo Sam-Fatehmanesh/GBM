@@ -7,11 +7,11 @@ The `unified_spike_processing.py` script processes calcium imaging data through 
 ## Pipeline Summary
 
 ```
-Raw Calcium Traces → Baseline Correction → CASCADE Inference → Direct Probability Output
+Raw Calcium Traces → Baseline Correction → [CASCADE Inference | Skip] → Output
 ```
 
 **Key Features:**
-- CASCADE-only spike detection (no OASIS support)
+- CASCADE spike detection (optional; can be skipped)
 - Configurable baseline correction (proper ΔF/F or baseline subtraction)
 - Direct probability time series output (T, N) format
 - Cell spatial positions preserved as (N, 3) coordinates
@@ -98,6 +98,7 @@ processing:
   batch_size: 5000                           # CASCADE batch size
   workers: 1                                 # Number of parallel workers
   seed: 42                                   # Random seed
+  skip_cascade: false                        # If true, skip CASCADE and save processed calcium
   original_sampling_rate: 2.73               # Original sampling rate (Hz)
   target_sampling_rate: 2.5                  # Target sampling rate (Hz)
   return_to_original_rate: false             # Downsample neural data back to original rate after CASCADE
@@ -117,6 +118,18 @@ output:
 | `true`   | `true` or `false`            | ΔF/F: `(F - F0) / F0` |
 | `false`  | `true`                       | Baseline subtraction: `F - F0` |
 | `false`  | `false`                      | No processing (original data) |
+
+#### CASCADE Mode vs Skip Mode
+
+- When `processing.skip_cascade: false` (default):
+  - Runs CASCADE to produce spike probabilities in [0,1].
+  - Output dataset name: `spike_probabilities` (T, N).
+
+- When `processing.skip_cascade: true`:
+  - Skips CASCADE; saves baseline-corrected calcium values (unclamped, real-valued).
+  - Output dataset name: `processed_calcium` (T, N).
+  - Attributes include `skip_cascade: true` and `cascade_model: 'skipped'`.
+  - Visualization PDF second panel shows processed calcium instead of probabilities.
 
 ---
 
@@ -269,14 +282,14 @@ Based on the analysis output, you can optimize processing parameters:
 
 #### Main Datasets
 
-**`spike_probabilities`** - Spike probability time series data
-- **Shape**: `(T, N)`
-  - `T` = Number of timepoints
-  - `N` = Number of neurons
-- **Data Type**: Configurable (default: `float16`)
-- **Values**: Continuous spike probabilities `[0.0, 1.0]`
-- **Compression**: gzip level 1
-- **Chunking**: `(min(1000, T), min(100, N))` for efficient access
+Primary time-series dataset (always present):
+
+- `neuron_values`
+  - Shape: `(T, N)`; dtype configurable (default `float16`)
+  - Values: either probabilities in [0,1] (CASCADE mode) or baseline-corrected calcium (skip mode, unclamped)
+  - Compression: gzip level 1; Chunking: `(min(1000, T), min(100, N))`
+
+Backward-compatibility: older files may contain `spike_probabilities`, `spike_rates_hz`, or `processed_calcium` instead of `neuron_values`.
 
 **`cell_positions`** - 3D spatial coordinates of neurons
 - **Shape**: `(N, 3)`
@@ -335,7 +348,8 @@ The following datasets are included when `include_additional_data: true` in conf
 **Processing Information:**
 - `subject`: Subject name (string)
 - `data_source`: Always `'raw_calcium'`
-- `cascade_model`: CASCADE model used (string)
+- `cascade_model`: CASCADE model used (string; `'skipped'` if skip mode)
+- `skip_cascade`: Boolean indicating CASCADE was skipped
 - `calcium_dataset`: Dataset name used from TimeSeries.h5
 - `spike_dtype`: Data type used for spike probabilities
 - `position_dtype`: Data type used for cell positions
@@ -359,7 +373,9 @@ The following datasets are included when `include_additional_data: true` in conf
 - Multiple pages (one per visualized neuron)
 - Each page contains 2 subplots:
   1. **Raw Calcium Trace** - Original fluorescence signal over time
-  2. **Spike Probabilities** - CASCADE-inferred probabilities over time
+  2. **Second Panel**
+     - Spike Probabilities (CASCADE) when skip_cascade=false
+     - Processed Calcium (baseline-corrected) when skip_cascade=true
 - Default: 10 randomly selected neurons (configurable)
 
 ---
@@ -397,10 +413,10 @@ The following datasets are included when `include_additional_data: true` in conf
    - Percentile-based baseline computation
    - Choice between ΔF/F or baseline subtraction
 
-3. **CASCADE Inference**
-   - Batched processing to avoid memory issues
-   - Probability clipping to `[0, 1]` range
-   - NaN/infinity handling with graceful fallback
+3. **CASCADE Inference (optional)**
+   - When enabled, batched processing to avoid memory issues
+   - Probability clipping to `[0, 1]` range; NaN/inf handling
+   - When disabled, processed calcium is used directly as output
 
 ### Memory Management
 
@@ -594,6 +610,7 @@ The script automatically reports:
 - **2025-01-18**: Changed interpolation for non-neural data (stimulus, behavior, eye) to zero-order hold to preserve discrete values
 - **2025-01-18**: Enhanced neuron filtering using IX_inval_anat with absIX mapping and added support for additional datasets (anat_stack, stimulus_full, behavior_full, eye_full)
 - **2025-01-18**: Removed volumetric processing - now saves spike probabilities as (T, N) time series and cell positions as (N, 3) coordinates directly
+- **2025-09-19**: Added `processing.skip_cascade` to optionally skip CASCADE and save baseline-corrected calcium as `processed_calcium` with dynamic visualization and metadata updates
 - **2025-07-18**: Initial 3D volumetric processing pipeline
 - **2025-07-18**: Added proper ΔF/F support and reorganized configuration
 - **2025-07-18**: Simplified file structure and merged metadata

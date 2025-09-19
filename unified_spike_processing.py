@@ -80,6 +80,7 @@ def create_default_config():
             'batch_size': 5000,
             'workers': 1,
             'seed': 42,
+            'skip_cascade': False,
             'original_sampling_rate': None,  # Required for CASCADE
             'target_sampling_rate': None,    # Required for CASCADE
             'return_to_original_rate': False,  # If True, downsample neural data back to original rate after CASCADE
@@ -234,7 +235,8 @@ def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_
 
 
 def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path, 
-                             num_neurons=10, stim=None, behavior=None, eye=None):
+                             num_neurons=10, stim=None, behavior=None, eye=None, 
+                             is_probability=True):
     """
     Create visualization PDF showing calcium traces and spike probabilities.
     
@@ -259,9 +261,12 @@ def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path,
         per_frame_var = prob_data.var(axis=0)
         global_mean = float(prob_data.mean())
         global_var = float(prob_data.var())
-        sparsity_frac = float((prob_data < 1e-3).sum()) / float(prob_data.size)
-        active_frac = 1.0 - sparsity_frac
-        frac_active_gt_1pct = float((prob_data > 1e-2).mean())
+        if is_probability:
+            sparsity_frac = float((prob_data < 1e-3).sum()) / float(prob_data.size)
+            active_frac = 1.0 - sparsity_frac
+            frac_active_gt_1pct = float((prob_data > 1e-2).mean())
+        else:
+            sparsity_frac = active_frac = frac_active_gt_1pct = 0.0
         pn_mean_mean = float(per_neuron_mean.mean())
         pn_mean_median = float(np.median(per_neuron_mean))
         pn_var_mean = float(per_neuron_var.mean())
@@ -284,11 +289,13 @@ def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path,
             lines = [
                 f"Neurons (N): {N}",
                 f"Timepoints (T): {T}",
-                f"Global mean prob: {global_mean:.6f}",
-                f"Global var prob: {global_var:.6f}",
-                f"Sparsity (<1e-3): {sparsity_frac:.4f}",
-                f"Active frac: {active_frac:.4f}",
-                f"Frac >1%: {frac_active_gt_1pct:.4f}",
+                (f"Global mean prob: {global_mean:.6f}" if is_probability else f"Global mean signal: {global_mean:.6f}"),
+                (f"Global var prob: {global_var:.6f}" if is_probability else f"Global var signal: {global_var:.6f}"),
+                *( [
+                    f"Sparsity (<1e-3): {sparsity_frac:.4f}",
+                    f"Active frac: {active_frac:.4f}",
+                    f"Frac >1%: {frac_active_gt_1pct:.4f}",
+                ] if is_probability else [] ),
                 f"Per-neuron mean (mean/median): {pn_mean_mean:.6f} / {pn_mean_median:.6f}",
                 f"Per-neuron var (mean): {pn_var_mean:.6f}",
                 f"Per-frame mean (mean): {pf_mean_mean:.6f}",
@@ -300,7 +307,7 @@ def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path,
             ax1 = axes[0, 1]
             if per_neuron_mean is not None:
                 ax1.hist(per_neuron_mean, bins=50, color='steelblue', alpha=0.8)
-                ax1.set_title('Histogram: per-neuron mean prob')
+                ax1.set_title('Histogram: per-neuron mean' + (" prob" if is_probability else " signal"))
             else:
                 ax1.axis('off')
 
@@ -308,9 +315,9 @@ def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path,
             ax2 = axes[1, 0]
             if per_frame_mean is not None:
                 ax2.plot(per_frame_mean, color='darkmagenta', lw=0.8)
-                ax2.set_title('Per-frame mean prob over time')
+                ax2.set_title('Per-frame mean ' + ("prob" if is_probability else "signal") + ' over time')
                 ax2.set_xlabel('Frame')
-                ax2.set_ylabel('Mean prob')
+                ax2.set_ylabel('Mean ' + ("prob" if is_probability else "signal"))
             else:
                 ax2.axis('off')
 
@@ -433,10 +440,14 @@ def create_visualization_pdf(calcium_data, prob_data, subject_name, output_path,
             ax[0].set_title(f'Neuron {idx}: Raw Calcium')
             ax[0].set_ylabel('Fluorescence')
             
-            # Spike probabilities
+            # Second panel: probabilities or processed calcium
             ax[1].plot(prob_data[idx], 'm')
-            ax[1].set_title('Spike Probabilities (CASCADE)')
-            ax[1].set_ylabel('Probability')
+            if is_probability:
+                ax[1].set_title('Spike Probabilities (CASCADE)')
+                ax[1].set_ylabel('Probability')
+            else:
+                ax[1].set_title('Processed Calcium (baseline-corrected)')
+                ax[1].set_ylabel('Signal')
             ax[1].set_xlabel('Frame')
             
             plt.tight_layout()
@@ -457,7 +468,7 @@ def process_subject(subject_dir, config):
     subject_name = os.path.basename(os.path.normpath(subject_dir))
     
     # Process raw calcium data
-    print(f"\nProcessing subject: {subject_name} using CASCADE")
+    print(f"\nProcessing subject: {subject_name} using {'CASCADE' if not config['processing'].get('skip_cascade', False) else 'baseline-only (skip CASCADE)'}")
         
     # Create output directory
     os.makedirs(config['data']['output_dir'], exist_ok=True)
@@ -756,18 +767,23 @@ def process_subject(subject_dir, config):
         # Clean up calcium to free memory
         del calcium
         gc.collect()
-        
-                # Run CASCADE inference
-        prob_data = run_cascade_inference(
-            processed_calcium, 
-            config['processing']['batch_size'], 
-            config['cascade']['model_type'],
-            effective_sampling_rate
-                )
-                
-                # Clean up after CASCADE
-        del processed_calcium
-        gc.collect()
+
+        # Depending on config, either run CASCADE to get probabilities, or skip and use processed calcium directly
+        skip_cascade = bool(config['processing'].get('skip_cascade', False))
+        if not skip_cascade:
+            prob_data = run_cascade_inference(
+                processed_calcium,
+                config['processing']['batch_size'],
+                config['cascade']['model_type'],
+                effective_sampling_rate
+            )
+            # Clean up after CASCADE
+            del processed_calcium
+            gc.collect()
+        else:
+            # Use baseline-corrected calcium as the output (N, T) expected downstream
+            prob_data = processed_calcium.T  # (N, T)
+            processed_calcium = None
         
         # Optionally downsample neural data back to original rate
         if return_to_original and orig_rate is not None and target_rate is not None and orig_rate != target_rate:
@@ -810,11 +826,11 @@ def process_subject(subject_dir, config):
             del prob_data_T, downsampled_prob_data
             gc.collect()
         
-        # Prepare data for saving - transpose probabilities to (T, N) format and convert to configured dtype
-        print("  → Preparing probability data for saving...")
+        # Prepare data for saving - transpose to (T, N) format and convert to configured dtype
+        print("  → Preparing output data for saving...")
         output_dtype = getattr(np, config['output']['dtype'])
 
-        # Handle NaN values in probability data
+        # Handle NaN values in output data
         prob_data = np.nan_to_num(prob_data, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Transpose to (T, N) and convert to specified dtype
@@ -827,11 +843,11 @@ def process_subject(subject_dir, config):
         print(f"  → Saving final data to {final_file}")
         with h5py.File(final_file, 'w') as f:
                 # Save main datasets
-            f.create_dataset('spike_probabilities',
-                            data=prob_data_transposed,
-                            chunks=(min(1000, T), min(100, N)),
-                            compression='gzip',
-                            compression_opts=1)
+            f.create_dataset('neuron_values',
+                             data=prob_data_transposed,
+                             chunks=(min(1000, T), min(100, N)),
+                             compression='gzip',
+                             compression_opts=1)
 
             f.create_dataset('cell_positions',
                              data=cell_positions,
@@ -902,12 +918,13 @@ def process_subject(subject_dir, config):
             f.attrs['positions_source'] = 'CellXYZ_norm' if cell_xyz_norm_available else 'CellXYZ_normalized_runtime'
             f.attrs['positions_min'] = pos_min.astype(np.float32)
             f.attrs['positions_max'] = pos_max.astype(np.float32)
-            f.attrs['cascade_model'] = config['cascade']['model_type']
+            f.attrs['cascade_model'] = config['cascade']['model_type'] if not skip_cascade else 'skipped'
             f.attrs['calcium_dataset'] = config['data']['calcium_dataset']
             f.attrs['is_raw'] = config['data']['is_raw']
             f.attrs['apply_baseline_subtraction'] = config['data']['apply_baseline_subtraction']
             f.attrs['window_length'] = config['data']['window_length']
             f.attrs['baseline_percentile'] = config['data']['baseline_percentile']
+            f.attrs['skip_cascade'] = skip_cascade
             f.attrs['original_sampling_rate'] = config['processing'].get('original_sampling_rate', fpsec)
             f.attrs['target_sampling_rate'] = config['processing'].get('target_sampling_rate', fpsec)
             f.attrs['effective_sampling_rate'] = effective_sampling_rate
@@ -927,6 +944,7 @@ def process_subject(subject_dir, config):
             stim=(stim_full if stim_full is not None else None),
             behavior=behavior_full,
             eye=eye_full,
+            is_probability=(not skip_cascade),
         )
             
             # Clean up memory
@@ -1213,14 +1231,16 @@ def main():
         analyze_raw_data(config)
         return
     
-    # Validate CASCADE availability
-    if not CASCADE_AVAILABLE:
-        print("Error: CASCADE not available. Please install neuralib.")
-        return
+    # Validate CASCADE availability when needed
+    if not config['processing'].get('skip_cascade', False):
+        if not CASCADE_AVAILABLE:
+            print("Error: CASCADE not available. Please install neuralib or set processing.skip_cascade: true")
+            return
     
     # Validate required parameters
-    if not config['processing'].get('original_sampling_rate') or not config['processing'].get('target_sampling_rate'):
-        print("Error: original_sampling_rate and target_sampling_rate are required for raw data processing")
+    require_rates = not config['processing'].get('skip_cascade', False)
+    if require_rates and (not config['processing'].get('original_sampling_rate') or not config['processing'].get('target_sampling_rate')):
+        print("Error: original_sampling_rate and target_sampling_rate are required unless processing.skip_cascade is true")
         return
     
     # Create output directory
@@ -1262,12 +1282,12 @@ def main():
             print(f"Error processing {subject_dir}: {e}")
         gc.collect()
 
-    print(f"\nSpike probability processing complete!")
+    print(f"\nProcessing complete!")
     print(f"Processed {len(processed_subjects)} subjects")
     if config['data'].get('test_run_neurons'):
         print(f"Test mode: Used only {config['data']['test_run_neurons']} randomly selected neurons per subject")
     print(f"Output saved to: {config['data']['output_dir']}")
-    print(f"Output format: Spike probabilities (T, N) and cell positions (N, 3)")
+    print(f"Output format: Neuron values (T, N) and cell positions (N, 3)")
     print(f"Data type: {config['output']['dtype']}")
 
 if __name__ == '__main__':

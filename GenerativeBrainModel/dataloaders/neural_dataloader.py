@@ -37,7 +37,7 @@ class NeuralDataset(Dataset):
         use_cache: bool = False,
         start_timepoint: Optional[int] = None,
         end_timepoint: Optional[int] = None,
-        spikes_dataset_name: str = 'spike_probabilities',
+        spikes_dataset_name: str = 'neuron_values',
     ) -> None:
         self.data_files = data_files
         self.pad_stimuli_to = pad_stimuli_to
@@ -66,9 +66,8 @@ class NeuralDataset(Dataset):
         print(f"Building neural sequence index... Caching: {self.use_cache}")
         for file_path in self.data_files:
             with h5py.File(file_path, 'r') as f:
-                if self.spikes_dataset_name not in f:
-                    raise ValueError(f"Dataset '{self.spikes_dataset_name}' not found in {file_path}")
-                spikes_ds = f[self.spikes_dataset_name]  # (T, N)
+                ds_name = self._resolve_spikes_dataset_name(f)
+                spikes_ds = f[ds_name]  # (T, N)
                 T_total, N = spikes_ds.shape
 
                 # Determine start/end bounds
@@ -186,9 +185,8 @@ class NeuralDataset(Dataset):
             stimulus = self.cached_stimulus[file_path][rel_start:rel_end]  # (L, K_file)
         else:
             f = self._get_file_handle(file_path)
-            if self.spikes_dataset_name not in f:
-                raise ValueError(f"Dataset '{self.spikes_dataset_name}' not found in {file_path}")
-            spikes_ds = f[self.spikes_dataset_name]  # (T, N)
+            ds_name = self._resolve_spikes_dataset_name(f)
+            spikes_ds = f[ds_name]  # (T, N)
             positions = f['cell_positions'][:]    # (N, 3)
             segment = spikes_ds[start_idx:end_idx].astype(np.float32)
             if 'stimulus_full' in f:
@@ -223,6 +221,28 @@ class NeuralDataset(Dataset):
             'file_path': file_path,
             'start_idx': start_idx,
         }
+
+    def _resolve_spikes_dataset_name(self, f: h5py.File) -> str:
+        """Resolve dataset name with backward compatibility.
+        Priority: explicit self.spikes_dataset_name -> 'neuron_values' -> 'spike_probabilities' -> 'spike_rates_hz' -> 'processed_calcium'.
+        """
+        # If explicitly provided name exists, honor it
+        try:
+            if self.spikes_dataset_name in f:
+                return self.spikes_dataset_name
+        except Exception:
+            pass
+        # Preferred new name
+        if 'neuron_values' in f:
+            return 'neuron_values'
+        # Backward-compat names
+        if 'spike_probabilities' in f:
+            return 'spike_probabilities'
+        if 'spike_rates_hz' in f:
+            return 'spike_rates_hz'
+        if 'processed_calcium' in f:
+            return 'processed_calcium'
+        raise ValueError("No compatible spikes dataset found (tried neuron_values, spike_probabilities, spike_rates_hz, processed_calcium)")
 
     def __del__(self) -> None:
         for handle in self.worker_file_handles.values():
@@ -328,13 +348,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
     start_timepoint = training_config.get('start_timepoint', None)
     end_timepoint = training_config.get('end_timepoint', None)
 
-    # Determine which spikes dataset to read (probabilities vs rates)
-    spikes_dataset_name = 'spike_probabilities'
-    try:
-        if bool(data_config.get('spikes_are_rates', False)):
-            spikes_dataset_name = 'spike_rates_hz'
-    except Exception:
-        pass
+    # Determine which spikes dataset to read (defaults to neuron_values, can override)
+    spikes_dataset_name = data_config.get('spikes_dataset_name', 'neuron_values')
 
     train_dataset = NeuralDataset(
         train_files,
