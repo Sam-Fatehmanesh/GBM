@@ -134,3 +134,4 @@ create_volume_video.py
 lightning_logs/
 *.npz
 *.svg
+zapdata/
