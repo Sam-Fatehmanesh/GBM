@@ -107,13 +107,15 @@ class GBM(nn.Module):
         if get_logits:
             return x
 
-        # When not returning logits, choose output domain based on model flag
-        # - Probabilities mode (default): sigmoid(logits)
-        # - Rates mode: exp(logits) where logits represent log-rate
+        # When not returning logits, choose output domain based on model flags
+        # - Z-calcium mode: identity (already z-scored, can be negative)
+        # - Rates mode: exp(logits) where logits represent log-rate (nonnegative)
+        # - Probabilities mode (default): sigmoid(logits) in [0,1]
+        if getattr(self, 'spikes_are_zcalcium', False):
+            return x
         if getattr(self, 'spikes_are_rates', False):
             return torch.exp(x)
-        else:
-            return torch.sigmoid(x)
+        return torch.sigmoid(x)
 
     def autoregress(self, init_x, init_stimuli, point_positions, neuron_pad_mask, future_stimuli=None, n_steps=10, context_len=12):
         # init_x: (B, T, n_neurons)

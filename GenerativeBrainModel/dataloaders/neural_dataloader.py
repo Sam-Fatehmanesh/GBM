@@ -224,7 +224,8 @@ class NeuralDataset(Dataset):
 
     def _resolve_spikes_dataset_name(self, f: h5py.File) -> str:
         """Resolve dataset name with backward compatibility.
-        Priority: explicit self.spikes_dataset_name -> 'neuron_values' -> 'spike_probabilities' -> 'spike_rates_hz' -> 'processed_calcium'.
+        Priority: explicit self.spikes_dataset_name -> 'neuron_values' ->
+        'spike_probabilities' -> 'spike_rates_hz' -> 'processed_calcium' -> 'zcalcium'.
         """
         # If explicitly provided name exists, honor it
         try:
@@ -242,7 +243,9 @@ class NeuralDataset(Dataset):
             return 'spike_rates_hz'
         if 'processed_calcium' in f:
             return 'processed_calcium'
-        raise ValueError("No compatible spikes dataset found (tried neuron_values, spike_probabilities, spike_rates_hz, processed_calcium)")
+        if 'zcalcium' in f:
+            return 'zcalcium'
+        raise ValueError("No compatible spikes dataset found (tried neuron_values, spike_probabilities, spike_rates_hz, processed_calcium, zcalcium)")
 
     def __del__(self) -> None:
         for handle in self.worker_file_handles.values():

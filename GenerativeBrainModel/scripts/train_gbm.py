@@ -29,6 +29,7 @@ from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloader
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
 import pdb
+import math
 
 
 # ------------------------------- CUDA prefetcher (casts to bf16) -------------------------------
@@ -93,6 +94,7 @@ def create_default_config() -> Dict[str, Any]:
             'test_subjects': [],
             'use_cache': False,
             'spikes_are_rates': False,
+            'spikes_are_zcalcium': False,
         },
         'model': {
             'd_model': 256,
@@ -318,6 +320,34 @@ def train_one_epoch(
     wrapped_loader = CUDAPrefetchLoader(loader, device, cast_bf16=True) if prefetch else loader
     pbar = tqdm(wrapped_loader, desc=f"Epoch {epoch}", mininterval=0.1, smoothing=0.05)
 
+    # Initialize warmup-cosine scheduler before the loop, aligned to optimizer steps
+    if scheduler == 'warmup_cosine_placeholder' and 'train_loader_len' in cfg:
+        if 'scheduler_obj' not in cfg:
+            accum = int(cfg.get('gradient_accumulation_steps') or 1)
+            steps_per_epoch = int(math.ceil(float(cfg['train_loader_len']) / float(accum)))
+            warm = int(0.1 * steps_per_epoch)
+            total = int(cfg.get('num_epochs', 1)) * steps_per_epoch
+            base_lr = float(cfg.get('learning_rate', 3e-4))
+            min_lr = base_lr * float(cfg.get('min_lr_ratio', 0.01))
+
+            def lr_lambda(step_idx: int) -> float:
+                if warm <= 0 or total <= 0:
+                    return 1.0
+                if step_idx < warm:
+                    return float(step_idx) / float(max(1, warm))
+                prog = (step_idx - warm) / float(max(1, total - warm))
+                prog = min(max(prog, 0.0), 1.0)
+                # Return factor relative to base_lr
+                return (min_lr + 0.5 * (base_lr - min_lr) * (1.0 + np.cos(np.pi * prog))) / base_lr
+
+            cfg['scheduler_obj'] = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            cfg['global_step'] = 0
+            # Seed scheduler to step 0 so initial LR starts near 0 (warmup start)
+            try:
+                cfg['scheduler_obj'].step(0)
+            except Exception:
+                pass
+
     # Determine validation trigger steps (exact count per epoch), and always include step 4 if possible
     triggers: set[int] = set()
     total_steps = len(loader)
@@ -358,8 +388,8 @@ def train_one_epoch(
         # teacher-forced pass (previous-step predictions only). Training-only.
         ss_cfg = cfg.get('scheduled_sampling', {}) or {}
         ss_enable = bool(ss_cfg.get('enable', False))
-        # Disable scheduled sampling in rates mode (Bernoulli substitution not defined on rates)
-        if ss_enable and not bool(cfg.get('spikes_are_rates', False)):
+        # Disable scheduled sampling in rates or zcalcium modes (Bernoulli substitution undefined)
+        if ss_enable and not (getattr(model, 'spikes_are_rates', False) or getattr(model, 'spikes_are_zcalcium', False)):
             start_p = float(ss_cfg.get('start_prob', 0.0))
             end_p = float(ss_cfg.get('end_prob', 0.2))
             # Drive schedule by global batch step (increments every batch), spanning entire training
@@ -396,11 +426,16 @@ def train_one_epoch(
             cfg['ss_global_step'] = step_now + 1
 
         logits = model(x_in, stim_in, positions, mask, get_logits=True)  # (B, L-1, N) bf16
-        if bool(cfg.get('spikes_are_rates', False) or cfg.get('data', {}).get('spikes_are_rates', False)):
+        if getattr(model, 'spikes_are_rates', False):
             # Interpret logits as log-rate (unbounded). Use Poisson NLL with log_input=True
             log_rate = logits.float()                 # fp32 for stability
             target_rate = x_tgt                       # already fp32
             loss = torch.nn.functional.poisson_nll_loss(log_rate, target_rate, log_input=True, reduction='mean')
+        elif getattr(model, 'spikes_are_zcalcium', False):
+            # Z-scored calcium regression (identity domain)
+            preds = logits.float()
+            target = x_tgt
+            loss = torch.nn.functional.mse_loss(preds, target, reduction='mean')
         else:
             loss = nn.BCEWithLogitsLoss()(logits.float(), x_tgt)
         (loss / grad_accum).backward()
@@ -410,20 +445,8 @@ def train_one_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['gradient_clip_norm'])
             optimizer.step()
             # Per-batch scheduler (warmup_cosine) → step AFTER optimizer.step()
-            if scheduler == 'warmup_cosine_placeholder' and 'train_loader_len' in cfg:
-                if 'scheduler_obj' not in cfg:
-                    warm = int(0.1 * cfg['train_loader_len'])
-                    total = cfg['num_epochs'] * cfg['train_loader_len']
-                    base_lr = cfg['learning_rate']
-                    min_lr = base_lr * cfg.get('min_lr_ratio', 0.01)
-                    def lr_lambda(step):
-                        if step < warm:
-                            return float(step) / float(max(1, warm))
-                        prog = (step - warm) / max(1, total - warm)
-                        return (min_lr + 0.5 * (base_lr - min_lr) * (1 + np.cos(np.pi * min(prog, 1.0)))) / base_lr
-                    cfg['scheduler_obj'] = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-                    cfg['global_step'] = 0
-                cfg['global_step'] += 1
+            if scheduler == 'warmup_cosine_placeholder' and 'scheduler_obj' in cfg:
+                cfg['global_step'] = int(cfg.get('global_step', 0)) + 1
                 cfg['scheduler_obj'].step()
 
         lr_now = optimizer.param_groups[0]['lr']
@@ -455,10 +478,15 @@ def train_one_epoch(
                 stim_in_v = stim_v[:, :-1, :]
                 with torch.no_grad():
                     logits_v = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
-                    if bool(cfg.get('spikes_are_rates', False)):
+                    if getattr(model, 'spikes_are_rates', False):
                         log_rate_v = logits_v.float()
                         vloss = torch.nn.functional.poisson_nll_loss(log_rate_v, x_tgt_v, log_input=True, reduction='mean')
                         probs_v = torch.exp(log_rate_v)
+                        targs_prob_v = x_tgt_v
+                    elif getattr(model, 'spikes_are_zcalcium', False):
+                        preds_v = logits_v.float()
+                        vloss = torch.nn.functional.mse_loss(preds_v, x_tgt_v, reduction='mean')
+                        probs_v = preds_v
                         targs_prob_v = x_tgt_v
                     else:
                         vloss = loss_fn(logits_v.float(), x_tgt_v)
@@ -585,8 +613,11 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
     x_tgt = spikes[:, 1:, :]
     stim_in = stim[:, :-1, :]
     logits = model(x_in, stim_in, positions, mask, get_logits=True)
-    if bool(cfg.get('spikes_are_rates', False) or cfg.get('data', {}).get('spikes_are_rates', False)):
+    if getattr(model, 'spikes_are_rates', False):
         preds_vis = torch.exp(logits)
+        truth_vis = x_tgt
+    elif getattr(model, 'spikes_are_zcalcium', False):
+        preds_vis = logits
         truth_vis = x_tgt
     else:
         preds_vis = torch.sigmoid(logits)
@@ -684,11 +715,15 @@ def main():
 
     model = GBM(d_model=mcfg['d_model'], d_stimuli=d_stimuli,
                 n_heads=mcfg['n_heads'], n_layers=mcfg['n_layers']).to(device)
-    # Propagate rates mode into model for forward(get_logits=False)
+    # Propagate data mode flags into model for forward(get_logits=False)
     try:
         model.spikes_are_rates = bool(cfg['data'].get('spikes_are_rates', False))
     except Exception:
         model.spikes_are_rates = False
+    try:
+        model.spikes_are_zcalcium = bool(cfg['data'].get('spikes_are_zcalcium', False))
+    except Exception:
+        model.spikes_are_zcalcium = False
 
     # Run the whole model in bf16 on CUDA (norms/centroids handled internally in fp32)
     if device.type == 'cuda':

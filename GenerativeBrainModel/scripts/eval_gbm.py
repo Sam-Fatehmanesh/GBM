@@ -44,6 +44,7 @@ def create_default_config() -> Dict[str, Any]:
             'test_subjects': [],               # if empty: random split used by dataloader
             'use_cache': False,
             'spikes_are_rates': False,
+            'spikes_are_zcalcium': False,
         },
         'model': {
             'checkpoint': None,                # REQUIRED: path to checkpoint saved by train_gbm.py
@@ -181,11 +182,9 @@ def load_model_from_checkpoint(ckpt_path: Path, device: torch.device) -> GBM:
         n_heads = model_cfg['n_heads']
 
     model = GBM(d_model=d_model, d_stimuli=d_stimuli, n_heads=n_heads, n_layers=n_layers).to(device)
-    # Propagate rates mode into model for forward(get_logits=False)
-    try:
-        model.spikes_are_rates = bool(cfg['data'].get('spikes_are_rates', False))
-    except Exception:
-        model.spikes_are_rates = False
+    # Flags will be set by caller based on eval config
+    model.spikes_are_rates = False
+    model.spikes_are_zcalcium = False
 
     # Pre-shape routing centroid buffers to match checkpoint (avoid size-mismatch errors)
     try:
@@ -235,13 +234,15 @@ def load_model_from_checkpoint(ckpt_path: Path, device: torch.device) -> GBM:
 
 
 @torch.no_grad()
-def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, tracker: CombinedMetricsTracker, threshold: float, num_batches: Optional[int] = None, *, spikes_are_rates: bool = False, sampling_rate_hz: float = 3.0) -> Dict[str, float]:
+def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, tracker: CombinedMetricsTracker, threshold: float, num_batches: Optional[int] = None, *, spikes_are_rates: bool = False, spikes_are_zcalcium: bool = False, sampling_rate_hz: float = 3.0) -> Dict[str, float]:
     model.eval()
     loss_fn = nn.BCEWithLogitsLoss()
     total_loss = 0.0
     total_batches = 0
     mae_rate_sums = 0.0
     mae_rate_counts = 0
+    mae_z_sums = 0.0
+    mae_z_counts = 0
     for batch_idx, batch in enumerate(tqdm(loader, desc='Eval'), 1):
         if num_batches and batch_idx > num_batches:
             break
@@ -264,6 +265,16 @@ def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
             abs_err = (probs - x_tgt.float()).abs()
             mae_rate_sums += float(abs_err.mean().detach().cpu().item())
             mae_rate_counts += 1
+        elif spikes_are_zcalcium:
+            # Identity domain with MSE
+            preds = logits.float()
+            loss = torch.nn.functional.mse_loss(preds, x_tgt.float(), reduction='mean')
+            probs = preds
+            targs_for_tracker = x_tgt.float()
+            # MAE in zcalcium mode
+            abs_err = (preds - x_tgt.float()).abs()
+            mae_z_sums += float(abs_err.mean().detach().cpu().item())
+            mae_z_counts += 1
         else:
             loss = loss_fn(logits.float(), x_tgt.float())
             probs = torch.sigmoid(logits)
@@ -284,11 +295,15 @@ def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
 
     avg_loss = total_loss / max(1, total_batches)
     avg_mae_rate = (mae_rate_sums / max(1, mae_rate_counts)) if mae_rate_counts > 0 else float('nan')
-    return {'val_loss': avg_loss, 'mae_rate': avg_mae_rate}
+    avg_mae = (mae_z_sums / max(1, mae_z_counts)) if mae_z_counts > 0 else float('nan')
+    out = {'val_loss': avg_loss, 'mae_rate': avg_mae_rate}
+    if spikes_are_zcalcium:
+        out['mae'] = avg_mae
+    return out
 
 
 @torch.no_grad()
-def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, videos_dir: Path, sequence_length: int, num_batches: int = 1, use_double_window_for_ar: bool = False, *, spikes_are_rates: bool = False, sampling_rate_hz: float = 3.0) -> None:
+def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, videos_dir: Path, sequence_length: int, num_batches: int = 1, use_double_window_for_ar: bool = False, *, spikes_are_rates: bool = False, spikes_are_zcalcium: bool = False, sampling_rate_hz: float = 3.0) -> None:
     # Use a few batches to render videos
     it = iter(loader)
     # Aggregators for a single unified H5 output
@@ -314,6 +329,9 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
         if spikes_are_rates:
             # Visualize rates directly
             probs = torch.exp(logits.float())
+            truth_probs = x_tgt.float()
+        elif spikes_are_zcalcium:
+            probs = logits.float()
             truth_probs = x_tgt.float()
         else:
             probs = torch.sigmoid(logits)
@@ -386,18 +404,20 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
 
 
 @torch.no_grad()
-def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, threshold: float, logs_dir: Path, num_batches: Optional[int] = None, use_double_window: bool = True, sampling_rate_hz: float = 3.0, *, spikes_are_rates: bool = False) -> Dict[str, List[float]]:
+def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, threshold: float, logs_dir: Path, num_batches: Optional[int] = None, use_double_window: bool = True, sampling_rate_hz: float = 3.0, *, spikes_are_rates: bool = False, spikes_are_zcalcium: bool = False) -> Dict[str, List[float]]:
     """
     Compute per-horizon autoregression metrics to assess degradation as steps increase.
     Also compute relative performance vs a baseline that copies the last context frame.
     Uses half of the available sequence as context by default.
     Also tracks the best performing AR sample across all batches.
     """
-    per_step_loss_sums: List[float] = []  # BCE in prob mode; left empty in rates mode
+    per_step_loss_sums: List[float] = []  # BCE in prob mode; MSE in zcalcium; N/A in rates
     # PR AUC removed
     per_step_counts: List[int] = []
     # Additional spike-rate metric (MAE only)
     per_step_mae_rate_sums: List[float] = []
+    # Additional zcalcium MAE per step
+    per_step_mae_z_sums: List[float] = []
     # Baseline (copy-last) spike-rate MAE sums
     per_step_mae_rate_baseline_sums: List[float] = []
 
@@ -438,6 +458,7 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
             # no PR AUC accumulator
             per_step_counts.extend([0] * extend_by)
             per_step_mae_rate_sums.extend([0.0] * extend_by)
+            per_step_mae_z_sums.extend([0.0] * extend_by)
             per_step_mae_rate_baseline_sums.extend([0.0] * extend_by)
 
         # Per-sample tracking for best AR sample
@@ -492,45 +513,63 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
         for k in range(n_steps):
             preds_k = gen_only[:, k, :].detach()
             targs_k = tgt_only[:, k, :].detach()
-            # BCE only valid in probability mode
-            if not spikes_are_rates:
+            # Loss per step depending on mode
+            if spikes_are_rates:
+                # No BCE; could log NaN or skip
+                pass
+            elif spikes_are_zcalcium:
+                loss_k = F.mse_loss(preds_k.float(), targs_k.float(), reduction='mean').item()
+                per_step_loss_sums[k] += loss_k
+            else:
                 loss_k = F.binary_cross_entropy(preds_k, targs_k, reduction='mean').item()
                 per_step_loss_sums[k] += loss_k
             per_step_counts[k] += 1
 
-            # Spike-rate metrics from probabilities: r = -lambda * ln(1 - p)
-            eps = 1e-7
+            # Spike-rate metrics are only defined for prob/rates modes
             if spikes_are_rates:
-                # Inputs are already rates
                 pred_rate = preds_k.float()
                 true_rate = targs_k.float()
-            else:
+                abs_err = (pred_rate - true_rate).abs()
+                mae_rate_k = abs_err.mean().item()
+                per_step_mae_rate_sums[k] += mae_rate_k
+            elif not spikes_are_zcalcium:
+                eps = 1e-7
                 preds_k_clamped = preds_k.clamp(0.0, 1.0 - eps)
                 targs_k_clamped = targs_k.clamp(0.0, 1.0 - eps)
                 pred_rate = -sampling_rate_hz * torch.log1p(-preds_k_clamped)
                 true_rate = -sampling_rate_hz * torch.log1p(-targs_k_clamped)
-            abs_err = (pred_rate - true_rate).abs()
-            mae_rate_k = abs_err.mean().item()
-            per_step_mae_rate_sums[k] += mae_rate_k
-            # Baseline: copy last context frame forward
-            last_ctx = init_x[:, -1, :]  # (B, N) probs or rates, matching mode
-            if spikes_are_rates:
-                last_ctx_rate = last_ctx.float()
+                abs_err = (pred_rate - true_rate).abs()
+                mae_rate_k = abs_err.mean().item()
+                per_step_mae_rate_sums[k] += mae_rate_k
             else:
-                last_ctx_clamped = last_ctx.clamp(0.0, 1.0 - eps)
-                last_ctx_rate = -sampling_rate_hz * torch.log1p(-last_ctx_clamped)
-            # Broadcast to (B, N) against true_rate
-            abs_err_baseline = (last_ctx_rate - true_rate).abs()
-            mae_rate_baseline_k = abs_err_baseline.mean().item()
-            per_step_mae_rate_baseline_sums[k] += mae_rate_baseline_k
+                # zcalcium MAE per step (identity domain)
+                abs_err = (preds_k.float() - targs_k.float()).abs()
+                per_step_mae_z_sums[k] += abs_err.mean().item()
+            # Baseline: copy last context frame forward
+            if spikes_are_rates or (not spikes_are_zcalcium):
+                last_ctx = init_x[:, -1, :]  # (B, N)
+                if spikes_are_rates:
+                    last_ctx_rate = last_ctx.float()
+                    true_rate_for_baseline = true_rate
+                else:
+                    eps = 1e-7
+                    last_ctx_clamped = last_ctx.clamp(0.0, 1.0 - eps)
+                    last_ctx_rate = -sampling_rate_hz * torch.log1p(-last_ctx_clamped)
+                    true_rate_for_baseline = true_rate
+                abs_err_baseline = (last_ctx_rate - true_rate_for_baseline).abs()
+                mae_rate_baseline_k = abs_err_baseline.mean().item()
+                per_step_mae_rate_baseline_sums[k] += mae_rate_baseline_k
             
 
     # Averages
-    per_step_loss = [
-        (per_step_loss_sums[k] / max(1, per_step_counts[k])) if (not spikes_are_rates and k < len(per_step_loss_sums)) else float('nan')
-        for k in range(len(per_step_counts))
-    ]
+    per_step_loss = []
+    for k in range(len(per_step_counts)):
+        if spikes_are_rates:
+            per_step_loss.append(float('nan'))
+        else:
+            per_step_loss.append(per_step_loss_sums[k] / max(1, per_step_counts[k]))
     per_step_mae_rate = [per_step_mae_rate_sums[k] / max(1, per_step_counts[k]) for k in range(len(per_step_counts))]
+    per_step_mae_z = [per_step_mae_z_sums[k] / max(1, per_step_counts[k]) for k in range(len(per_step_counts))]
     per_step_mae_rate_baseline = [per_step_mae_rate_baseline_sums[k] / max(1, per_step_counts[k]) for k in range(len(per_step_counts))]
     # Relative performance: 1 - (model MAE / baseline MAE)
     per_step_relative = []
@@ -543,11 +582,16 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
     # Write CSV
     out_csv = logs_dir / 'autoregression_per_step.csv'
     with open(out_csv, 'w') as f:
-        f.write('step,bce,mae_rate,rel_perf,count\n')
-        for k in range(len(per_step_counts)):
-            rp = per_step_relative[k]
-            rp_str = f"{rp:.6f}" if np.isfinite(rp) else 'nan'
-            f.write(f"{k+1},{per_step_loss[k]:.6f},{per_step_mae_rate[k]:.6f},{rp_str},{per_step_counts[k]}\n")
+        if spikes_are_zcalcium:
+            f.write('step,mse,mae,count\n')
+            for k in range(len(per_step_counts)):
+                f.write(f"{k+1},{per_step_loss[k]:.6f},{per_step_mae_z[k]:.6f},{per_step_counts[k]}\n")
+        else:
+            f.write('step,bce,mae_rate,rel_perf,count\n')
+            for k in range(len(per_step_counts)):
+                rp = per_step_relative[k]
+                rp_str = f"{rp:.6f}" if np.isfinite(rp) else 'nan'
+                f.write(f"{k+1},{per_step_loss[k]:.6f},{per_step_mae_rate[k]:.6f},{rp_str},{per_step_counts[k]}\n")
 
     # Optional quick plot
     try:
@@ -556,7 +600,16 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
         fig, ax1 = plt.subplots(figsize=(8, 4))
         color = 'tab:red'
         ax1.set_xlabel('Horizon (steps)')
-        if not spikes_are_rates:
+        if spikes_are_zcalcium:
+            ax1.set_ylabel('MSE', color=color)
+            ax1.plot(steps, per_step_loss, color=color)
+            ax1.tick_params(axis='y', labelcolor=color)
+            ax2 = ax1.twinx()
+            color = 'tab:purple'
+            ax2.set_ylabel('MAE (zcalcium)', color=color)
+            ax2.plot(steps, per_step_mae_z, color=color)
+            ax2.tick_params(axis='y', labelcolor=color)
+        elif not spikes_are_rates:
             ax1.set_ylabel('BCE', color=color)
             ax1.plot(steps, per_step_loss, color=color)
             ax1.tick_params(axis='y', labelcolor=color)
@@ -798,6 +851,15 @@ def main():
         model = load_model_from_checkpoint(Path(ckpt), device)
         if device.type == 'cuda':
             model = model.to(dtype=torch.bfloat16)
+        # Set mode flags from eval config (mirrors training)
+        try:
+            model.spikes_are_rates = bool(cfg['data'].get('spikes_are_rates', False))
+        except Exception:
+            model.spikes_are_rates = False
+        try:
+            model.spikes_are_zcalcium = bool(cfg['data'].get('spikes_are_zcalcium', False))
+        except Exception:
+            model.spikes_are_zcalcium = False
     else:
         if not load_from:
             raise ValueError('Please specify model.checkpoint or eval.load_from (path to eval_data.h5)')
@@ -855,6 +917,7 @@ def main():
             threshold=cfg['eval']['threshold'],
             num_batches=cfg['eval']['num_batches_nextstep'],
             spikes_are_rates=bool(cfg['data'].get('spikes_are_rates', False)),
+            spikes_are_zcalcium=bool(cfg['data'].get('spikes_are_zcalcium', False)),
             sampling_rate_hz=float(cfg['eval'].get('sampling_rate_hz', 3.0)),
         )
         logger.info(f"Evaluation metrics: {metrics}")
@@ -873,6 +936,7 @@ def main():
                 use_double_window=True,
                 sampling_rate_hz=float(cfg['eval'].get('sampling_rate_hz', 3.0)),
                 spikes_are_rates=bool(cfg['data'].get('spikes_are_rates', False)),
+                spikes_are_zcalcium=bool(cfg['data'].get('spikes_are_zcalcium', False)),
             )
             logger.info(f"Autoregression per-step metrics saved. First steps: BCE={ar_metrics['per_step_bce'][:3]}, MAE_rate={ar_metrics['per_step_mae_rate'][:3]}")
             
@@ -910,6 +974,7 @@ def main():
                 num_batches=1,
                 use_double_window_for_ar=True,
                 spikes_are_rates=bool(cfg['data'].get('spikes_are_rates', False)),
+                spikes_are_zcalcium=bool(cfg['data'].get('spikes_are_zcalcium', False)),
                 sampling_rate_hz=float(cfg['eval'].get('sampling_rate_hz', 3.0)),
             )
         except Exception as e:

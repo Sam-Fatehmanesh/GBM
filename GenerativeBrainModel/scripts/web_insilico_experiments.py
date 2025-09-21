@@ -749,6 +749,13 @@ def index():
       <h2 style="margin-top:0;">Zebrafish Brain In-Silico Experiment Platform</h2>
 
       <div class="control-group">
+        <h3>Model</h3>
+        <div>
+          <button id="open-preprint">Open Model Preprint</button>
+        </div>
+      </div>
+
+      <div class="control-group">
         <h3>Playback</h3>
          <div class="slider-container">
            <label for="point-size">Point Size</label>
@@ -1326,6 +1333,10 @@ def index():
           const inverted = document.body.classList.toggle('invert-colors');
           invertBtn.textContent = inverted ? 'Normal Colors' : 'Invert Colors';
         };
+      }
+      const preprintBtn = document.getElementById('open-preprint');
+      if (preprintBtn) {
+        preprintBtn.onclick = () => { window.open('https://samfv.systems/Preprint0.pdf', '_blank', 'noopener'); };
       }
       document.getElementById('run-experiment').onclick = () => { submitExperiment(); };
       document.getElementById('reset-view').onclick = () => {
