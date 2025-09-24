@@ -266,9 +266,9 @@ def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
             mae_rate_sums += float(abs_err.mean().detach().cpu().item())
             mae_rate_counts += 1
         elif spikes_are_zcalcium:
-            # Identity domain with MSE
+            # Identity domain with MAE
             preds = logits.float()
-            loss = torch.nn.functional.mse_loss(preds, x_tgt.float(), reduction='mean')
+            loss = torch.nn.functional.l1_loss(preds, x_tgt.float(), reduction='mean')
             probs = preds
             targs_for_tracker = x_tgt.float()
             # MAE in zcalcium mode
@@ -518,7 +518,7 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
                 # No BCE; could log NaN or skip
                 pass
             elif spikes_are_zcalcium:
-                loss_k = F.mse_loss(preds_k.float(), targs_k.float(), reduction='mean').item()
+                loss_k = F.l1_loss(preds_k.float(), targs_k.float(), reduction='mean').item()
                 per_step_loss_sums[k] += loss_k
             else:
                 loss_k = F.binary_cross_entropy(preds_k, targs_k, reduction='mean').item()
@@ -898,14 +898,30 @@ def main():
         missing = [s for s in test_subjects if not (data_dir / f"{s}.h5").exists()]
         if missing:
             raise ValueError(f"Requested test subjects not found in {data_dir}: {missing}")
-    _, ns_loader, *_ = create_dataloaders(cfg)
+    # Build loaders (train, val, test); evaluate on combined val+test
+    train_loader, val_loader, test_loader, *_ = create_dataloaders(cfg)
+    # Helper: combined loader that iterates val then test
+    class _CombinedLoader:
+        def __init__(self, loaders):
+            self.loaders = loaders
+        def __iter__(self):
+            for ld in self.loaders:
+                for b in ld:
+                    yield b
+        def __len__(self):
+            try:
+                return sum(len(ld) for ld in self.loaders)
+            except Exception:
+                return 0
+    ns_loader = _CombinedLoader([val_loader, test_loader])
 
     # Build AR dataloader with window size 2L (first L context, second L horizon)
     import copy as _copy
     cfg_ar = _copy.deepcopy(cfg)
     L_ctx = int(cfg['eval']['sequence_length'])
     cfg_ar['training']['sequence_length'] = 2 * L_ctx
-    _, ar_loader, *_ = create_dataloaders(cfg_ar)
+    _, ar_val_loader, ar_test_loader, *_ = create_dataloaders(cfg_ar)
+    ar_loader = _CombinedLoader([ar_val_loader, ar_test_loader])
 
     tracker = CombinedMetricsTracker(log_dir=dirs['logs'], ema_alpha=0.0, val_threshold=cfg['eval']['threshold'], enable_plots=True)
     if not offline_mode:

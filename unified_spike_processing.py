@@ -91,6 +91,7 @@ def create_default_config():
             'workers': 1,
             'seed': 42,
             'skip_cascade': False,
+            'disable_zscore_norm': False,
             'original_sampling_rate': None,  # Required for CASCADE
             'target_sampling_rate': None,    # Required for CASCADE
             'return_to_original_rate': False,  # If True, downsample neural data back to original rate after CASCADE
@@ -802,17 +803,24 @@ def process_subject(subject_dir, config):
             zscore_mean = None
             zscore_std = None
         else:
-            # No baseline correction in no-cascade mode; z-score normalize calcium per neuron
-            # calcium shape: (T, N) → compute per-neuron params along axis=0
-            zscore_mean = np.mean(calcium, axis=0).astype(np.float32)
-            zscore_std = np.std(calcium, axis=0).astype(np.float32)
-            std_safe = np.where(zscore_std == 0.0, 1.0, zscore_std)
-            z_calcium = (calcium - zscore_mean) / std_safe
-            # Output is (N, T)
-            prob_data = z_calcium.T
-            # Clean up
-            del z_calcium, calcium
-            gc.collect()
+            # No CASCADE path: optionally z-score normalize calcium per neuron
+            disable_z = bool(config['processing'].get('disable_zscore_norm', False))
+            if disable_z:
+                print("  → Skip CASCADE: disabling z-score; passing raw/processed calcium through")
+                prob_data = calcium.T.astype(np.float32)
+                zscore_mean = None
+                zscore_std = None
+                del calcium
+                gc.collect()
+            else:
+                # z-score normalize calcium per neuron
+                zscore_mean = np.mean(calcium, axis=0).astype(np.float32)
+                zscore_std = np.std(calcium, axis=0).astype(np.float32)
+                std_safe = np.where(zscore_std == 0.0, 1.0, zscore_std)
+                z_calcium = (calcium - zscore_mean) / std_safe
+                prob_data = z_calcium.T
+                del z_calcium, calcium
+                gc.collect()
         
         # Optionally downsample neural data back to original rate
         if return_to_original and orig_rate is not None and target_rate is not None and orig_rate != target_rate:
@@ -1647,12 +1655,77 @@ def process_zapbench(config):
         return vals
 
     if skip_cascade:
+        # Respect disable_zscore_norm: optionally bypass z-score normalization and write raw ΔF/F
+        chunk_T = min(1000, T)
+        if bool(config['processing'].get('disable_zscore_norm', False)):
+            print("  → Skip CASCADE: disabling z-score norm; saving raw calcium values")
+            with h5py.File(final_file, 'w') as f:
+                chunk_N = min(256, N_keep)
+                dset_vals = f.create_dataset(
+                    'neuron_values', shape=(T, N_keep), dtype=output_dtype,
+                    chunks=(chunk_T, chunk_N), compression='gzip', compression_opts=1,
+                )
+                # Stream raw ΔF/F values (no z-score)
+                for t0 in range(0, T, chunk_T):
+                    t1 = min(T, t0 + chunk_T)
+                    slab_all = np.asarray(tr[t0:t1, :])
+                    slab = slab_all[:, keep_indices].astype(np.float32)
+                    slab = np.nan_to_num(slab, nan=0.0, posinf=0.0, neginf=0.0).astype(output_dtype)
+                    dset_vals[t0:t1, :] = slab
+
+                # Positions and metadata
+                f.create_dataset('cell_positions', data=pos_norm.astype(output_dtype), compression='gzip', compression_opts=1)
+                f.create_dataset('timepoint_indices', data=np.arange(T, dtype=np.int32))
+                f.create_dataset('num_timepoints', data=T)
+                f.create_dataset('num_neurons', data=N_keep)
+                # Save stimulus features and labels if available
+                if stimuli_features is not None:
+                    f.create_dataset('stimuli_features', data=stimuli_features.astype(np.float32), compression='gzip', compression_opts=1)
+                if stimuli_onehot is not None:
+                    f.create_dataset('stimulus_full', data=stimuli_onehot.astype(np.float32), compression='gzip', compression_opts=1)
+                    f.attrs['stimulus_num_classes'] = int(stimuli_onehot.shape[1])
+                    if 'condition_names' in locals():
+                        try:
+                            f.attrs['stimulus_condition_names'] = np.array(condition_names, dtype='S')
+                            f.attrs['stimulus_identity_indices'] = np.array(identity_indices_used, dtype=np.int32)
+                        except Exception:
+                            pass
+                # Attributes
+                f.attrs['subject'] = subject_name
+                f.attrs['data_source'] = 'zapbench_zarr'
+                f.attrs['positions_normalized'] = True
+                f.attrs['positions_min'] = mins
+                f.attrs['positions_max'] = maxs
+                f.attrs['includes_additional_data'] = False
+                f.attrs['final_sampling_rate'] = float(orig_rate) if orig_rate else np.nan
+
+            # PDF for raw signal
+            try:
+                K = config['processing']['num_neurons_viz'] * 2
+                values_small = read_small_sample(K)
+                create_visualization_pdf(
+                    values_small,
+                    values_small.T,
+                    subject_name,
+                    pdf_file,
+                    num_neurons=config['processing']['num_neurons_viz'],
+                    stim=(stimuli_labels if stimuli_labels is not None else None), behavior=None, eye=None,
+                    is_probability=False, value_label='ZapBench Signal',
+                )
+            except Exception as e:
+                print(f"  → Skipping PDF viz due to error: {e}")
+            # Optional split-by-stimuli (skip_cascade path)
+            if bool(zap_cfg.get('split_by_stimuli', False)) and (stimuli_onehot is not None):
+                print("  → Splitting output by contiguous stimulus segments…")
+                _split_and_save_by_stimuli(final_file, output_dir)
+
+            return final_file
+
         # Two-pass streaming z-score: first pass stats, second pass write
         print("  → Skip CASCADE: computing per-neuron z-score (streaming two-pass)")
         mean = np.zeros(N_keep, dtype=np.float64)
         M2 = np.zeros(N_keep, dtype=np.float64)
         ncount = 0
-        chunk_T = min(1000, T)
         for t0 in range(0, T, chunk_T):
             t1 = min(T, t0 + chunk_T)
             slab_all = np.asarray(tr[t0:t1, :])

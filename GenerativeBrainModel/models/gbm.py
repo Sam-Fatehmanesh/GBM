@@ -70,7 +70,8 @@ class GBM(nn.Module):
 
 
         # Concatenate the neuron scalars and the point positions by repeating the point positions for the entire sequence of neuron states
-        x = torch.cat([x, point_positions.unsqueeze(1).repeat(1, T, 1, 1)], dim=3)
+        # x = torch.cat([x, point_positions.unsqueeze(1).repeat(1, T, 1, 1)], dim=3)
+        x = torch.cat([x, torch.zeros_like(point_positions.unsqueeze(1).repeat(1, T, 1, 1))], dim=3)
 
         # Encode the neuron scalars and the point positions
         x = self.neuron_scalar_position_encoder(x)

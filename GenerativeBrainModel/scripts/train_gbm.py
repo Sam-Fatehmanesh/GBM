@@ -30,6 +30,9 @@ from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
 import pdb
 import math
+import os
+import csv
+import matplotlib.pyplot as plt
 
 
 # ------------------------------- CUDA prefetcher (casts to bf16) -------------------------------
@@ -111,6 +114,10 @@ def create_default_config() -> Dict[str, Any]:
             'weight_decay': 1e-4,
             'scheduler': 'warmup_cosine',
             'min_lr_ratio': 0.01,
+            # Fraction of total global steps used for linear warmup
+            'warmup_fraction': 0.1,
+            # Linear warmup start ratio (relative to base lr). If None, falls back to min_lr_ratio
+            'warmup_min_lr_ratio': None,
             'sequence_length': 12,
             'stride': 3,
             'max_timepoints_per_subject': None,
@@ -142,6 +149,8 @@ def create_default_config() -> Dict[str, Any]:
                 # If False, feed raw probabilities.
                 'sample': True,
             },
+            # Control autoregression video generation during training/val
+            'generate_ar_video': True,
         },
         'logging': {
             'log_level': 'INFO',
@@ -325,20 +334,33 @@ def train_one_epoch(
         if 'scheduler_obj' not in cfg:
             accum = int(cfg.get('gradient_accumulation_steps') or 1)
             steps_per_epoch = int(math.ceil(float(cfg['train_loader_len']) / float(accum)))
-            warm = int(0.1 * steps_per_epoch)
+            warm_frac = float(cfg.get('warmup_fraction', 0.1))
             total = int(cfg.get('num_epochs', 1)) * steps_per_epoch
+            warm = int(max(0, round(warm_frac * total)))
             base_lr = float(cfg.get('learning_rate', 3e-4))
-            min_lr = base_lr * float(cfg.get('min_lr_ratio', 0.01))
+            min_lr_ratio = float(cfg.get('min_lr_ratio', 0.01))
+            min_lr = base_lr * min_lr_ratio
+            warmup_min_lr_ratio = cfg.get('warmup_min_lr_ratio')
+            if warmup_min_lr_ratio is None:
+                warmup_min_lr_ratio = min_lr_ratio
+            warmup_min_lr_ratio = float(warmup_min_lr_ratio)
 
             def lr_lambda(step_idx: int) -> float:
-                if warm <= 0 or total <= 0:
+                if total <= 0:
                     return 1.0
-                if step_idx < warm:
-                    return float(step_idx) / float(max(1, warm))
-                prog = (step_idx - warm) / float(max(1, total - warm))
-                prog = min(max(prog, 0.0), 1.0)
-                # Return factor relative to base_lr
-                return (min_lr + 0.5 * (base_lr - min_lr) * (1.0 + np.cos(np.pi * prog))) / base_lr
+                min_factor = min_lr / base_lr               # cosine phase floor
+                warm_min_factor = warmup_min_lr_ratio       # warmup phase floor (ratio of base lr)
+                # Linear warmup from warm_min_factor -> 1.0 over 'warm' steps
+                if warm > 0 and step_idx < warm:
+                    frac = float(step_idx) / float(max(1, warm))
+                    return warm_min_factor + frac * (1.0 - warm_min_factor)
+                # Cosine decay from 1.0 down toward min_factor over remaining steps
+                if warm <= 0:
+                    prog = min(max(step_idx / float(max(1, total)), 0.0), 1.0)
+                else:
+                    prog = (step_idx - warm) / float(max(1, total - warm))
+                    prog = min(max(prog, 0.0), 1.0)
+                return min_factor + 0.5 * (1.0 - min_factor) * (1.0 + np.cos(np.pi * prog))
 
             cfg['scheduler_obj'] = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
             cfg['global_step'] = 0
@@ -432,7 +454,7 @@ def train_one_epoch(
             target_rate = x_tgt                       # already fp32
             loss = torch.nn.functional.poisson_nll_loss(log_rate, target_rate, log_input=True, reduction='mean')
         elif getattr(model, 'spikes_are_zcalcium', False):
-            # Z-scored calcium regression (identity domain)
+            # Z-scored calcium regression (identity domain) — use MSE
             preds = logits.float()
             target = x_tgt
             loss = torch.nn.functional.mse_loss(preds, target, reduction='mean')
@@ -463,7 +485,7 @@ def train_one_epoch(
         # Lightweight validation at frequency
         if batch_idx in triggers:
             model.eval()
-            loss_fn = nn.BCEWithLogitsLoss()
+            loss_fn = nn.L1Loss()
             vb = 0
             total_vloss = 0.0
             preds_all = []
@@ -478,20 +500,16 @@ def train_one_epoch(
                 stim_in_v = stim_v[:, :-1, :]
                 with torch.no_grad():
                     logits_v = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
+                    # Regular MAE on predictions vs targets
                     if getattr(model, 'spikes_are_rates', False):
-                        log_rate_v = logits_v.float()
-                        vloss = torch.nn.functional.poisson_nll_loss(log_rate_v, x_tgt_v, log_input=True, reduction='mean')
-                        probs_v = torch.exp(log_rate_v)
-                        targs_prob_v = x_tgt_v
+                        preds_v = torch.exp(logits_v.float())
                     elif getattr(model, 'spikes_are_zcalcium', False):
                         preds_v = logits_v.float()
-                        vloss = torch.nn.functional.mse_loss(preds_v, x_tgt_v, reduction='mean')
-                        probs_v = preds_v
-                        targs_prob_v = x_tgt_v
                     else:
-                        vloss = loss_fn(logits_v.float(), x_tgt_v)
-                        probs_v = torch.sigmoid(logits_v)
-                        targs_prob_v = x_tgt_v
+                        preds_v = torch.sigmoid(logits_v.float())
+                    vloss = torch.nn.functional.l1_loss(preds_v, x_tgt_v, reduction='mean')
+                    probs_v = preds_v
+                    targs_prob_v = x_tgt_v
                 total_vloss += float(vloss.detach().cpu().item())
                 preds_all.append(probs_v.detach())
                 targs_all.append(targs_prob_v.detach())
@@ -506,35 +524,36 @@ def train_one_epoch(
                 compute_auc = False
                 tracker.log_validation(epoch, batch_idx, preds_all, targs_all, avg_vloss, compute_auc=False)
                 # Sample video
-                try:
-                    sample_batch = next(iter(val_loader))
-                    # Ensure a consistent per-sample shape for videos to avoid cat-size issues
-                    spikes0 = sample_batch['spikes'][0:1]
-                    stim0 = sample_batch['stimulus'][0:1]
-                    pos0 = sample_batch['positions'][0:1]
-                    mask0 = sample_batch['neuron_mask'][0:1]
-                    # Diagnostics
-                    print(f"[VideoDebug] spikes {tuple(spikes0.shape)} stim {tuple(stim0.shape)} pos {tuple(pos0.shape)} mask {tuple(mask0.shape)}")
-                    # Truncate to a common L if mismatch exists
-                    Lx = spikes0.shape[1]
-                    Ls = stim0.shape[1]
-                    L = min(Lx, Ls)
-                    if Lx != Ls:
-                        print(f"[VideoDebug] Truncating sequence length from spikes {Lx} / stim {Ls} to L={L}")
-                    spikes0 = spikes0[:, :L]
-                    stim0 = stim0[:, :L]
-                    sample_batch = {
-                        'spikes': spikes0.float(),
-                        'positions': pos0,
-                        'neuron_mask': mask0,
-                        'stimulus': stim0,
-                    }
-                    generate_epoch_videos(model, sample_batch, device, videos_dir, epoch=f"{epoch}_step{batch_idx}")
-                except Exception as e:
-                    # Log and continue; video generation should not break training
-                    import traceback
-                    traceback.print_exc()
-                    print(f"Video generation failed at step {batch_idx}: {e}")
+                if bool(cfg.get('generate_ar_video', True)):
+                    try:
+                        sample_batch = next(iter(val_loader))
+                        # Ensure a consistent per-sample shape for videos to avoid cat-size issues
+                        spikes0 = sample_batch['spikes'][0:1]
+                        stim0 = sample_batch['stimulus'][0:1]
+                        pos0 = sample_batch['positions'][0:1]
+                        mask0 = sample_batch['neuron_mask'][0:1]
+                        # Diagnostics
+                        print(f"[VideoDebug] spikes {tuple(spikes0.shape)} stim {tuple(stim0.shape)} pos {tuple(pos0.shape)} mask {tuple(mask0.shape)}")
+                        # Truncate to a common L if mismatch exists
+                        Lx = spikes0.shape[1]
+                        Ls = stim0.shape[1]
+                        L = min(Lx, Ls)
+                        if Lx != Ls:
+                            print(f"[VideoDebug] Truncating sequence length from spikes {Lx} / stim {Ls} to L={L}")
+                        spikes0 = spikes0[:, :L]
+                        stim0 = stim0[:, :L]
+                        sample_batch = {
+                            'spikes': spikes0.float(),
+                            'positions': pos0,
+                            'neuron_mask': mask0,
+                            'stimulus': stim0,
+                        }
+                        generate_epoch_videos(model, sample_batch, device, videos_dir, epoch=f"{epoch}_step{batch_idx}", enable_ar=bool(cfg.get('generate_ar_video', True)))
+                    except Exception as e:
+                        # Log and continue; video generation should not break training
+                        import traceback
+                        traceback.print_exc()
+                        print(f"Video generation failed at step {batch_idx}: {e}")
                 # Save best checkpoint if improved
                 if avg_vloss < best_loss:
                     best_loss = avg_vloss
@@ -566,11 +585,12 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
     Computes average loss (with optional mean-activation MSE term) and PR-AUC over all batches.
     """
     model.eval()
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.L1Loss()
     total_loss = 0.0
     total_batches = 0
     preds_all = []
     targs_all = []
+    per_condition_losses: Dict[str, list] = {}
     for batch in tqdm(loader, desc=f"Validation E{epoch}"):
         spikes = batch['spikes'].to(device).to(torch.bfloat16)
         positions = batch['positions'].to(device)
@@ -582,10 +602,24 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         stim_in = stim[:, :-1, :]
 
         logits = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = loss_fn(logits.float(), x_tgt)
-        probs = torch.sigmoid(logits.float())
-        total_loss += float(loss.detach().cpu().item())
+        # Regular MAE regardless of mode
+        if getattr(model, 'spikes_are_rates', False):
+            preds = torch.exp(logits.float())
+        elif getattr(model, 'spikes_are_zcalcium', False):
+            preds = logits.float()
+        else:
+            preds = torch.sigmoid(logits.float())
+        loss = torch.nn.functional.l1_loss(preds, x_tgt, reduction='mean')
+        probs = preds
+        loss_val = float(loss.detach().cpu().item())
+        total_loss += loss_val
         total_batches += 1
+        # Track per-condition
+        conds = batch.get('condition_name', None)
+        if conds is not None:
+            # Single condition per batch (all windows from same file) expected; fallback to first
+            cond = conds[0] if isinstance(conds, list) else 'unknown'
+            per_condition_losses.setdefault(cond, []).append(loss_val)
 
         preds_all.append(probs.detach())
         targs_all.append(x_tgt.detach())
@@ -596,11 +630,101 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         targs_all = torch.cat([t.reshape(-1) for t in targs_all], dim=0)
         # Log a single aggregated row (batch_idx=1); PR-AUC disabled
         tracker.log_validation(epoch, 1, preds_all, targs_all, avg_loss, compute_auc=False)
-    return {'val_loss': avg_loss}
+    # Print per-condition means for quick visibility
+    try:
+        import numpy as np
+        cond_summary = {k: float(np.mean(v)) for k, v in per_condition_losses.items()}
+    except Exception:
+        cond_summary = {}
+    return {'val_loss': avg_loss, 'per_condition_loss': cond_summary}
+
+
+@torch.no_grad()
+def validate_epoch_combined(
+    model: GBM,
+    val_loader: torch.utils.data.DataLoader,
+    test_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    log_dir: Path,
+    epoch: int,
+    training_cfg: Dict[str, Any],
+) -> Dict[str, float]:
+    """Run one combined end-of-epoch validation over both val and test loaders.
+
+    Writes a separate CSV (epoch_eval.csv) and a dedicated plot (plots/epoch_eval.png).
+    """
+    model.eval()
+    loss_fn = nn.L1Loss()
+    total_loss = 0.0
+    total_batches = 0
+
+    def _run(loader):
+        nonlocal total_loss, total_batches
+        for batch in loader:
+            spikes = batch['spikes'].to(device).to(torch.bfloat16)
+            positions = batch['positions'].to(device)
+            mask = batch['neuron_mask'].to(device)
+            stim = batch['stimulus'].to(device).to(torch.bfloat16)
+
+            x_in = spikes[:, :-1, :]
+            x_tgt = spikes[:, 1:, :].float()
+            stim_in = stim[:, :-1, :]
+
+            logits = model(x_in, stim_in, positions, mask, get_logits=True)
+            # Regular MAE across modes
+            if getattr(model, 'spikes_are_rates', False):
+                preds = torch.exp(logits.float())
+            elif getattr(model, 'spikes_are_zcalcium', False):
+                preds = logits.float()
+            else:
+                preds = torch.sigmoid(logits.float())
+            loss = torch.nn.functional.l1_loss(preds, x_tgt, reduction='mean')
+            total_loss += float(loss.detach().cpu().item())
+            total_batches += 1
+
+    _run(val_loader)
+    _run(test_loader)
+
+    avg_loss = total_loss / max(1, total_batches)
+
+    # Append to separate CSV
+    csv_path = log_dir / 'epoch_eval.csv'
+    is_new = not csv_path.exists()
+    with open(csv_path, 'a', newline='') as f:
+        w = csv.writer(f)
+        if is_new:
+            w.writerow(['epoch', 'avg_loss'])
+        w.writerow([epoch, avg_loss])
+
+    # Update dedicated plot
+    try:
+        # Read back CSV
+        epochs = []
+        losses = []
+        with open(csv_path, 'r') as f:
+            r = csv.DictReader(f)
+            for row in r:
+                epochs.append(int(row['epoch']))
+                losses.append(float(row['avg_loss']))
+        plt.figure(figsize=(6, 4))
+        plt.plot(epochs, losses, marker='o')
+        plt.xlabel('Epoch')
+        plt.ylabel('Combined Val+Test Loss')
+        plt.title('End-of-epoch evaluation (combined)')
+        plt.grid(True, alpha=0.3)
+        plots_dir = log_dir / 'plots'
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        plt.tight_layout()
+        plt.savefig(plots_dir / 'epoch_eval.png')
+        plt.close()
+    except Exception:
+        pass
+
+    return {'epoch_eval_loss': avg_loss}
 
 
 def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: torch.device,
-                           videos_dir: Path, epoch: int | str) -> None:
+                           videos_dir: Path, epoch: int | str, enable_ar: bool = True) -> None:
     model.eval()
     # Keep spikes in fp32 to preserve small probabilities for visualization
     spikes = batch['spikes'].to(device).float()                 # (B, L, N)
@@ -626,30 +750,31 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
     #pdb.set_trace()
     create_nextstep_video(truth_vis, preds_vis, positions, nextstep_path)
 
-    # Autoregression demo (double-panel): use half window as context, half as truth horizon
-    L_full = int(spikes.shape[1])
-    context_len = max(1, L_full // 2)
-    n_steps = context_len
-    if n_steps > 0:
-        init_x = spikes[0:1, :context_len, :]
-        init_stim = stim[0:1, :context_len, :]
-        # Build future stimulus of length n_steps from the second half; pad with zeros if needed
-        K = stim.shape[-1]
-        future_real = stim[0:1, context_len: context_len + n_steps, :]
-        pad_len = n_steps - future_real.shape[1]
-        if pad_len > 0:
-            future_pad = torch.zeros((1, pad_len, K), device=stim.device, dtype=stim.dtype)
-            future_stim = torch.cat([future_real, future_pad], dim=1)
-        else:
-            future_stim = future_real
-        pos0 = positions[0:1]
-        mask0 = mask[0:1]
-        gen_seq = model.autoregress(init_x, init_stim, pos0, mask0, future_stim,
-                                     n_steps=n_steps, context_len=context_len)
-        ar_path = videos_dir / f'autoreg_epoch_{epoch}.mp4'
-        # In rates mode, spikes already hold rates; in prob mode spikes hold probabilities
-        truth_horizon = spikes[0:1, context_len: context_len + n_steps, :]
-        create_autoregression_video(gen_seq[:, -n_steps:, :], pos0, ar_path, truth=truth_horizon)
+    # Autoregression demo: gated by enable_ar
+    if enable_ar:
+        L_full = int(spikes.shape[1])
+        context_len = max(1, L_full // 2)
+        n_steps = context_len
+        if n_steps > 0:
+            init_x = spikes[0:1, :context_len, :]
+            init_stim = stim[0:1, :context_len, :]
+            # Build future stimulus of length n_steps from the second half; pad with zeros if needed
+            K = stim.shape[-1]
+            future_real = stim[0:1, context_len: context_len + n_steps, :]
+            pad_len = n_steps - future_real.shape[1]
+            if pad_len > 0:
+                future_pad = torch.zeros((1, pad_len, K), device=stim.device, dtype=stim.dtype)
+                future_stim = torch.cat([future_real, future_pad], dim=1)
+            else:
+                future_stim = future_real
+            pos0 = positions[0:1]
+            mask0 = mask[0:1]
+            gen_seq = model.autoregress(init_x, init_stim, pos0, mask0, future_stim,
+                                         n_steps=n_steps, context_len=context_len)
+            ar_path = videos_dir / f'autoreg_epoch_{epoch}.mp4'
+            # In rates mode, spikes already hold rates; in prob mode spikes hold probabilities
+            truth_horizon = spikes[0:1, context_len: context_len + n_steps, :]
+            create_autoregression_video(gen_seq[:, -n_steps:, :], pos0, ar_path, truth=truth_horizon)
 
 
 # ---------------------------------------------- Main ----------------------------------------------
@@ -699,7 +824,7 @@ def main():
         pass
 
     # Data
-    train_loader, val_loader, train_sampler, val_sampler = create_dataloaders(cfg)
+    train_loader, val_loader, test_loader, train_sampler, val_sampler, test_sampler = create_dataloaders(cfg)
     cfg['training']['train_loader_len'] = len(train_loader)
 
     # Model
@@ -777,8 +902,9 @@ def main():
             tracker, epoch, cfg['training'], best_loss, best_ckpt, dirs['ckpt'], dirs['videos']
         )
 
-        val_metrics = validate(model, val_loader, device, tracker, epoch, cfg['training'])
-        logger.info(f"Epoch {epoch} - Val: {val_metrics}")
+        # Per-epoch combined evaluation on val+test, logged separately
+        epoch_eval = validate_epoch_combined(model, val_loader, test_loader, device, dirs['logs'], epoch, cfg['training'])
+        logger.info(f"Epoch {epoch} - Combined Val+Test: {epoch_eval}")
 
         # Save checkpoint
         ckpt_path = dirs['ckpt'] / f'epoch_{epoch}.pth'
@@ -786,15 +912,17 @@ def main():
                     'optimizer': optimizer.state_dict(), 'config': sanitized_config(cfg)}, ckpt_path)
 
         # Videos on a small sampled batch
-        try:
-            sample_batch = next(iter(val_loader))
-            generate_epoch_videos(model, sample_batch, device, dirs['videos'], epoch)
-        except Exception as e:
-            logger.warning(f"Epoch {epoch} video generation failed: {e}")
+        if bool(cfg['training'].get('generate_ar_video', True)):
+            try:
+                sample_batch = next(iter(val_loader))
+                generate_epoch_videos(model, sample_batch, device, dirs['videos'], epoch, enable_ar=bool(cfg['training'].get('generate_ar_video', True)))
+            except Exception as e:
+                logger.warning(f"Epoch {epoch} video generation failed: {e}")
 
-        # Track best
-        if val_metrics['val_loss'] < best_loss:
-            best_loss = val_metrics['val_loss']
+        # Track best using combined evaluation loss
+        cur_loss = float(epoch_eval.get('epoch_eval_loss', float('inf')))
+        if cur_loss < best_loss:
+            best_loss = cur_loss
             best_ckpt = ckpt_path
 
         # Update plots
@@ -804,13 +932,18 @@ def main():
     # Best checkpoint videos
     if best_ckpt is not None:
         logger.info(f"Loading best checkpoint: {best_ckpt}")
-        state = torch.load(best_ckpt, map_location=device)
-        model.load_state_dict(state['model'])
         try:
-            sample_batch = next(iter(val_loader))
-            generate_epoch_videos(model, sample_batch, device, dirs['videos'], epoch='best')
-        except Exception as e:
-            logger.warning(f"Best checkpoint video generation failed: {e}")
+            state = torch.load(best_ckpt, map_location=device, weights_only=False)
+        except TypeError:
+            # Older torch without weights_only kw
+            state = torch.load(best_ckpt, map_location=device)
+        model.load_state_dict(state['model'])
+        if bool(cfg['training'].get('generate_ar_video', True)):
+            try:
+                sample_batch = next(iter(val_loader))
+                generate_epoch_videos(model, sample_batch, device, dirs['videos'], epoch='best', enable_ar=bool(cfg['training'].get('generate_ar_video', True)))
+            except Exception as e:
+                logger.warning(f"Best checkpoint video generation failed: {e}")
 
 
 if __name__ == '__main__':

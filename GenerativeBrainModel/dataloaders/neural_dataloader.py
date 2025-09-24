@@ -38,6 +38,7 @@ class NeuralDataset(Dataset):
         start_timepoint: Optional[int] = None,
         end_timepoint: Optional[int] = None,
         spikes_dataset_name: str = 'neuron_values',
+        role: str = 'all',  # 'all' | 'train' | 'val' | 'test'
     ) -> None:
         self.data_files = data_files
         self.pad_stimuli_to = pad_stimuli_to
@@ -48,6 +49,7 @@ class NeuralDataset(Dataset):
         self.start_timepoint = start_timepoint
         self.end_timepoint = end_timepoint
         self.spikes_dataset_name = spikes_dataset_name
+        self.role = role
 
         self.sequences: List[Dict[str, int]] = []
         self.cached_spikes: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
@@ -70,7 +72,27 @@ class NeuralDataset(Dataset):
                 spikes_ds = f[ds_name]  # (T, N)
                 T_total, N = spikes_ds.shape
 
-                # Determine start/end bounds
+                # Read optional split attributes from file (0-based, [start,end) semantics)
+                def _get_attr(name: str, default: Optional[int]) -> Optional[int]:
+                    try:
+                        return int(f.attrs[name]) if name in f.attrs else default
+                    except Exception:
+                        return default
+                tr0 = _get_attr('split_train_start', None)
+                tr1 = _get_attr('split_train_end', None)
+                va0 = _get_attr('split_val_start', None)
+                va1 = _get_attr('split_val_end', None)
+                te0 = _get_attr('split_test_start', None)
+                te1 = _get_attr('split_test_end', None)
+                condition_name = None
+                try:
+                    if 'split_condition_name' in f.attrs:
+                        v = f.attrs['split_condition_name']
+                        condition_name = v.decode('utf-8') if isinstance(v, (bytes, bytearray)) else str(v)
+                except Exception:
+                    condition_name = None
+
+                # Determine start/end bounds (global override optional)
                 start_point = self.start_timepoint if self.start_timepoint is not None else 0
                 end_point = self.end_timepoint if self.end_timepoint is not None else T_total
                 end_point = min(end_point, T_total)
@@ -133,18 +155,38 @@ class NeuralDataset(Dataset):
                     if file_path not in self.cached_positions:
                         pos = f['cell_positions'][:]  # (N, 3)
                         self.cached_positions[file_path] = pos.astype(np.float32)
-                    # Stimulus: expect one-hot float dataset at 'stimulus_full'
-                    if 'stimulus_full' in f:
-                        stim_oh = f['stimulus_full'][trimmed_start:trimmed_end]
-                        self.cached_stimulus[file_path] = stim_oh.astype(np.float32)  # (T, K)
+                    # Stimulus: prefer 'stimuli_features' else 'stimulus_full'
+                    if 'stimuli_features' in f:
+                        stim = f['stimuli_features'][trimmed_start:trimmed_end]
+                        self.cached_stimulus[file_path] = stim.astype(np.float32)
+                    elif 'stimulus_full' in f:
+                        stim = f['stimulus_full'][trimmed_start:trimmed_end]
+                        self.cached_stimulus[file_path] = stim.astype(np.float32)
                     else:
-                        # default to zeros with one channel
                         self.cached_stimulus[file_path] = np.zeros((trimmed_end - trimmed_start, 1), dtype=np.float32)
 
-                # Create sequence indices
-                max_start_idx = trimmed_end - self.sequence_length
-                for start_idx in range(trimmed_start, max_start_idx + 1, self.stride):
-                    self.sequences.append({'file_path': file_path, 'start_idx': start_idx})
+                # Create sequence indices within selected role range and trimmed bounds
+                role_ranges: List[Tuple[int, int, str]] = []
+                if self.role in ('all', 'train') and tr0 is not None and tr1 is not None:
+                    role_ranges.append((tr0, tr1, 'train'))
+                if self.role in ('all', 'val') and va0 is not None and va1 is not None:
+                    role_ranges.append((va0, va1, 'val'))
+                if self.role in ('all', 'test') and te0 is not None and te1 is not None:
+                    role_ranges.append((te0, te1, 'test'))
+                # Fallback if no attrs present
+                if not role_ranges:
+                    role_ranges.append((0, T_total, 'all'))
+                for a, b, role_name in role_ranges:
+                    a2 = max(a, trimmed_start)
+                    b2 = min(b, trimmed_end)
+                    max_start_idx = b2 - self.sequence_length
+                    for start_idx in range(a2, max_start_idx + 1, self.stride):
+                        self.sequences.append({
+                            'file_path': file_path,
+                            'start_idx': start_idx,
+                            'role': role_name,
+                            'condition_name': condition_name or 'unknown'
+                        })
 
     def __len__(self) -> int:
         return len(self.sequences)
@@ -189,8 +231,10 @@ class NeuralDataset(Dataset):
             spikes_ds = f[ds_name]  # (T, N)
             positions = f['cell_positions'][:]    # (N, 3)
             segment = spikes_ds[start_idx:end_idx].astype(np.float32)
-            if 'stimulus_full' in f:
-                stimulus = f['stimulus_full'][start_idx:end_idx].astype(np.float32)  # (L, K_file)
+            if 'stimuli_features' in f:
+                stimulus = f['stimuli_features'][start_idx:end_idx].astype(np.float32)
+            elif 'stimulus_full' in f:
+                stimulus = f['stimulus_full'][start_idx:end_idx].astype(np.float32)
             else:
                 stimulus = np.zeros((self.sequence_length, 1), dtype=np.float32)
 
@@ -220,6 +264,8 @@ class NeuralDataset(Dataset):
             'stimulus': stimulus_tensor,        # (sequence_length, K_file)
             'file_path': file_path,
             'start_idx': start_idx,
+            'split_role': seq_info.get('role', 'all'),
+            'condition_name': seq_info.get('condition_name', 'unknown'),
         }
 
     def _resolve_spikes_dataset_name(self, f: h5py.File) -> str:
@@ -276,7 +322,11 @@ def _max_stimuli_in_files(files: List[str]) -> int:
     for fp in files:
         try:
             with h5py.File(fp, 'r') as f:
-                if 'stimulus_full' in f:
+                if 'stimuli_features' in f:
+                    ds = f['stimuli_features']
+                    if ds.ndim == 2:
+                        max_k = max(max_k, int(ds.shape[1]))
+                elif 'stimulus_full' in f:
                     ds = f['stimulus_full']
                     if ds.ndim == 2:
                         max_k = max(max_k, int(ds.shape[1]))
@@ -287,7 +337,7 @@ def _max_stimuli_in_files(files: List[str]) -> int:
     return max_k
 
 
-def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler], Optional[DistributedSampler]]:
+def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, DataLoader, Optional[DistributedSampler], Optional[DistributedSampler], Optional[DistributedSampler]]:
     """
     Create train/test DataLoaders for neural spike probability data.
 
@@ -325,7 +375,24 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
     if not test_files and test_subjects:
         print(f"Warning: No valid files found for requested test subjects: {test_subjects}")
 
-    if not test_files and not only_test:
+    # If files contain internal split attributes, use them for all roles and avoid random 80/20
+    def _has_internal_splits(file_list: List[str]) -> bool:
+        for fp in file_list:
+            try:
+                with h5py.File(fp, 'r') as f:
+                    if all(k in f.attrs for k in (
+                        'split_train_start','split_train_end','split_val_start','split_val_end','split_test_start','split_test_end'
+                    )):
+                        return True
+            except Exception:
+                continue
+        return False
+
+    if _has_internal_splits(selected_files):
+        print("Detected per-file train/val/test split attributes; using internal ranges for all roles.")
+        train_files = selected_files
+        test_files = selected_files
+    elif not test_files and not only_test:
         print("No valid test subjects provided. Creating a random 80/20 train/test split.")
         num_test = max(1, len(selected_files) // 5)
         random.seed(training_config.get('seed', 42))
@@ -364,6 +431,20 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
         start_timepoint=start_timepoint,
         end_timepoint=end_timepoint,
         spikes_dataset_name=spikes_dataset_name,
+        role='train',
+    )
+
+    val_dataset = NeuralDataset(
+        test_files if training_config.get('val_on_test_plus_val', True) else train_files,
+        pad_stimuli_to=pad_stimuli_to,
+        sequence_length=sequence_length,
+        stride=stride,
+        max_timepoints_per_subject=max_timepoints_per_subject,
+        use_cache=use_cache,
+        start_timepoint=start_timepoint,
+        end_timepoint=end_timepoint,
+        spikes_dataset_name=spikes_dataset_name,
+        role='val',
     )
 
     test_dataset = NeuralDataset(
@@ -376,6 +457,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
         start_timepoint=start_timepoint,
         end_timepoint=end_timepoint,
         spikes_dataset_name=spikes_dataset_name,
+        role='test',
     )
 
     # Safer defaults for memory usage
@@ -393,6 +475,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
 
     # Distributed samplers (if dist is initialized)
     train_sampler = None
+    val_sampler = None
     test_sampler = None
     try:
         import torch.distributed as dist
@@ -406,7 +489,19 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
                 use_cache=use_cache,
                 start_timepoint=start_timepoint,
                 end_timepoint=end_timepoint,
+                role='train',
             ), shuffle=True)
+            val_sampler = DistributedSampler(NeuralDataset(
+                test_files if training_config.get('val_on_test_plus_val', True) else train_files,
+                pad_stimuli_to=pad_stimuli_to,
+                sequence_length=sequence_length,
+                stride=stride,
+                max_timepoints_per_subject=max_timepoints_per_subject,
+                use_cache=use_cache,
+                start_timepoint=start_timepoint,
+                end_timepoint=end_timepoint,
+                role='val',
+            ), shuffle=False)
             test_sampler = DistributedSampler(NeuralDataset(
                 test_files,
                 pad_stimuli_to=pad_stimuli_to,
@@ -416,6 +511,7 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
                 use_cache=use_cache,
                 start_timepoint=start_timepoint,
                 end_timepoint=end_timepoint,
+                role='test',
             ), shuffle=False)
     except Exception:
         pass
@@ -463,9 +559,12 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
             'stimulus': stimulus,       # (B, L, K)
             'file_path': [it['file_path'] for it in batch],
             'start_idx': torch.tensor([it['start_idx'] for it in batch], dtype=torch.long),
+            'split_role': [it['split_role'] for it in batch],
+            'condition_name': [it['condition_name'] for it in batch],
         }
 
     train_loader = DataLoader(train_dataset, shuffle=(train_sampler is None), sampler=train_sampler, collate_fn=collate_pad, **dl_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, sampler=val_sampler, collate_fn=collate_pad, **dl_kwargs)
     test_loader = DataLoader(test_dataset, shuffle=False, sampler=test_sampler, collate_fn=collate_pad, **dl_kwargs)
 
-    return train_loader, test_loader, train_sampler, test_sampler
+    return train_loader, val_loader, test_loader, train_sampler, val_sampler, test_sampler

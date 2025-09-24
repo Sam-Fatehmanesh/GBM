@@ -272,6 +272,12 @@ class SpatialNeuralAttention(nn.Module):
             ema_decay=ema_decay,
             bias=False,
         )
+        # Disable torch.compile for self.attn
+        if hasattr(torch, 'dynamo') and hasattr(torch.dynamo, 'disable'):
+            torch.dynamo.disable(self.attn)
+        elif hasattr(torch, 'compile') and hasattr(self.attn, '__torch_function__'):
+            # For torch >=2.0, torch.compile disables via attribute
+            self.attn.__torch_compile__ = False
         from GenerativeBrainModel.models.rms import RMSNorm
         self.norm = RMSNorm(d_model)
         self.rope_proj = nn.Linear(2 * n_rope_features, d_model, bias=False)

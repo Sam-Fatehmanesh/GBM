@@ -32,7 +32,6 @@ class CausalConv1d(nn.Module):
         out = self.conv(x)
         # Remove extra padding on the right for causality
         out = out[..., :x.shape[-1]]
-        out = F.silu(out)
         return out
 
 class CausalResidualNeuralConv1d(nn.Module):
@@ -53,27 +52,9 @@ class CausalResidualNeuralConv1d(nn.Module):
         # reshape to (batch*N, channels=d_model, length=seq_len) for Conv1d
         x = x.permute(0, 2, 3, 1).contiguous().view(B * N, D, T)
         x = self.conv(x)
+        #x = F.silu(x)
         # restore to (batch, seq_len, n_neurons, d_model)
         x = x.view(B, N, D, T).permute(0, 3, 1, 2).contiguous()
         x = x + res
 
-        return x
-
-
-class CausalFNNNeuralCNN1d(nn.Module):
-    def __init__(self, dim, kernel_size=16):
-        super().__init__()
-        self.dim = dim
-        self.kernel_size = kernel_size
-
-        self.convres1 = CausalResidualNeuralConv1d(dim, kernel_size)
-        self.FFN = FFN(dim, dim*3)
-        self.convres2 = CausalResidualNeuralConv1d(dim, kernel_size)
-
-    def forward(self, x):
-        # x: (batch_size, seq_len, n_neurons, d_model)
-        B, T, N, D = x.shape
-        x = self.convres1(x)
-        x = self.FFN(x)
-        x = self.convres2(x)
         return x

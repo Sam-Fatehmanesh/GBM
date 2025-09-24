@@ -5,6 +5,7 @@ import numpy as np
 from GenerativeBrainModel.models.rms import RMSNorm
 from GenerativeBrainModel.models.mlp import MLP, FFN
 from GenerativeBrainModel.models.attention import SpatialNeuralAttention, TemporalNeuralAttention
+from GenerativeBrainModel.models.conv import CausalResidualNeuralConv1d
 # from mamba_ssm import Mamba2 as Mamba
 import os
 
@@ -14,10 +15,16 @@ class SpatioTemporalNeuralAttention(nn.Module):
         super(SpatioTemporalNeuralAttention, self).__init__()
         self.d_model = d_model
         self.n_heads = n_heads
-        self.spatial_attention = SpatialNeuralAttention(d_model, n_heads)
-        self.temporal_attention = TemporalNeuralAttention(d_model, n_heads)
+        #self.spatial_attention = SpatialNeuralAttention(d_model, n_heads)
+        #self.temporal_attention = TemporalNeuralAttention(d_model, n_heads)
+        #self.temporal_attention_first = TemporalNeuralAttention(d_model, n_heads)
+        self.conv = nn.Sequential(
+                CausalResidualNeuralConv1d(d_model, kernel_size=32),
+                CausalResidualNeuralConv1d(d_model, kernel_size=16),
+                CausalResidualNeuralConv1d(d_model, kernel_size=16),
+            )
 
-        self.FFN0 = FFN(d_model, d_model*3)
+        #self.FFN0 = FFN(d_model, d_model*3)
         self.FFN1 = FFN(d_model, d_model*3)
         
 
@@ -25,11 +32,15 @@ class SpatioTemporalNeuralAttention(nn.Module):
         # expects x of shape (batch_size, seq_len, n_neurons, d_model)
         B, T, N, D = x.shape
 
-        x = self.spatial_attention(x, point_positions, neuron_pad_mask)
+        x = self.conv(x)
+        #x = self.temporal_attention_first(x, neuron_pad_mask)
 
-        x = self.FFN0(x)
+        #x = self.spatial_attention(x, point_positions, neuron_pad_mask)
+        #x = self.temporal_attention(x, neuron_pad_mask)
+
+        #x = self.FFN0(x)
         
-        x = self.temporal_attention(x, neuron_pad_mask)
+        # = self.temporal_attention(x, neuron_pad_mask)
 
         x = self.FFN1(x)
         
