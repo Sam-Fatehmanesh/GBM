@@ -16,7 +16,7 @@ class SpatioTemporalNeuralAttention(nn.Module):
         self.n_heads = n_heads
         self.spatial_attention = SpatialNeuralAttention(d_model, n_heads)
         self.temporal_attention = TemporalNeuralAttention(d_model, n_heads)
-
+        
         self.FFN0 = FFN(d_model, d_model*3)
         self.FFN1 = FFN(d_model, d_model*3)
         
