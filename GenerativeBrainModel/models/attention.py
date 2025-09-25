@@ -136,6 +136,7 @@ class RoutingFlashMHA(nn.Module):
         # Write back in buffer dtype
         self.centroids[:k_use] = c.to(dtype=self.centroids.dtype)
 
+    @torch._dynamo.disable
     def forward(
         self,
         x_compact: torch.Tensor,          # [Ttot, D]
@@ -143,8 +144,6 @@ class RoutingFlashMHA(nn.Module):
     ):
         dtype = next(self.parameters()).dtype
         x = x_compact.to(dtype=dtype)
-        if x.dtype not in (torch.bfloat16, torch.float16):
-            x = x.to(torch.bfloat16)
 
         Ttot, D = x.shape
         H, Dh = self.n_heads, self.head_dim
@@ -256,7 +255,11 @@ class RoutingFlashMHA(nn.Module):
             with torch.no_grad():
                 self._ema_update_ddp(ema_sums, ema_counts, k_needed)
 
-        return self.out_proj(out_h.reshape(Ttot, D))
+        out_input = out_h.reshape(Ttot, D)
+        weight_dtype = self.out_proj.weight.dtype
+        if out_input.dtype != weight_dtype:
+            out_input = out_input.to(dtype=weight_dtype)
+        return self.out_proj(out_input)
 
 class SpatialNeuralAttention(nn.Module):
     """
@@ -272,7 +275,7 @@ class SpatialNeuralAttention(nn.Module):
             ema_decay=ema_decay,
             bias=False,
         )
-        from GenerativeBrainModel.models.rms import RMSNorm
+
         self.norm = RMSNorm(d_model)
         self.rope_proj = nn.Linear(2 * n_rope_features, d_model, bias=False)
 
@@ -439,6 +442,7 @@ class SDPA_MHA(nn.Module):
             out_chunks.append(self._flash_once(qs, ks, vs, is_causal=is_causal))
         out = torch.cat(out_chunks, dim=0)  # (B,H,L,Dh)
         out = self._from_bhld(out)
+        out = out.to(module_dtype)
         return self.out_proj(out)
 
 
@@ -492,6 +496,6 @@ class TemporalNeuralAttention(nn.Module):
                 out[valid_rows] = out_valid.to(out.dtype)
             # rows that were padded stay zero → residual passthrough below
 
-        x = out + res
+        x = out.to(res.dtype) + res
         x = x.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()   # back to (B,T,N,D)
         return x

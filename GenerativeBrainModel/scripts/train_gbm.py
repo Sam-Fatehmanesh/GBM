@@ -28,6 +28,7 @@ from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
+from GenerativeBrainModel.utils.lognormal import lognormal_nll, lognormal_mean
 import pdb
 import math
 
@@ -133,15 +134,7 @@ def create_default_config() -> Dict[str, Any]:
             # Mean activation MSE removed; training uses only primary loss per mode
             # No sampling rate needed; pipeline is domain-pure (probs or rates)
             # Scheduled sampling settings
-            'scheduled_sampling': {
-                'enable': False,
-                # Linear schedule over global steps from step 0 to final training step
-                'start_prob': 0.0,
-                'end_prob': 0.2,
-                # If True, sample Bernoulli from predicted probabilities when substituting.
-                # If False, feed raw probabilities.
-                'sample': True,
-            },
+            'scheduled_sampling': None,
         },
         'logging': {
             'log_level': 'INFO',
@@ -371,7 +364,7 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(pbar, 1):
         # Batches are already on device and in bf16 via the prefetcher
-        spikes = batch['spikes']           # (B, L, N) bf16 when probs; fp32 or bf16 when rates
+        spikes = batch['spikes']           # (B, L, N) bf16
         positions = batch['positions']     # (B, N, 3) fp32
         mask = batch['neuron_mask']        # (B, N) bool/int
         stim = batch['stimulus']           # (B, L, K) bf16
@@ -384,60 +377,8 @@ def train_one_epoch(
         if batch_idx % grad_accum == 1:
             optimizer.zero_grad()
 
-        # Scheduled sampling: optionally replace part of x_in with model predictions from a
-        # teacher-forced pass (previous-step predictions only). Training-only.
-        ss_cfg = cfg.get('scheduled_sampling', {}) or {}
-        ss_enable = bool(ss_cfg.get('enable', False))
-        # Disable scheduled sampling in rates or zcalcium modes (Bernoulli substitution undefined)
-        if ss_enable and not (getattr(model, 'spikes_are_rates', False) or getattr(model, 'spikes_are_zcalcium', False)):
-            start_p = float(ss_cfg.get('start_prob', 0.0))
-            end_p = float(ss_cfg.get('end_prob', 0.2))
-            # Drive schedule by global batch step (increments every batch), spanning entire training
-            step_now = int(cfg.get('ss_global_step', 0))
-            train_len = int(cfg.get('train_loader_len', 0)) or int(len(loader))
-            total_steps = max(1, int(cfg.get('num_epochs', 1)) * train_len)
-            start_s = 0
-            end_s = total_steps
-            if step_now <= start_s:
-                ss_p = start_p
-            elif step_now >= end_s:
-                ss_p = end_p
-            else:
-                frac = (step_now - start_s) / max(1, (end_s - start_s))
-                ss_p = start_p + frac * (end_p - start_p)
-            if ss_p > 0.0:
-                with torch.no_grad():
-                    logits_tf = model(x_in, stim_in, positions, mask, get_logits=True)
-                    probs_tf = torch.sigmoid(logits_tf.float()).to(dtype=x_in.dtype)
-                # Build previous-step predictions aligned to inputs: at t>0 use pred for t from probs_tf[:, t-1]
-                prev_preds = torch.zeros_like(x_in)
-                prev_preds[:, 1:, :] = probs_tf[:, :-1, :]
-                if bool(ss_cfg.get('sample', True)):
-                    # Sample Bernoulli spikes from probabilities
-                    prev_sampled = torch.bernoulli(prev_preds.to(torch.float32)).to(dtype=x_in.dtype)
-                    substitute = prev_sampled
-                else:
-                    substitute = prev_preds
-                # Per-batch, per-time mask (not per-neuron) to replace entire frames; keep t=0 untouched
-                replace_mask = (torch.rand(x_in.shape[0], x_in.shape[1], 1, device=x_in.device) < ss_p).to(x_in.dtype)
-                replace_mask[:, 0, :] = 0  # never replace the first input step
-                x_in = x_in * (1 - replace_mask) + substitute * replace_mask
-            # Increment global step counter every batch
-            cfg['ss_global_step'] = step_now + 1
-
-        logits = model(x_in, stim_in, positions, mask, get_logits=True)  # (B, L-1, N) bf16
-        if getattr(model, 'spikes_are_rates', False):
-            # Interpret logits as log-rate (unbounded). Use Poisson NLL with log_input=True
-            log_rate = logits.float()                 # fp32 for stability
-            target_rate = x_tgt                       # already fp32
-            loss = torch.nn.functional.poisson_nll_loss(log_rate, target_rate, log_input=True, reduction='mean')
-        elif getattr(model, 'spikes_are_zcalcium', False):
-            # Z-scored calcium regression (identity domain)
-            preds = logits.float()
-            target = x_tgt
-            loss = torch.nn.functional.mse_loss(preds, target, reduction='mean')
-        else:
-            loss = nn.BCEWithLogitsLoss()(logits.float(), x_tgt)
+        m_raw, s_raw = model(x_in, stim_in, positions, mask, get_logits=True)
+        loss = lognormal_nll(x_tgt.float(), m_raw.float(), s_raw.float())
         (loss / grad_accum).backward()
 
         if batch_idx % grad_accum == 0:
@@ -463,7 +404,6 @@ def train_one_epoch(
         # Lightweight validation at frequency
         if batch_idx in triggers:
             model.eval()
-            loss_fn = nn.BCEWithLogitsLoss()
             vb = 0
             total_vloss = 0.0
             preds_all = []
@@ -477,21 +417,11 @@ def train_one_epoch(
                 x_tgt_v = spikes_v[:, 1:, :].float()
                 stim_in_v = stim_v[:, :-1, :]
                 with torch.no_grad():
-                    logits_v = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
-                    if getattr(model, 'spikes_are_rates', False):
-                        log_rate_v = logits_v.float()
-                        vloss = torch.nn.functional.poisson_nll_loss(log_rate_v, x_tgt_v, log_input=True, reduction='mean')
-                        probs_v = torch.exp(log_rate_v)
-                        targs_prob_v = x_tgt_v
-                    elif getattr(model, 'spikes_are_zcalcium', False):
-                        preds_v = logits_v.float()
-                        vloss = torch.nn.functional.mse_loss(preds_v, x_tgt_v, reduction='mean')
-                        probs_v = preds_v
-                        targs_prob_v = x_tgt_v
-                    else:
-                        vloss = loss_fn(logits_v.float(), x_tgt_v)
-                        probs_v = torch.sigmoid(logits_v)
-                        targs_prob_v = x_tgt_v
+                    m_val, s_val = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
+                    vloss = lognormal_nll(x_tgt_v, m_val.float(), s_val.float())
+                    preds_vis = lognormal_mean(m_val, s_val)
+                    probs_v = preds_vis
+                    targs_prob_v = x_tgt_v
                 total_vloss += float(vloss.detach().cpu().item())
                 preds_all.append(probs_v.detach())
                 targs_all.append(targs_prob_v.detach())
@@ -562,11 +492,8 @@ def train_one_epoch(
 @torch.no_grad()
 def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device,
              tracker: CombinedMetricsTracker, epoch: int, training_cfg: Dict[str, Any]) -> Dict[str, float]:
-    """Run end-of-epoch validation and log a SINGLE aggregated entry to CSV/plots.
-    Computes average loss (with optional mean-activation MSE term) and PR-AUC over all batches.
-    """
+    """Run end-of-epoch validation and log a SINGLE aggregated entry to CSV/plots."""
     model.eval()
-    loss_fn = nn.BCEWithLogitsLoss()
     total_loss = 0.0
     total_batches = 0
     preds_all = []
@@ -581,20 +508,19 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         x_tgt = spikes[:, 1:, :].float()
         stim_in = stim[:, :-1, :]
 
-        logits = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = loss_fn(logits.float(), x_tgt)
-        probs = torch.sigmoid(logits.float())
+        m_val, s_val = model(x_in, stim_in, positions, mask, get_logits=True)
+        loss = lognormal_nll(x_tgt, m_val.float(), s_val.float())
+        preds = lognormal_mean(m_val, s_val)
         total_loss += float(loss.detach().cpu().item())
         total_batches += 1
 
-        preds_all.append(probs.detach())
+        preds_all.append(preds.detach())
         targs_all.append(x_tgt.detach())
 
     avg_loss = total_loss / max(1, total_batches)
     if preds_all and targs_all:
         preds_all = torch.cat([p.reshape(-1) for p in preds_all], dim=0)
         targs_all = torch.cat([t.reshape(-1) for t in targs_all], dim=0)
-        # Log a single aggregated row (batch_idx=1); PR-AUC disabled
         tracker.log_validation(epoch, 1, preds_all, targs_all, avg_loss, compute_auc=False)
     return {'val_loss': avg_loss}
 
@@ -612,16 +538,9 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
     x_in = spikes[:, :-1, :]
     x_tgt = spikes[:, 1:, :]
     stim_in = stim[:, :-1, :]
-    logits = model(x_in, stim_in, positions, mask, get_logits=True)
-    if getattr(model, 'spikes_are_rates', False):
-        preds_vis = torch.exp(logits)
-        truth_vis = x_tgt
-    elif getattr(model, 'spikes_are_zcalcium', False):
-        preds_vis = logits
-        truth_vis = x_tgt
-    else:
-        preds_vis = torch.sigmoid(logits)
-        truth_vis = x_tgt
+    m_vis, s_vis = model(x_in, stim_in, positions, mask, get_logits=True)
+    preds_vis = lognormal_mean(m_vis, s_vis)
+    truth_vis = x_tgt
     nextstep_path = videos_dir / f'nextstep_epoch_{epoch}.mp4'
     #pdb.set_trace()
     create_nextstep_video(truth_vis, preds_vis, positions, nextstep_path)
@@ -716,14 +635,8 @@ def main():
     model = GBM(d_model=mcfg['d_model'], d_stimuli=d_stimuli,
                 n_heads=mcfg['n_heads'], n_layers=mcfg['n_layers']).to(device)
     # Propagate data mode flags into model for forward(get_logits=False)
-    try:
-        model.spikes_are_rates = bool(cfg['data'].get('spikes_are_rates', False))
-    except Exception:
-        model.spikes_are_rates = False
-    try:
-        model.spikes_are_zcalcium = bool(cfg['data'].get('spikes_are_zcalcium', False))
-    except Exception:
-        model.spikes_are_zcalcium = False
+    model.spikes_are_rates = False
+    model.spikes_are_zcalcium = False
 
     # Run the whole model in bf16 on CUDA (norms/centroids handled internally in fp32)
     if device.type == 'cuda':

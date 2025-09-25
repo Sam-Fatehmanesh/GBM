@@ -27,6 +27,7 @@ from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
+from GenerativeBrainModel.utils.lognormal import lognormal_nll, lognormal_mean
 import numpy as np
 import torch.nn.functional as F
 import h5py
@@ -236,7 +237,6 @@ def load_model_from_checkpoint(ckpt_path: Path, device: torch.device) -> GBM:
 @torch.no_grad()
 def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device, tracker: CombinedMetricsTracker, threshold: float, num_batches: Optional[int] = None, *, spikes_are_rates: bool = False, spikes_are_zcalcium: bool = False, sampling_rate_hz: float = 3.0) -> Dict[str, float]:
     model.eval()
-    loss_fn = nn.BCEWithLogitsLoss()
     total_loss = 0.0
     total_batches = 0
     mae_rate_sums = 0.0
@@ -254,40 +254,14 @@ def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         x_in = spikes[:, :-1, :]
         x_tgt = spikes[:, 1:, :]
         stim_in = stim[:, :-1, :]
-        logits = model(x_in, stim_in, positions, mask, get_logits=True)
-        if spikes_are_rates:
-            # targets are rates; model logits are log-rates
-            loss = torch.nn.functional.poisson_nll_loss(logits.float(), x_tgt.float(), log_input=True, reduction='mean')
-            # Use rates directly for tracker; it will skip AUC if asked
-            probs = torch.exp(logits.float())
-            targs_for_tracker = x_tgt.float()
-            # MAE between spike rates (rates mode): |exp(logits) - target_rate|
-            abs_err = (probs - x_tgt.float()).abs()
-            mae_rate_sums += float(abs_err.mean().detach().cpu().item())
-            mae_rate_counts += 1
-        elif spikes_are_zcalcium:
-            # Identity domain with MSE
-            preds = logits.float()
-            loss = torch.nn.functional.mse_loss(preds, x_tgt.float(), reduction='mean')
-            probs = preds
-            targs_for_tracker = x_tgt.float()
-            # MAE in zcalcium mode
-            abs_err = (preds - x_tgt.float()).abs()
-            mae_z_sums += float(abs_err.mean().detach().cpu().item())
-            mae_z_counts += 1
-        else:
-            loss = loss_fn(logits.float(), x_tgt.float())
-            probs = torch.sigmoid(logits)
-            targs_for_tracker = x_tgt.float()
-            # Convert probabilities to rates for MAE-rate
-            eps = 1e-7
-            p_pred = probs.clamp(0.0, 1.0 - eps)
-            p_true = x_tgt.float().clamp(0.0, 1.0 - eps)
-            r_pred = -float(sampling_rate_hz) * torch.log1p(-p_pred)
-            r_true = -float(sampling_rate_hz) * torch.log1p(-p_true)
-            abs_err = (r_pred - r_true).abs()
-            mae_rate_sums += float(abs_err.mean().detach().cpu().item())
-            mae_rate_counts += 1
+        m_raw, s_raw = model(x_in, stim_in, positions, mask, get_logits=True)
+        loss = lognormal_nll(x_tgt.float(), m_raw.float(), s_raw.float())
+        preds = lognormal_mean(m_raw, s_raw)
+        abs_err = (preds - x_tgt.float()).abs()
+        mae_rate_sums += float(abs_err.mean().detach().cpu().item())
+        mae_rate_counts += 1
+        probs = preds
+        targs_for_tracker = x_tgt.float()
         total_loss += float(loss.detach().cpu().item())
         total_batches += 1
 
@@ -297,8 +271,6 @@ def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
     avg_mae_rate = (mae_rate_sums / max(1, mae_rate_counts)) if mae_rate_counts > 0 else float('nan')
     avg_mae = (mae_z_sums / max(1, mae_z_counts)) if mae_z_counts > 0 else float('nan')
     out = {'val_loss': avg_loss, 'mae_rate': avg_mae_rate}
-    if spikes_are_zcalcium:
-        out['mae'] = avg_mae
     return out
 
 
@@ -323,24 +295,20 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
 
         # Next-step video
         x_in = spikes[:, :-1, :]
-        x_tgt = spikes[:, 1:, :]
+        x_tgt = spikes[:, 1:, :].float()
         stim_in = stim[:, :-1, :]
-        logits = model(x_in, stim_in, positions, mask, get_logits=True)
-        if spikes_are_rates:
-            # Visualize rates directly
-            probs = torch.exp(logits.float())
-            truth_probs = x_tgt.float()
-        elif spikes_are_zcalcium:
-            probs = logits.float()
-            truth_probs = x_tgt.float()
+        m_raw, s_raw = model(x_in, stim_in, positions, mask, get_logits=True)
+        if spikes_are_zcalcium:
+            preds_next = m_raw.float()
+            truth_next = x_tgt.float()
         else:
-            probs = torch.sigmoid(logits)
-            truth_probs = x_tgt
-        create_nextstep_video(truth_probs, probs, positions, videos_dir / f'nextstep_batch{i+1}.mp4')
+            preds_next = lognormal_mean(m_raw, s_raw).float()
+            truth_next = x_tgt.float()
+        create_nextstep_video(truth_next, preds_next, positions, videos_dir / f'nextstep_batch{i+1}.mp4')
 
         # Accumulate next-step truth/pred/positions
-        ns_truth_list.append(x_tgt.detach().cpu())
-        ns_pred_list.append(probs.detach().cpu())
+        ns_truth_list.append(truth_next.detach().cpu())
+        ns_pred_list.append(preds_next.detach().cpu())
         ns_pos_list.append(positions.detach().cpu())
         ns_mask_list.append(mask.detach().cpu())
 
@@ -363,19 +331,14 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
                 future_stim = torch.cat([future_real, pad], dim=1)
             else:
                 future_stim = future_real
-            gen_seq = model.autoregress(init_x, init_stim, positions, mask, future_stim, n_steps=n_steps, context_len=context_len)
-            if spikes_are_rates:
-                gen_only = gen_seq[:, -n_steps:, :].float()
-                truth_only = spikes[:, context_len:context_len + n_steps, :].float()
-            else:
-                gen_only = gen_seq[:, -n_steps:, :]
-                truth_only = spikes[:, context_len:context_len + n_steps, :]
-            create_autoregression_video(gen_only, positions, videos_dir / f'autoreg_batch{i+1}.mp4', truth=truth_only)
+        gen_only = gen_seq[:, -n_steps:, :].float()
+        truth_only = spikes[:, context_len:context_len + n_steps, :].float()
+        create_autoregression_video(gen_only, positions, videos_dir / f'autoreg_batch{i+1}.mp4', truth=truth_only)
             # Accumulate AR truth/pred and metadata
-            ar_truth_list.append(truth_only.detach().cpu())
-            ar_pred_list.append(gen_only.detach().cpu())
-            ar_context_list.append(int(context_len))
-            ar_nsteps_list.append(int(n_steps))
+        ar_truth_list.append(truth_only.detach().cpu())
+        ar_pred_list.append(gen_only.detach().cpu())
+        ar_context_list.append(int(context_len))
+        ar_nsteps_list.append(int(n_steps))
 
     # Write a single unified H5 with all collected arrays
     try:
@@ -448,8 +411,8 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
         init_stim = stim[:, :context_len, :]
         future_stim = stim[:, context_len:, :]
         gen_seq = model.autoregress(init_x, init_stim, positions, mask, future_stim, n_steps=n_steps, context_len=context_len)
-        gen_only = gen_seq[:, -n_steps:, :]   # (B, n_steps, N), probabilities in [0,1]
-        tgt_only = spikes[:, context_len:context_len + n_steps, :]    # (B, n_steps, N)
+        gen_only = gen_seq[:, -n_steps:, :]
+        tgt_only = spikes[:, context_len:context_len + n_steps, :].float()
 
         # Ensure accumulator sizes
         if len(per_step_loss_sums) < n_steps:
@@ -513,17 +476,16 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
         for k in range(n_steps):
             preds_k = gen_only[:, k, :].detach()
             targs_k = tgt_only[:, k, :].detach()
-            # Loss per step depending on mode
-            if spikes_are_rates:
-                # No BCE; could log NaN or skip
-                pass
-            elif spikes_are_zcalcium:
+            # Track optional losses
+            if spikes_are_zcalcium:
                 loss_k = F.mse_loss(preds_k.float(), targs_k.float(), reduction='mean').item()
                 per_step_loss_sums[k] += loss_k
-            else:
-                loss_k = F.binary_cross_entropy(preds_k, targs_k, reduction='mean').item()
-                per_step_loss_sums[k] += loss_k
-            per_step_counts[k] += 1
+                per_step_counts[k] += 1
+            elif not spikes_are_rates:
+                # MAE in log-rate domain as proxy loss
+                abs_err_loss = (preds_k.float() - targs_k.float()).abs().mean().item()
+                per_step_loss_sums[k] += abs_err_loss
+                per_step_counts[k] += 1
 
             # Spike-rate metrics are only defined for prob/rates modes
             if spikes_are_rates:
@@ -564,7 +526,9 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
     # Averages
     per_step_loss = []
     for k in range(len(per_step_counts)):
-        if spikes_are_rates:
+        if spikes_are_zcalcium:
+            per_step_loss.append(per_step_loss_sums[k] / max(1, per_step_counts[k]))
+        elif spikes_are_rates:
             per_step_loss.append(float('nan'))
         else:
             per_step_loss.append(per_step_loss_sums[k] / max(1, per_step_counts[k]))
@@ -587,7 +551,7 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
             for k in range(len(per_step_counts)):
                 f.write(f"{k+1},{per_step_loss[k]:.6f},{per_step_mae_z[k]:.6f},{per_step_counts[k]}\n")
         else:
-            f.write('step,bce,mae_rate,rel_perf,count\n')
+            f.write('step,loss,mae_rate,rel_perf,count\n')
             for k in range(len(per_step_counts)):
                 rp = per_step_relative[k]
                 rp_str = f"{rp:.6f}" if np.isfinite(rp) else 'nan'
@@ -610,7 +574,7 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
             ax2.plot(steps, per_step_mae_z, color=color)
             ax2.tick_params(axis='y', labelcolor=color)
         elif not spikes_are_rates:
-            ax1.set_ylabel('BCE', color=color)
+            ax1.set_ylabel('Avg loss', color=color)
             ax1.plot(steps, per_step_loss, color=color)
             ax1.tick_params(axis='y', labelcolor=color)
             ax2 = ax1.twinx()
@@ -640,7 +604,7 @@ def evaluate_autoregression(model: GBM, loader: torch.utils.data.DataLoader, dev
         pass
 
     return {
-        'per_step_bce': per_step_loss,
+        'per_step_loss': per_step_loss,
         'per_step_mae_rate': per_step_mae_rate,
         'per_step_rel_perf': per_step_relative,
         'best_sample_data': best_sample_data,
@@ -889,8 +853,11 @@ def main():
     cfg['training']['batch_size'] = cfg['eval']['batch_size']
     cfg['training']['sequence_length'] = cfg['eval']['sequence_length']
     cfg['training']['stride'] = cfg['eval']['stride']
+    cfg['training']['only_test'] = False
+    max_tp = cfg['eval'].get('max_timepoints_per_subject')
+    if max_tp is not None:
+        cfg['training']['max_timepoints_per_subject'] = max_tp
     cfg['training']['num_workers'] = cfg['eval']['num_workers']
-    cfg['training']['only_test'] = True  # enforce strict use of provided test subjects
     # Enforce explicit test subjects if provided; do NOT fall back to random split
     data_dir = Path(cfg['data']['data_dir'])
     test_subjects = cfg['data'].get('test_subjects', [])
@@ -898,14 +865,29 @@ def main():
         missing = [s for s in test_subjects if not (data_dir / f"{s}.h5").exists()]
         if missing:
             raise ValueError(f"Requested test subjects not found in {data_dir}: {missing}")
+        cfg['training']['only_test'] = True
     _, ns_loader, *_ = create_dataloaders(cfg)
+
+    if len(ns_loader) == 0:
+        raise RuntimeError(
+            "Next-step evaluation loader returned zero batches. "
+            "Verify data_dir, sequence_length, stride, and test_subjects cover at least one window."
+        )
 
     # Build AR dataloader with window size 2L (first L context, second L horizon)
     import copy as _copy
     cfg_ar = _copy.deepcopy(cfg)
     L_ctx = int(cfg['eval']['sequence_length'])
     cfg_ar['training']['sequence_length'] = 2 * L_ctx
+    if max_tp is not None:
+        cfg_ar['training']['max_timepoints_per_subject'] = max_tp
     _, ar_loader, *_ = create_dataloaders(cfg_ar)
+
+    if len(ar_loader) == 0:
+        raise RuntimeError(
+            "Autoregression evaluation loader returned zero batches with context length 2L. "
+            "Consider reducing sequence_length or stride."
+        )
 
     tracker = CombinedMetricsTracker(log_dir=dirs['logs'], ema_alpha=0.0, val_threshold=cfg['eval']['threshold'], enable_plots=True)
     if not offline_mode:
@@ -938,7 +920,7 @@ def main():
                 spikes_are_rates=bool(cfg['data'].get('spikes_are_rates', False)),
                 spikes_are_zcalcium=bool(cfg['data'].get('spikes_are_zcalcium', False)),
             )
-            logger.info(f"Autoregression per-step metrics saved. First steps: BCE={ar_metrics['per_step_bce'][:3]}, MAE_rate={ar_metrics['per_step_mae_rate'][:3]}")
+            logger.info(f"Autoregression per-step metrics saved. First steps MAE_rate={ar_metrics['per_step_mae_rate'][:3]}")
             
             # Create video for best performing AR sample
             if ar_metrics.get('best_sample_data') is not None:
@@ -1052,18 +1034,17 @@ def main():
                     stim = batch['stimulus'].to(device).to(torch.bfloat16)
                     x_in = spikes[:, :-1, :]
                     x_tgt = spikes[:, 1:, :].float()
-                    logits = model(x_in, stim[:, :-1, :], batch['positions'].to(device), mask, get_logits=True)
-                    # BCE only when not in rates mode
-                    bce = F.binary_cross_entropy_with_logits(logits.float(), x_tgt, reduction='none') if not bool(cfg['data'].get('spikes_are_rates', False)) else torch.zeros_like(x_tgt)
-                    mask_rep = mask[:, None, :].expand(bce.shape[0], bce.shape[1], bce.shape[2])
-                    # Spike-rate errors from probabilities
+                    m_val, s_val = model(x_in, stim[:, :-1, :], batch['positions'].to(device), mask, get_logits=True)
+                    preds = lognormal_mean(m_val, s_val)
+                    mask_rep = mask[:, None, :].expand(preds.shape[0], preds.shape[1], preds.shape[2])
+                    # Loss surrogate (MAE in rates)
+                    bce = (preds.float() - x_tgt.float()).abs()
                     eps = 1e-7
                     if bool(cfg['data'].get('spikes_are_rates', False)):
-                        p_rate = torch.exp(logits.float())
+                        p_rate = preds.float()
                         t_rate = x_tgt.float()
                     else:
-                        probs = torch.sigmoid(logits.float())
-                        p_clamped = probs.clamp(0.0, 1.0 - eps)
+                        p_clamped = preds.clamp(0.0, 1.0 - eps)
                         t_clamped = x_tgt.clamp(0.0, 1.0 - eps)
                         p_rate = -sampling_rate_hz * torch.log1p(-p_clamped)
                         t_rate = -sampling_rate_hz * torch.log1p(-t_clamped)
@@ -1173,13 +1154,15 @@ def main():
                     stim_in = stim[:, :-1, :]
                     logits = model(x_in, stim_in, positions, mask, get_logits=True)
                     probs = torch.sigmoid(logits).detach()  # keep on device for masked means
+                    m_val, s_val = model(x_in, stim_in, positions, mask, get_logits=True)
+                    pred_mean = lognormal_mean(m_val, s_val).detach()
                     all_truth.append(x_tgt.detach().float().cpu())
-                    all_pred.append(probs.float().cpu())
+                    all_pred.append(pred_mean.float().cpu())
                     mask_exp = mask[:, None, :].to(x_tgt.dtype)
                     mask_rep = mask_exp.expand(-1, x_tgt.shape[1], -1)
                     denom = mask_rep.sum(dim=-1).clamp_min(1)
                     truth_means_list.append(((x_tgt.float() * mask_rep).sum(dim=-1) / denom).detach().cpu())
-                    pred_means_list.append(((probs.float() * mask_rep).sum(dim=-1) / denom).detach().cpu())
+                    pred_means_list.append(((pred_mean.float() * mask_rep).sum(dim=-1) / denom).detach().cpu())
                 # No early stop: use all next-step timepoints across all batches
         if all_truth:
             truth_np = torch.cat([t.reshape(-1, t.shape[-1]) for t in all_truth], dim=0).numpy()

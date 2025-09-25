@@ -9,6 +9,9 @@ from GenerativeBrainModel.models.spatiotemporal import SpatioTemporalNeuralAtten
 import os
 
 
+LOGNORMAL_STABILITY_EPS = 1e-6
+
+
 class GBM(nn.Module):
     def __init__(self, d_model, d_stimuli, n_heads, n_layers):
         super(GBM, self).__init__()
@@ -32,7 +35,7 @@ class GBM(nn.Module):
         )
         self.neuron_scalar_decoder_head = nn.Sequential(
             RMSNorm(d_model),
-            nn.Linear(d_model, 1),
+            nn.Linear(d_model, 2),
         )
 
 
@@ -49,7 +52,7 @@ class GBM(nn.Module):
         })
 
 
-    def forward(self, x, x_stimuli, point_positions, neuron_pad_mask, get_logits=True):
+    def forward(self, x, x_stimuli, point_positions, neuron_pad_mask, get_logits=True, input_log_rates=False):
         # Takes as input sequences of shape x: (batch_size, seq_len, n_neurons)
         # x_stimuli: (batch_size, seq_len, d_stimuli)
         # point_positions: (batch_size, n_neurons, 3)
@@ -57,26 +60,42 @@ class GBM(nn.Module):
         # Returns sequences of shape (batch_size, seq_len, n_neurons, d_model)
         B, T, N = x.shape
 
+        if not input_log_rates:
+            # Convert input spike rates to log-rates immediately for downstream processing
+            x = torch.log(x.clamp_min(LOGNORMAL_STABILITY_EPS))
+
+        target_dtype = next(self.parameters()).dtype
+
         x = x.unsqueeze(-1)
 
 
 
+        params_dtype = target_dtype
+
         # Keep dtype consistent with model weights (bf16 when enabled)
-        if x.dtype != next(self.parameters()).dtype:
-            x = x.to(next(self.parameters()).dtype)
+        if x.dtype != params_dtype:
+            x = x.to(params_dtype)
         # Ensure point_positions dtype matches as well
-        if point_positions.dtype != next(self.parameters()).dtype:
-            point_positions = point_positions.to(next(self.parameters()).dtype)
+        if point_positions.dtype != params_dtype:
+            point_positions = point_positions.to(params_dtype)
 
+        # point_positions: (B, N, 3)
+        # Compute centroid (mean) and RMS scale for each batch to normalize positions
+        centroid = point_positions.mean(dim=1, keepdim=True)  # (B, 1, 3)
+        pos_centered = point_positions - centroid              # (B, N, 3)
+        # Compute RMS scale (root mean square distance from centroid)
+        r2 = (pos_centered ** 2).sum(dim=2)                   # (B, N)
+        scale = (r2.mean(dim=1, keepdim=True).clamp_min(1e-6).sqrt()).unsqueeze(-1)  # (B, 1, 1)
+        rel_point_positions = pos_centered / scale             # (B, N, 3) -- zero mean, unit RMS
 
-        # Concatenate the neuron scalars and the point positions by repeating the point positions for the entire sequence of neuron states
-        x = torch.cat([x, point_positions.unsqueeze(1).repeat(1, T, 1, 1)], dim=3)
+        # Concatenate the neuron scalars and the relative point positions by repeating for the entire sequence
+        x = torch.cat([x, rel_point_positions.unsqueeze(1).repeat(1, T, 1, 1)], dim=3)
 
         # Encode the neuron scalars and the point positions
         x = self.neuron_scalar_position_encoder(x)
 
         # (B, T, d_stimuli) -> (B, T, 1, d_model), acts as a global stimulus embedding as a token for each time step
-        x_stimuli = x_stimuli.to(next(self.parameters()).dtype).unsqueeze(2)
+        x_stimuli = x_stimuli.to(params_dtype).unsqueeze(2)
         x_stimuli = self.stimuli_encoder(x_stimuli) # (B, T, 1, d_model)
 
         # concatenate the stimulus embedding to the input
@@ -86,7 +105,7 @@ class GBM(nn.Module):
         neuron_pad_mask = torch.cat([neuron_pad_mask, torch.ones(B, 1, device=neuron_pad_mask.device)], dim=1) # (B, n_neurons + 1)
 
         # Adds a zero vector to point_positions to account for the stimulus token
-        point_positions = torch.cat([point_positions, torch.zeros(B, 1, 3, device=point_positions.device)], dim=1) # (B, n_neurons + 1, 3)
+        point_positions = torch.cat([point_positions, torch.zeros(B, 1, 3, device=point_positions.device, dtype=params_dtype)], dim=1) # (B, n_neurons + 1, 3)
 
         # Apply the layers
         for i, layer in enumerate(self.layers):
@@ -99,57 +118,57 @@ class GBM(nn.Module):
         # Decode the neuron scalars
         x = self.neuron_scalar_decoder_head(x)
 
-
-
-        # Reshape to (batch_size, seq_len, n_neurons)
-        x = x.squeeze(-1)
+        # Split into log-rate location (m_raw) and scale (s_raw)
+        m_raw = x[..., 0]
+        s_raw = x[..., 1]
 
         if get_logits:
-            return x
+            return m_raw, s_raw
 
-        # When not returning logits, choose output domain based on model flags
-        # - Z-calcium mode: identity (already z-scored, can be negative)
-        # - Rates mode: exp(logits) where logits represent log-rate (nonnegative)
-        # - Probabilities mode (default): sigmoid(logits) in [0,1]
-        if getattr(self, 'spikes_are_zcalcium', False):
-            return x
-        if getattr(self, 'spikes_are_rates', False):
-            return torch.exp(x)
-        return torch.sigmoid(x)
+        # Calculate the mean of the lognormal distribution
+        s = F.softplus(s_raw) + LOGNORMAL_STABILITY_EPS
+        mean = torch.exp(m_raw.float() + 0.5 * s.float() * s.float())
+        return mean.to(m_raw.dtype)
+
 
     def autoregress(self, init_x, init_stimuli, point_positions, neuron_pad_mask, future_stimuli=None, n_steps=10, context_len=12):
-        # init_x: (B, T, n_neurons)
-        # init_stimuli: (B, T, d_stimuli)
-        # init_point_positions: (B, n_neurons, 3)
-        # neuron_pad_mask: (B, n_neurons)
-        # future_stimuli: (B, n_steps, d_stimuli)
-        # n_steps: number of steps to generate
-        # context_len: number of steps to use as context
-
+        """
+        Deterministic, unbiased rollout: feed the LogNormal *median* (exp(m)) at each step.
+        init_x:         (B, T, N)   rates (Hz)
+        init_stimuli:   (B, T, dS)
+        point_positions:(B, N, 3)
+        neuron_pad_mask:(B, N)
+        future_stimuli: (B, n_steps, dS) or None -> zeros
+        Returns:        (B, T + n_steps, N)
+        """
         B, T, N = init_x.shape
-        
-        assert T >= context_len, "context_len must be less than or equal to T"
-        assert n_steps > 0, "n_steps must be greater than 0"
-        assert context_len > 0, "context_len must be greater than 0"
+        assert T >= context_len, "context_len must be ≤ T"
+        assert n_steps > 0 and context_len > 0
 
         if future_stimuli is None:
-            future_stimuli = torch.zeros(B, n_steps, self.d_stimuli, device=init_x.device)
+            future_stimuli = torch.zeros(B, n_steps, self.d_stimuli, device=init_x.device, dtype=init_x.dtype)
         else:
-            assert future_stimuli.shape[0] == B, "future_stimuli must have the same batch size as init_x"
-            assert future_stimuli.shape[1] == n_steps, "future_stimuli must have n_steps steps"
-            assert future_stimuli.shape[2] == self.d_stimuli, "future_stimuli must have d_stimuli features"
+            assert future_stimuli.shape == (B, n_steps, self.d_stimuli)
 
-        # Start with the full context
         current_neuron_scalars = init_x
         current_stimuli = init_stimuli
 
-        # Generate n_steps by repeatedly using the last `context_len` frames as context
+        current_neuron_scalars = torch.log(current_neuron_scalars.clamp_min(LOGNORMAL_STABILITY_EPS))
+
         for i in range(n_steps):
-            context = current_neuron_scalars[:, -context_len:]
-            context_stim = current_stimuli[:, -context_len:, :]
-            next_step = self.forward(context, context_stim, point_positions, neuron_pad_mask, get_logits=False)[:, -1:]  # (B,1,N)
+            context = current_neuron_scalars[:, -context_len:]              # (B, C, N)
+            context_stim = current_stimuli[:, -context_len:, :]             # (B, C, dS)
+
+            # Get lognormal params for next step
+            m_raw, s_raw = self.forward(context, context_stim, point_positions, neuron_pad_mask, get_logits=True, input_log_rates=True)
+            m_next = m_raw[:, -1:, :]                                       # (B, 1, N)
+
+            # Unbiased deterministic input = log median = m_raw
+            next_step = m_next                                   # (B, 1, N) in Hz
+
             current_neuron_scalars = torch.cat([current_neuron_scalars, next_step], dim=1)
             current_stimuli = torch.cat([current_stimuli, future_stimuli[:, i:i+1, :]], dim=1)
 
-        # Return the full sequence (context + generated)
+        current_neuron_scalars = torch.exp(current_neuron_scalars)
+
         return current_neuron_scalars
