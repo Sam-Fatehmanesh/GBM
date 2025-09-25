@@ -40,7 +40,7 @@ class SpatioTemporalNeuralAttention(nn.Module):
 
         x = self.conv(x)
 
-        # x = self.spatial_attention(x, point_positions, neuron_pad_mask)
+        x = self.spatial_attention(x, point_positions, neuron_pad_mask)
 
         x = self.FFN0(x)
         

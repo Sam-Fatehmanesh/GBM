@@ -31,7 +31,8 @@ class RoutingFlashMHA(nn.Module):
         d_model: int,
         n_heads: int,
         *,
-        target_cluster_size: int = 384,    # w
+        target_cluster_size: int = 384,    # desired tokens per centroid (w)
+        num_centroids: int = 384,          # fixed number of spatial centroids
         ema_decay: float = 0.999,          # λ
         bias: bool = False,
         ddp_sync: bool = True,             # turn on DDP all-reduce/broadcast
@@ -44,6 +45,7 @@ class RoutingFlashMHA(nn.Module):
         assert self.head_dim % 8 == 0
 
         self.w = int(target_cluster_size)
+        self.num_centroids = int(num_centroids)
         self.ema_decay = float(ema_decay)
         self.ddp_sync = bool(ddp_sync)
         self.ddp_pg = ddp_pg
@@ -58,12 +60,35 @@ class RoutingFlashMHA(nn.Module):
         # Spherical routing norm over shared routing features (per-token Dh)
         self.route_ln = nn.LayerNorm(self.head_dim, elementwise_affine=False)
 
-        # Persistent centroid bank as a BUFFER (not optimized): [K, Dh], unit-norm
-        self.register_buffer("centroids", torch.empty(0, self.head_dim), persistent=True)
+        # Fixed spatial centroid bank (features + positions)
+        grid_pos, grid_feat = self._create_initial_centroids(self.num_centroids, self.head_dim, dtype=torch.float32)
+        self.register_buffer("centroids", grid_feat, persistent=True)           # (K, Dh)
+        self.register_buffer("centroid_pos", grid_pos, persistent=True)         # (K, 3)
+        self.register_buffer("centroid_pos_norm2", (grid_pos ** 2).sum(-1), persistent=True)
+
+        self.spatial_weight = 1.0
 
     @staticmethod
     def _l2n(x: torch.Tensor, eps: float = 1e-6):
         return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+    @staticmethod
+    def _create_initial_centroids(K: int, head_dim: int, dtype=torch.float32):
+        # Generate near-uniform grid in [-1,1]^3
+        if K <= 0:
+            raise ValueError("num_centroids must be positive")
+        n = int(round(K ** (1 / 3)))
+        if n ** 3 < K:
+            n += 1
+        axes = torch.linspace(-1.0, 1.0, steps=n)
+        grid = torch.stack(torch.meshgrid(axes, axes, axes, indexing='ij'), dim=-1).reshape(-1, 3)
+        grid = grid[:K]
+        grid_pos = grid.to(dtype=dtype)
+        repeats = (head_dim + 2) // 3
+        tiled = grid_pos.repeat(1, repeats)
+        centroids_feat = tiled[:, :head_dim]
+        centroids_feat = RoutingFlashMHA._l2n(centroids_feat)
+        return grid_pos, centroids_feat
 
     def _ddp_available(self):
         return self.ddp_sync and dist.is_available() and dist.is_initialized()
@@ -76,37 +101,12 @@ class RoutingFlashMHA(nn.Module):
         if self._ddp_available() and self.centroids.numel() > 0:
             # Broadcast whole tensor (simple & robust)
             dist.broadcast(self.centroids, src=0, group=self.ddp_pg)
+            dist.broadcast(self.centroid_pos, src=0, group=self.ddp_pg)
+            dist.broadcast(self.centroid_pos_norm2, src=0, group=self.ddp_pg)
 
-    def _ensure_centroids(self, device, dtype, K_needed: int, seed_feats: torch.Tensor):
-        """
-        Ensure we have at least K_needed centroids. If we grow, rank-0 seeds new rows and broadcasts them.
-        seed_feats are assumed roughly unit-norm in (Dh,).
-        """
-        K_cur = int(self.centroids.shape[0])
-        if K_needed <= K_cur:
-            return
-
-        K_new = K_needed
-        # Resize (all ranks) and zero-fill new rows
-        if K_cur == 0:
-            centroids = torch.zeros(K_new, self.head_dim, device=device, dtype=dtype)
-        else:
-            centroids = torch.zeros(K_new, self.head_dim, device=device, dtype=dtype)
-            centroids[:K_cur] = self.centroids.to(device=device, dtype=dtype)
-
-        # Rank-0 seeds the new rows, others leave zeros; then broadcast
-        if (not self._ddp_available()) or dist.get_rank(self.ddp_pg or dist.group.WORLD) == 0:
-            if seed_feats.numel() > 0:
-                idx = torch.linspace(0, max(seed_feats.size(0) - 1, 0),
-                                     steps=K_new - K_cur, device=seed_feats.device).round().to(torch.long)
-                new_c = seed_feats.index_select(0, idx).to(device=device, dtype=dtype)
-                new_c = self._l2n(new_c)
-            else:
-                new_c = self._l2n(torch.randn(K_new - K_cur, self.head_dim, device=device, dtype=dtype))
-            centroids[K_cur:K_new] = new_c
-
-        self.centroids = centroids  # assign buffer
-        self._bcast_centroids_()
+    def _ensure_centroids(self, *args, **kwargs):
+        # Fixed centroid bank; nothing to do
+        return
 
     @torch.no_grad()
     def _ema_update_ddp(self, sums_f32: torch.Tensor, counts_f32: torch.Tensor, k_use: int):
@@ -141,6 +141,8 @@ class RoutingFlashMHA(nn.Module):
         self,
         x_compact: torch.Tensor,          # [Ttot, D]
         seqlens_tokens: torch.Tensor,     # [S]
+        *,
+        token_positions: torch.Tensor | None = None,
     ):
         dtype = next(self.parameters()).dtype
         x = x_compact.to(dtype=dtype)
@@ -166,33 +168,10 @@ class RoutingFlashMHA(nn.Module):
         cu_tok[1:] = lens_dev.cumsum(0)
         bounds = cu_tok.detach().cpu().tolist()
 
-        # Determine local k_needed (max over sets)
-        k_needed_local = 0
-        for s in range(S):
-            a = int(bounds[s]); b = int(bounds[s + 1])
-            Ls = max(0, min(b, Ttot) - min(a, Ttot))
-            if Ls <= 0:
-                continue
-            w_eff = max(1, min(self.w, Ls))
-            k_s = max(1, (Ls + w_eff - 1) // w_eff)
-            k_needed_local = max(k_needed_local, k_s)
-
-        # Global max across ranks so we reduce with uniform shapes
-        k_needed = k_needed_local
-        if self._ddp_available():
-            t = torch.tensor([k_needed_local], device=x.device, dtype=torch.int64)
-            dist.all_reduce(t, op=dist.ReduceOp.MAX, group=self.ddp_pg)
-            k_needed = int(t.item())
-
-        # Ensure/grow centroid bank to k_needed (seed & broadcast if needed)
-        seed_idx = torch.linspace(0, max(Ttot - 1, 0), steps=max(1, k_needed),
-                                  device=r.device).round().to(torch.long)
-        self._ensure_centroids(x.device, r.dtype, k_needed, seed_feats=r.index_select(0, seed_idx))
-
         # Build multi-membership top-w packing and accumulate EMA stats (fp32)
         order_chunks, lens_chunks = [], []
-        ema_sums = torch.zeros(k_needed, Dh, device=x.device, dtype=torch.float32)
-        ema_counts = torch.zeros(k_needed, 1, device=x.device, dtype=torch.float32)
+        ema_sums = torch.zeros(self.num_centroids, Dh, device=x.device, dtype=torch.float32)
+        ema_counts = torch.zeros(self.num_centroids, 1, device=x.device, dtype=torch.float32)
 
         for s in range(S):
             a = int(bounds[s]); b = int(bounds[s + 1])
@@ -203,21 +182,43 @@ class RoutingFlashMHA(nn.Module):
 
             feats = r.narrow(0, a, Ls)                       # [L, Dh]
             w_eff = max(1, min(self.w, Ls))
-            k_s = max(1, (Ls + w_eff - 1) // w_eff)
+            k_s = self.num_centroids
+            C = self.centroids.to(device=x.device, dtype=feats.dtype)
+            sims = feats @ C.T
+            pos_slice = None
+            if token_positions is not None:
+                pos_slice = token_positions.narrow(0, a, Ls)
+                cen_pos = self.centroid_pos.to(device=x.device, dtype=pos_slice.dtype)
+                cen_norm = self.centroid_pos_norm2.to(device=x.device, dtype=pos_slice.dtype)
+                sq_norm_token = (pos_slice ** 2).sum(-1, keepdim=True)
+                spatial = sq_norm_token - 2 * (pos_slice @ cen_pos.T) + cen_norm
+                sims = sims - (self.spatial_weight * spatial)
 
-            C = self.centroids[:k_s]                          # [k_s, Dh]
-            sims = feats @ C.T                                # [L, k_s]
-
-            # Balanced top-w per centroid (multi-membership)
             top_idx = sims.topk(k=w_eff, dim=0, largest=True, sorted=False).indices  # [w_eff, k_s]
-            kept_rel = top_idx.transpose(0, 1).reshape(-1)    # [k_s * w_eff]
-            order_abs = kept_rel + a
-            order_chunks.append(order_abs)
-            lens_chunks.append(torch.full((k_s,), w_eff, device=x.device, dtype=torch.int32))
+            selected_local = torch.zeros(Ls, dtype=torch.bool, device=x.device)
+            cluster_buffers = []
+            lens_local = torch.zeros(k_s, dtype=torch.int32, device=x.device)
+            for j in range(k_s):
+                tokens_local = top_idx[:, j]
+                tokens_local = torch.unique(tokens_local)
+                selected_local[tokens_local] = True
+                cluster_buffers.append(tokens_local + a)
+                lens_local[j] = tokens_local.numel()
 
-            # Nearest-centroid assign for EMA stats
-            assign = sims.argmax(dim=1)                       # [L]
-            # fp32 accumulation
+            nearest = sims.argmax(dim=1)
+            missing_local = (~selected_local).nonzero(as_tuple=False).flatten()
+            if missing_local.numel() > 0:
+                nearest_missing = nearest[missing_local]
+                for idx_local, centroid_idx in zip(missing_local.tolist(), nearest_missing.tolist()):
+                    global_idx = torch.tensor([a + idx_local], device=x.device, dtype=torch.long)
+                    cluster_buffers[centroid_idx] = torch.cat([cluster_buffers[centroid_idx], global_idx], dim=0)
+                    lens_local[centroid_idx] += 1
+
+            order_abs = torch.cat(cluster_buffers, dim=0) if cluster_buffers else torch.empty(0, device=x.device, dtype=torch.long)
+            order_chunks.append(order_abs)
+            lens_chunks.append(lens_local)
+
+            assign = nearest                       # [L]
             feats_f32 = feats.to(torch.float32)
             ema_sums[:k_s].index_add_(0, assign, feats_f32)
             ema_counts[:k_s] += torch.bincount(assign, minlength=k_s).to(torch.float32).unsqueeze(1)
@@ -227,6 +228,21 @@ class RoutingFlashMHA(nn.Module):
 
         order = torch.cat(order_chunks, dim=0)                # [Tdup]
         lens_t = torch.cat(lens_chunks, dim=0)                # [#clusters_total]
+
+        # Ensure every token is assigned at least once
+        selected_mask = torch.zeros(Ttot, device=x.device, dtype=torch.bool)
+        selected_mask.index_fill_(0, order, True)
+        missing = (~selected_mask).nonzero(as_tuple=False).flatten()
+        if missing.numel() > 0:
+            sims_missing = (r[missing] @ self.centroids.T)
+            nearest = sims_missing.argmax(dim=1)
+            order = torch.cat([order, missing], dim=0)
+            counts_missing = torch.bincount(nearest, minlength=k_s).to(torch.float32)
+            ema_counts[:k_s, 0] += counts_missing
+            sums_missing = torch.zeros_like(ema_sums)
+            sums_missing.index_add_(0, nearest, r[missing].to(torch.float32))
+            ema_sums += sums_missing
+
         cu_cls = torch.zeros(lens_t.numel() + 1, device=x.device, dtype=torch.int32)
         cu_cls[1:] = lens_t.cumsum(0)
         max_seqlen = int(lens_t.max().item())
@@ -253,7 +269,7 @@ class RoutingFlashMHA(nn.Module):
         # Freeze centroid EMA during inference to ensure deterministic eval behavior
         if self.training:
             with torch.no_grad():
-                self._ema_update_ddp(ema_sums, ema_counts, k_needed)
+                self._ema_update_ddp(ema_sums, ema_counts, self.num_centroids)
 
         out_input = out_h.reshape(Ttot, D)
         weight_dtype = self.out_proj.weight.dtype
@@ -331,8 +347,14 @@ class SpatialNeuralAttention(nn.Module):
         x_compact = qk_flat.index_select(0, idx_flat)                  # [Ttot, D]
         v_compact = xn_flat.index_select(0, idx_flat)                  # (not used directly, but x_compact is the source)
 
+        if point_positions is not None:
+            pos_bt = point_positions.unsqueeze(1).expand(B, T, N, 3).reshape(S * N, 3)
+            token_pos = pos_bt.index_select(0, idx_flat)
+        else:
+            token_pos = None
+
         # Router uses x_compact for Q/K/V sources internally (self-attn)
-        out_compact = self.attn(x_compact, seqlens_tokens=lens)        # [Ttot, D]
+        out_compact = self.attn(x_compact, seqlens_tokens=lens, token_positions=token_pos)        # [Ttot, D]
 
         # Scatter back
         out_flat = torch.zeros(S * N, D, device=x.device, dtype=out_compact.dtype)
