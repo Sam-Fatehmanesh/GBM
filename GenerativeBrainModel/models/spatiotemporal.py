@@ -38,11 +38,11 @@ class SpatioTemporalNeuralAttention(nn.Module):
         if neuron_pad_mask is not None and neuron_pad_mask.dtype != d_dtype:
             neuron_pad_mask = neuron_pad_mask.to(d_dtype)
 
-        #x = self.conv(x)
+        x = self.conv(x)
 
-        #x = self.spatial_attention(x, point_positions, neuron_pad_mask)
+        # x = self.spatial_attention(x, point_positions, neuron_pad_mask)
 
-        #x = self.FFN0(x)
+        x = self.FFN0(x)
         
         x = self.temporal_attention(x, neuron_pad_mask)
 

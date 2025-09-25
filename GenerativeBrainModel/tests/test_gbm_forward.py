@@ -32,13 +32,15 @@ def test_forward_returns_log_params(dtype, require_cuda):
     model.eval()
     spikes, stim, positions, mask = _fake_batch(dtype=dtype, device=device)
 
-    m_raw, s_raw = model(spikes, stim, positions, mask, get_logits=True)
-    assert m_raw.shape == (spikes.shape[0], spikes.shape[1], spikes.shape[2])
-    assert s_raw.shape == m_raw.shape
+    mu, log_sigma, eta, log_delta = model(spikes, stim, positions, mask, get_logits=True)
+    assert mu.shape == (spikes.shape[0], spikes.shape[1], spikes.shape[2])
+    assert log_sigma.shape == mu.shape
+    assert eta.shape == mu.shape
+    assert log_delta.shape == mu.shape
 
-    mean_rates = model(spikes, stim, positions, mask, get_logits=False)
-    assert mean_rates.shape == m_raw.shape
-    assert torch.all(mean_rates > 0)
+    median_rates = model(spikes, stim, positions, mask, get_logits=False)
+    assert median_rates.shape == mu.shape
+    assert torch.all(median_rates > 0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -53,9 +55,9 @@ def test_forward_handles_dtype(dtype, require_cuda):
     positions = positions.to(device=device, dtype=dtype)
     mask = mask.to(device=device, dtype=dtype)
 
-    m_raw, s_raw = model(spikes, stim, positions, mask, get_logits=True)
-    assert m_raw.dtype == dtype
-    assert s_raw.dtype == dtype
+    outputs = model(spikes, stim, positions, mask, get_logits=True)
+    for tensor in outputs:
+        assert tensor.dtype == dtype
 
 
 def test_autoregress_extends_sequence(require_cuda):

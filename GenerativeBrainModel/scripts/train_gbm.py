@@ -28,7 +28,7 @@ from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
-from GenerativeBrainModel.utils.lognormal import lognormal_nll, lognormal_mean
+from GenerativeBrainModel.utils.sas import sas_nll, sas_rate_median
 import pdb
 import math
 
@@ -377,8 +377,8 @@ def train_one_epoch(
         if batch_idx % grad_accum == 1:
             optimizer.zero_grad()
 
-        m_raw, s_raw = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = lognormal_nll(x_tgt.float(), m_raw.float(), s_raw.float())
+        mu, log_sigma_raw, eta, log_delta_raw = model(x_in, stim_in, positions, mask, get_logits=True)
+        loss = sas_nll(x_tgt.float(), mu.float(), log_sigma_raw.float(), eta.float(), log_delta_raw.float())
         (loss / grad_accum).backward()
 
         if batch_idx % grad_accum == 0:
@@ -417,9 +417,9 @@ def train_one_epoch(
                 x_tgt_v = spikes_v[:, 1:, :].float()
                 stim_in_v = stim_v[:, :-1, :]
                 with torch.no_grad():
-                    m_val, s_val = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
-                    vloss = lognormal_nll(x_tgt_v, m_val.float(), s_val.float())
-                    preds_vis = lognormal_mean(m_val, s_val)
+                    mu_val, log_sigma_val, eta_val, log_delta_val = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
+                    vloss = sas_nll(x_tgt_v, mu_val.float(), log_sigma_val.float(), eta_val.float(), log_delta_val.float())
+                    preds_vis = sas_rate_median(mu_val, log_sigma_val, eta_val, log_delta_val)
                     probs_v = preds_vis
                     targs_prob_v = x_tgt_v
                 total_vloss += float(vloss.detach().cpu().item())
@@ -508,9 +508,9 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         x_tgt = spikes[:, 1:, :].float()
         stim_in = stim[:, :-1, :]
 
-        m_val, s_val = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = lognormal_nll(x_tgt, m_val.float(), s_val.float())
-        preds = lognormal_mean(m_val, s_val)
+        mu_val, log_sigma_val, eta_val, log_delta_val = model(x_in, stim_in, positions, mask, get_logits=True)
+        loss = sas_nll(x_tgt, mu_val.float(), log_sigma_val.float(), eta_val.float(), log_delta_val.float())
+        preds = sas_rate_median(mu_val, log_sigma_val, eta_val, log_delta_val)
         total_loss += float(loss.detach().cpu().item())
         total_batches += 1
 
@@ -538,8 +538,8 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
     x_in = spikes[:, :-1, :]
     x_tgt = spikes[:, 1:, :]
     stim_in = stim[:, :-1, :]
-    m_vis, s_vis = model(x_in, stim_in, positions, mask, get_logits=True)
-    preds_vis = lognormal_mean(m_vis, s_vis)
+    mu_vis, log_sigma_vis, eta_vis, log_delta_vis = model(x_in, stim_in, positions, mask, get_logits=True)
+    preds_vis = sas_rate_median(mu_vis, log_sigma_vis, eta_vis, log_delta_vis)
     truth_vis = x_tgt
     nextstep_path = videos_dir / f'nextstep_epoch_{epoch}.mp4'
     #pdb.set_trace()

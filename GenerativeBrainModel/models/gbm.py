@@ -9,7 +9,7 @@ from GenerativeBrainModel.models.spatiotemporal import SpatioTemporalNeuralAtten
 import os
 
 
-LOGNORMAL_STABILITY_EPS = 1e-6
+LOGRATE_EPS = 1e-6
 
 
 class GBM(nn.Module):
@@ -35,7 +35,7 @@ class GBM(nn.Module):
         )
         self.neuron_scalar_decoder_head = nn.Sequential(
             RMSNorm(d_model),
-            nn.Linear(d_model, 2),
+            nn.Linear(d_model, 4),
         )
 
 
@@ -62,7 +62,7 @@ class GBM(nn.Module):
 
         if not input_log_rates:
             # Convert input spike rates to log-rates immediately for downstream processing
-            x = torch.log(x.clamp_min(LOGNORMAL_STABILITY_EPS))
+            x = torch.log(x.clamp_min(LOGRATE_EPS))
 
         target_dtype = next(self.parameters()).dtype
 
@@ -118,22 +118,24 @@ class GBM(nn.Module):
         # Decode the neuron scalars
         x = self.neuron_scalar_decoder_head(x)
 
-        # Split into log-rate location (m_raw) and scale (s_raw)
-        m_raw = x[..., 0]
-        s_raw = x[..., 1]
+        # SAS parameters: mu, log_sigma_raw, eta, log_delta_raw
+        mu = x[..., 0]
+        log_sigma_raw = x[..., 1]
+        eta = x[..., 2]
+        log_delta_raw = x[..., 3]
 
         if get_logits:
-            return m_raw, s_raw
+            return mu, log_sigma_raw, eta, log_delta_raw
 
-        # Calculate the mean of the lognormal distribution
-        s = F.softplus(s_raw) + LOGNORMAL_STABILITY_EPS
-        mean = torch.exp(m_raw.float() + 0.5 * s.float() * s.float())
-        return mean.to(m_raw.dtype)
+        from GenerativeBrainModel.utils.sas import sas_rate_median
+
+        median = sas_rate_median(mu, log_sigma_raw, eta, log_delta_raw)
+        return median.to(mu.dtype)
 
 
     def autoregress(self, init_x, init_stimuli, point_positions, neuron_pad_mask, future_stimuli=None, n_steps=10, context_len=12):
         """
-        Deterministic, unbiased rollout: feed the LogNormal *median* (exp(m)) at each step.
+        Deterministic rollout using SAS median.
         init_x:         (B, T, N)   rates (Hz)
         init_stimuli:   (B, T, dS)
         point_positions:(B, N, 3)
@@ -150,25 +152,34 @@ class GBM(nn.Module):
         else:
             assert future_stimuli.shape == (B, n_steps, self.d_stimuli)
 
-        current_neuron_scalars = init_x
+        # Convert initial rates to log space once
+        current_log_rates = torch.log(init_x.clamp_min(LOGRATE_EPS))
         current_stimuli = init_stimuli
 
-        current_neuron_scalars = torch.log(current_neuron_scalars.clamp_min(LOGNORMAL_STABILITY_EPS))
+        from GenerativeBrainModel.utils.sas import sas_log_median
 
         for i in range(n_steps):
-            context = current_neuron_scalars[:, -context_len:]              # (B, C, N)
-            context_stim = current_stimuli[:, -context_len:, :]             # (B, C, dS)
-
-            # Get lognormal params for next step
-            m_raw, s_raw = self.forward(context, context_stim, point_positions, neuron_pad_mask, get_logits=True, input_log_rates=True)
-            m_next = m_raw[:, -1:, :]                                       # (B, 1, N)
-
-            # Unbiased deterministic input = log median = m_raw
-            next_step = m_next                                   # (B, 1, N) in Hz
-
-            current_neuron_scalars = torch.cat([current_neuron_scalars, next_step], dim=1)
+            # Use log-rates throughout
+            context_log = current_log_rates[:, -context_len:]
+            context_stim = current_stimuli[:, -context_len:, :]
+            mu, log_sigma_raw, eta, log_delta_raw = self.forward(
+                context_log,
+                context_stim,
+                point_positions,
+                neuron_pad_mask,
+                get_logits=True,
+                input_log_rates=True,
+            )
+            # The model outputs parameters for log-rate, so we use sas_log_median to get the next log-rate
+            next_log_rate = sas_log_median(
+                mu[:, -1:, :],
+                log_sigma_raw[:, -1:, :],
+                eta[:, -1:, :],
+                log_delta_raw[:, -1:, :],
+            )
+            # Keep everything in log space
+            current_log_rates = torch.cat([current_log_rates, next_log_rate], dim=1)
             current_stimuli = torch.cat([current_stimuli, future_stimuli[:, i:i+1, :]], dim=1)
 
-        current_neuron_scalars = torch.exp(current_neuron_scalars)
-
-        return current_neuron_scalars
+        # Return rates in Hz (exp of log-rates)
+        return current_log_rates.exp()

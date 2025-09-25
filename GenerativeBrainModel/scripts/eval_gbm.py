@@ -27,7 +27,7 @@ from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
 from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
-from GenerativeBrainModel.utils.lognormal import lognormal_nll, lognormal_mean
+from GenerativeBrainModel.utils.sas import sas_nll, sas_rate_median
 import numpy as np
 import torch.nn.functional as F
 import h5py
@@ -254,9 +254,9 @@ def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         x_in = spikes[:, :-1, :]
         x_tgt = spikes[:, 1:, :]
         stim_in = stim[:, :-1, :]
-        m_raw, s_raw = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = lognormal_nll(x_tgt.float(), m_raw.float(), s_raw.float())
-        preds = lognormal_mean(m_raw, s_raw)
+        mu_raw, log_sigma_raw, eta_raw, log_delta_raw = model(x_in, stim_in, positions, mask, get_logits=True)
+        loss = sas_nll(x_tgt.float(), mu_raw.float(), log_sigma_raw.float(), eta_raw.float(), log_delta_raw.float())
+        preds = sas_rate_median(mu_raw, log_sigma_raw, eta_raw, log_delta_raw)
         abs_err = (preds - x_tgt.float()).abs()
         mae_rate_sums += float(abs_err.mean().detach().cpu().item())
         mae_rate_counts += 1
@@ -297,13 +297,9 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
         x_in = spikes[:, :-1, :]
         x_tgt = spikes[:, 1:, :].float()
         stim_in = stim[:, :-1, :]
-        m_raw, s_raw = model(x_in, stim_in, positions, mask, get_logits=True)
-        if spikes_are_zcalcium:
-            preds_next = m_raw.float()
-            truth_next = x_tgt.float()
-        else:
-            preds_next = lognormal_mean(m_raw, s_raw).float()
-            truth_next = x_tgt.float()
+        mu_raw, log_sigma_raw, eta_raw, log_delta_raw = model(x_in, stim_in, positions, mask, get_logits=True)
+        preds_next = sas_rate_median(mu_raw, log_sigma_raw, eta_raw, log_delta_raw).float()
+        truth_next = x_tgt.float()
         create_nextstep_video(truth_next, preds_next, positions, videos_dir / f'nextstep_batch{i+1}.mp4')
 
         # Accumulate next-step truth/pred/positions
@@ -331,14 +327,14 @@ def make_videos(model: GBM, loader: torch.utils.data.DataLoader, device: torch.d
                 future_stim = torch.cat([future_real, pad], dim=1)
             else:
                 future_stim = future_real
-        gen_only = gen_seq[:, -n_steps:, :].float()
-        truth_only = spikes[:, context_len:context_len + n_steps, :].float()
-        create_autoregression_video(gen_only, positions, videos_dir / f'autoreg_batch{i+1}.mp4', truth=truth_only)
-            # Accumulate AR truth/pred and metadata
-        ar_truth_list.append(truth_only.detach().cpu())
-        ar_pred_list.append(gen_only.detach().cpu())
-        ar_context_list.append(int(context_len))
-        ar_nsteps_list.append(int(n_steps))
+            gen_seq = model.autoregress(init_x, init_stim, positions, mask, future_stim, n_steps=n_steps, context_len=context_len)
+            gen_only = gen_seq[:, -n_steps:, :].float()
+            truth_only = spikes[:, context_len:context_len + n_steps, :].float()
+            create_autoregression_video(gen_only, positions, videos_dir / f'autoreg_batch{i+1}.mp4', truth=truth_only)
+            ar_truth_list.append(truth_only.detach().cpu())
+            ar_pred_list.append(gen_only.detach().cpu())
+            ar_context_list.append(int(context_len))
+            ar_nsteps_list.append(int(n_steps))
 
     # Write a single unified H5 with all collected arrays
     try:
@@ -1034,8 +1030,8 @@ def main():
                     stim = batch['stimulus'].to(device).to(torch.bfloat16)
                     x_in = spikes[:, :-1, :]
                     x_tgt = spikes[:, 1:, :].float()
-                    m_val, s_val = model(x_in, stim[:, :-1, :], batch['positions'].to(device), mask, get_logits=True)
-                    preds = lognormal_mean(m_val, s_val)
+                    mu_val, log_sigma_val, eta_val, log_delta_val = model(x_in, stim[:, :-1, :], batch['positions'].to(device), mask, get_logits=True)
+                    preds = sas_rate_median(mu_val, log_sigma_val, eta_val, log_delta_val)
                     mask_rep = mask[:, None, :].expand(preds.shape[0], preds.shape[1], preds.shape[2])
                     # Loss surrogate (MAE in rates)
                     bce = (preds.float() - x_tgt.float()).abs()
@@ -1152,10 +1148,8 @@ def main():
                     x_in = spikes[:, :-1, :]
                     x_tgt = spikes[:, 1:, :]
                     stim_in = stim[:, :-1, :]
-                    logits = model(x_in, stim_in, positions, mask, get_logits=True)
-                    probs = torch.sigmoid(logits).detach()  # keep on device for masked means
-                    m_val, s_val = model(x_in, stim_in, positions, mask, get_logits=True)
-                    pred_mean = lognormal_mean(m_val, s_val).detach()
+                    mu_val, log_sigma_val, eta_val, log_delta_val = model(x_in, stim_in, positions, mask, get_logits=True)
+                    pred_mean = sas_rate_median(mu_val, log_sigma_val, eta_val, log_delta_val).detach()
                     all_truth.append(x_tgt.detach().float().cpu())
                     all_pred.append(pred_mean.float().cpu())
                     mask_exp = mask[:, None, :].to(x_tgt.dtype)
@@ -1212,6 +1206,33 @@ def main():
             plt.tight_layout()
             plt.savefig(dirs['logs'] / 'mean_activation_nextstep.png', dpi=120, bbox_inches='tight')
             plt.close()
+
+            # Calibration plot: true mean rate (sorted) vs predicted mean rate
+            try:
+                order = np.argsort(truth_mean)
+                true_rates_sorted = truth_mean[order]
+                pred_rates_sorted = pred_mean[order]
+                if true_rates_sorted.size > 1:
+                    r_val = float(np.corrcoef(true_rates_sorted, pred_rates_sorted)[0, 1])
+                else:
+                    r_val = float('nan')
+                plt.figure(figsize=(6, 4))
+                plt.plot(true_rates_sorted, pred_rates_sorted, color='tab:blue', linewidth=1.5)
+                plt.xlabel('True mean rate (sorted, Hz)')
+                plt.ylabel('Predicted mean rate (Hz)')
+                plt.title('Calibration: True vs Predicted Mean Rates')
+                plt.annotate(
+                    f"r = {r_val:.4f}",
+                    xy=(0.05, 0.95), xycoords='axes fraction',
+                    ha='left', va='top', fontsize=10,
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='gray', alpha=0.8),
+                )
+                plt.tight_layout()
+                plt.savefig(dirs['logs'] / 'calibration_true_vs_predicted_rates.png', dpi=120, bbox_inches='tight')
+                plt.close()
+            except Exception as e:
+                logger.warning(f"Calibration plot failed: {e}")
+
     except Exception as e:
         logger.warning(f"Embedding (PCA/UMAP) failed: {e}")
 
