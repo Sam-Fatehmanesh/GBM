@@ -378,7 +378,18 @@ def train_one_epoch(
             optimizer.zero_grad()
 
         mu, log_sigma_raw, eta, log_delta_raw = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = sas_nll(x_tgt.float(), mu.float(), log_sigma_raw.float(), eta.float(), log_delta_raw.float())
+        mask_exp = mask[:, None, :]
+        if mask_exp.shape != x_tgt.shape:
+            mask_exp = mask_exp.expand_as(x_tgt)
+        mask_exp = mask_exp.float()
+        loss = sas_nll(
+            x_tgt.float(),
+            mu.float(),
+            log_sigma_raw.float(),
+            eta.float(),
+            log_delta_raw.float(),
+            mask=mask_exp,
+        )
         (loss / grad_accum).backward()
 
         if batch_idx % grad_accum == 0:
@@ -408,6 +419,7 @@ def train_one_epoch(
             total_vloss = 0.0
             preds_all = []
             targs_all = []
+            masks_all = []
             for vbatch in val_loader:
                 spikes_v = vbatch['spikes'].to(device).to(torch.bfloat16)
                 positions_v = vbatch['positions'].to(device)
@@ -417,14 +429,26 @@ def train_one_epoch(
                 x_tgt_v = spikes_v[:, 1:, :].float()
                 stim_in_v = stim_v[:, :-1, :]
                 with torch.no_grad():
+                    mask_exp_v = mask_v[:, None, :]
+                    if mask_exp_v.shape != x_tgt_v.shape:
+                        mask_exp_v = mask_exp_v.expand_as(x_tgt_v)
+                    mask_exp_v = mask_exp_v.float()
                     mu_val, log_sigma_val, eta_val, log_delta_val = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
-                    vloss = sas_nll(x_tgt_v, mu_val.float(), log_sigma_val.float(), eta_val.float(), log_delta_val.float())
+                    vloss = sas_nll(
+                        x_tgt_v,
+                        mu_val.float(),
+                        log_sigma_val.float(),
+                        eta_val.float(),
+                        log_delta_val.float(),
+                        mask=mask_exp_v,
+                    )
                     preds_vis = sas_rate_median(mu_val, log_sigma_val, eta_val, log_delta_val)
                     probs_v = preds_vis
                     targs_prob_v = x_tgt_v
                 total_vloss += float(vloss.detach().cpu().item())
                 preds_all.append(probs_v.detach())
                 targs_all.append(targs_prob_v.detach())
+                masks_all.append(mask_exp_v.detach())
                 vb += 1
                 if vb >= val_sample_batches:
                     break
@@ -434,6 +458,12 @@ def train_one_epoch(
                 targs_all = torch.cat([t.flatten() for t in targs_all], dim=0)
                 # PR-AUC disabled
                 compute_auc = False
+                flat_mask = torch.cat([m.reshape(-1) for m in masks_all], dim=0)
+                preds_all = torch.cat([p.reshape(-1) for p in preds_all], dim=0)
+                targs_all = torch.cat([t.reshape(-1) for t in targs_all], dim=0)
+                valid = flat_mask > 0.5
+                preds_all = preds_all[valid]
+                targs_all = targs_all[valid]
                 tracker.log_validation(epoch, batch_idx, preds_all, targs_all, avg_vloss, compute_auc=False)
                 # Sample video
                 try:
@@ -498,6 +528,7 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
     total_batches = 0
     preds_all = []
     targs_all = []
+    masks_all = []
     for batch in tqdm(loader, desc=f"Validation E{epoch}"):
         spikes = batch['spikes'].to(device).to(torch.bfloat16)
         positions = batch['positions'].to(device)
@@ -509,19 +540,33 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         stim_in = stim[:, :-1, :]
 
         mu_val, log_sigma_val, eta_val, log_delta_val = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = sas_nll(x_tgt, mu_val.float(), log_sigma_val.float(), eta_val.float(), log_delta_val.float())
+        mask_exp = mask[:, None, :]
+        if mask_exp.shape != x_tgt.shape:
+            mask_exp = mask_exp.expand_as(x_tgt)
+        mask_exp = mask_exp.float()
+        loss = sas_nll(
+            x_tgt.float(),
+            mu_val.float(),
+            log_sigma_val.float(),
+            eta_val.float(),
+            log_delta_val.float(),
+            mask=mask_exp,
+        )
         preds = sas_rate_median(mu_val, log_sigma_val, eta_val, log_delta_val)
         total_loss += float(loss.detach().cpu().item())
         total_batches += 1
 
         preds_all.append(preds.detach())
         targs_all.append(x_tgt.detach())
+        masks_all.append(mask_exp.detach())
 
     avg_loss = total_loss / max(1, total_batches)
     if preds_all and targs_all:
+        flat_mask = torch.cat([m.reshape(-1) for m in masks_all], dim=0)
         preds_all = torch.cat([p.reshape(-1) for p in preds_all], dim=0)
         targs_all = torch.cat([t.reshape(-1) for t in targs_all], dim=0)
-        tracker.log_validation(epoch, 1, preds_all, targs_all, avg_loss, compute_auc=False)
+        valid = flat_mask > 0.5
+        tracker.log_validation(epoch, 1, preds_all[valid], targs_all[valid], avg_loss, compute_auc=False)
     return {'val_loss': avg_loss}
 
 
@@ -717,7 +762,7 @@ def main():
     # Best checkpoint videos
     if best_ckpt is not None:
         logger.info(f"Loading best checkpoint: {best_ckpt}")
-        state = torch.load(best_ckpt, map_location=device)
+        state = torch.load(best_ckpt, map_location=device, weights_only=False)
         model.load_state_dict(state['model'])
         try:
             sample_batch = next(iter(val_loader))

@@ -53,9 +53,9 @@ class RoutingFlashMHA(nn.Module):
         # Fused QKV
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
-        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-4)
-        if self.out_proj.bias is not None:
-            nn.init.normal_(self.out_proj.bias, mean=0.0, std=1e-4)
+        # nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-4)
+        # if self.out_proj.bias is not None:
+        #     nn.init.normal_(self.out_proj.bias, mean=0.0, std=1e-4)
 
         # Spherical routing norm over shared routing features (per-token Dh)
         self.route_ln = nn.LayerNorm(self.head_dim, elementwise_affine=False)
@@ -195,33 +195,44 @@ class RoutingFlashMHA(nn.Module):
                 sims = sims - (self.spatial_weight * spatial)
 
             top_idx = sims.topk(k=w_eff, dim=0, largest=True, sorted=False).indices  # [w_eff, k_s]
+            base_tokens = top_idx.transpose(0, 1)  # (k_s, w_eff)
             selected_local = torch.zeros(Ls, dtype=torch.bool, device=x.device)
-            cluster_buffers = []
-            lens_local = torch.zeros(k_s, dtype=torch.int32, device=x.device)
-            for j in range(k_s):
-                tokens_local = top_idx[:, j]
-                tokens_local = torch.unique(tokens_local)
-                selected_local[tokens_local] = True
-                cluster_buffers.append(tokens_local + a)
-                lens_local[j] = tokens_local.numel()
+            selected_local.scatter_(0, base_tokens.reshape(-1), True)
 
             nearest = sims.argmax(dim=1)
             missing_local = (~selected_local).nonzero(as_tuple=False).flatten()
             if missing_local.numel() > 0:
-                nearest_missing = nearest[missing_local]
-                for idx_local, centroid_idx in zip(missing_local.tolist(), nearest_missing.tolist()):
-                    global_idx = torch.tensor([a + idx_local], device=x.device, dtype=torch.long)
-                    cluster_buffers[centroid_idx] = torch.cat([cluster_buffers[centroid_idx], global_idx], dim=0)
-                    lens_local[centroid_idx] += 1
+                nearest_missing = nearest.index_select(0, missing_local)
+                added_counts = torch.bincount(nearest_missing, minlength=k_s)
+            else:
+                nearest_missing = None
+                added_counts = torch.zeros(k_s, dtype=torch.long, device=x.device)
 
-            order_abs = torch.cat(cluster_buffers, dim=0) if cluster_buffers else torch.empty(0, device=x.device, dtype=torch.long)
+            lens_local = torch.full((k_s,), w_eff, dtype=torch.long, device=x.device) + added_counts
+            total_tokens = lens_local.sum()
+
+            start_offsets = torch.zeros(k_s + 1, dtype=torch.long, device=x.device)
+            torch.cumsum(lens_local, dim=0, out=start_offsets[1:])
+
+            order_abs = torch.empty(int(total_tokens.item()), dtype=torch.long, device=x.device)
+
+            base_pos = (start_offsets[:-1].unsqueeze(1) + torch.arange(w_eff, device=x.device, dtype=torch.long)).reshape(-1)
+            order_abs[base_pos] = base_tokens.reshape(-1) + a
+
+            if nearest_missing is not None:
+                sort_idx = torch.argsort(nearest_missing)
+                nearest_sorted = nearest_missing.index_select(0, sort_idx)
+                missing_sorted = missing_local.index_select(0, sort_idx)
+                offsets = start_offsets[:-1] + w_eff
+                extra_offsets = torch.repeat_interleave(offsets, added_counts)
+                prefix = torch.cumsum(added_counts, dim=0) - added_counts
+                per_entry_prefix = torch.repeat_interleave(prefix, added_counts)
+                local_rank = torch.arange(missing_local.numel(), device=x.device, dtype=torch.long) - per_entry_prefix
+                extra_positions = extra_offsets + local_rank
+                order_abs[extra_positions] = missing_sorted + a
+
             order_chunks.append(order_abs)
-            lens_chunks.append(lens_local)
-
-            assign = nearest                       # [L]
-            feats_f32 = feats.to(torch.float32)
-            ema_sums[:k_s].index_add_(0, assign, feats_f32)
-            ema_counts[:k_s] += torch.bincount(assign, minlength=k_s).to(torch.float32).unsqueeze(1)
+            lens_chunks.append(lens_local.to(torch.int32))
 
         if not order_chunks:
             return self.out_proj(torch.zeros_like(x))

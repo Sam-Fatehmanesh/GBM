@@ -133,35 +133,49 @@ class GBM(nn.Module):
         return median.to(mu.dtype)
 
 
-    def autoregress(self, init_x, init_stimuli, point_positions, neuron_pad_mask, future_stimuli=None, n_steps=10, context_len=12):
+
+    def autoregress_sample(
+        self,
+        init_x,                 # (B, T, N)   rates (Hz)
+        init_stimuli,           # (B, T, dS)
+        point_positions,        # (B, N, 3)
+        neuron_pad_mask,        # (B, N)
+        future_stimuli=None,    # (B, n_steps, dS) or None -> zeros
+        n_steps=10,
+        context_len=12,
+        eps=LOGRATE_EPS,
+        temperature: float = 1.0,
+        generator: torch.Generator | None = None,
+        return_log: bool = False,
+    ):
         """
-        Deterministic rollout using SAS median.
-        init_x:         (B, T, N)   rates (Hz)
-        init_stimuli:   (B, T, dS)
-        point_positions:(B, N, 3)
-        neuron_pad_mask:(B, N)
-        future_stimuli: (B, n_steps, dS) or None -> zeros
-        Returns:        (B, T + n_steps, N)
+        Stochastic rollout using SAS sampling on log-rate:
+        Y = mu + sigma * sinh((U - eta) / delta),  U ~ N(0, temperature^2).
+        Returns: (B, T + n_steps, N) rates (or log-rates if return_log=True).
         """
+        assert n_steps > 0 and context_len > 0
         B, T, N = init_x.shape
         assert T >= context_len, "context_len must be ≤ T"
-        assert n_steps > 0 and context_len > 0
 
         if future_stimuli is None:
             future_stimuli = torch.zeros(B, n_steps, self.d_stimuli, device=init_x.device, dtype=init_x.dtype)
         else:
             assert future_stimuli.shape == (B, n_steps, self.d_stimuli)
 
-        # Convert initial rates to log space once
-        current_log_rates = torch.log(init_x.clamp_min(LOGRATE_EPS))
-        current_stimuli = init_stimuli
+        params_dtype = next(self.parameters()).dtype
+        current_log_rates = torch.log(init_x.clamp_min(eps) + eps).to(params_dtype)
+        current_stimuli   = init_stimuli.to(params_dtype)
+        point_positions   = point_positions.to(params_dtype)
 
-        from GenerativeBrainModel.utils.sas import sas_log_median
+        POS_EPS = 1e-8
+        def _pos(x): return F.softplus(x) + POS_EPS
 
-        for i in range(n_steps):
-            # Use log-rates throughout
-            context_log = current_log_rates[:, -context_len:]
+        for t in range(n_steps):
+            # context
+            context_log  = current_log_rates[:, -context_len:]
             context_stim = current_stimuli[:, -context_len:, :]
+
+            # one-step-ahead params for log-rate
             mu, log_sigma_raw, eta, log_delta_raw = self.forward(
                 context_log,
                 context_stim,
@@ -170,16 +184,21 @@ class GBM(nn.Module):
                 get_logits=True,
                 input_log_rates=True,
             )
-            # The model outputs parameters for log-rate, so we use sas_log_median to get the next log-rate
-            next_log_rate = sas_log_median(
-                mu[:, -1:, :],
-                log_sigma_raw[:, -1:, :],
-                eta[:, -1:, :],
-                log_delta_raw[:, -1:, :],
-            )
-            # Keep everything in log space
-            current_log_rates = torch.cat([current_log_rates, next_log_rate], dim=1)
-            current_stimuli = torch.cat([current_stimuli, future_stimuli[:, i:i+1, :]], dim=1)
+            mu   = mu[:, -1:, :]            # (B,1,N)
+            sig  = _pos(log_sigma_raw[:, -1:, :])
+            eta  = eta[:, -1:, :]
+            delt = _pos(log_delta_raw[:, -1:, :])
 
-        # Return rates in Hz (exp of log-rates)
-        return current_log_rates.exp()
+            # sample next log-rate
+            U = torch.randn_like(mu, generator=generator) * float(temperature)
+            next_log_rate = mu + sig * torch.sinh((U - eta) / delt)
+
+            # append
+            current_log_rates = torch.cat([current_log_rates, next_log_rate], dim=1)
+            current_stimuli   = torch.cat([current_stimuli, future_stimuli[:, t:t+1, :].to(params_dtype)], dim=1)
+
+        if return_log:
+            return current_log_rates
+        # back to rate domain with the SAME eps used going in
+        return torch.exp(current_log_rates) - eps
+

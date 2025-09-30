@@ -23,6 +23,7 @@ def sas_nll(
     eta: torch.Tensor,
     raw_log_delta: torch.Tensor,
     eps: float = 1e-8,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Negative log-likelihood for the SAS distribution on log-rates.
 
@@ -57,6 +58,15 @@ def sas_nll(
 
     # NLL on Y plus change of variables (already handled by z term)
     nll = -log_pdf
+
+    if mask is not None:
+        mask = mask.to(dtype=nll.dtype, device=nll.device)
+        if mask.shape != nll.shape:
+            mask = mask.expand_as(nll)
+        masked = nll * mask
+        total = mask.sum().clamp_min(1.0)
+        return masked.sum() / total
+
     return nll.mean()
 
 

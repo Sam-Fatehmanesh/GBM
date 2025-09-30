@@ -255,17 +255,36 @@ def evaluate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         x_tgt = spikes[:, 1:, :]
         stim_in = stim[:, :-1, :]
         mu_raw, log_sigma_raw, eta_raw, log_delta_raw = model(x_in, stim_in, positions, mask, get_logits=True)
-        loss = sas_nll(x_tgt.float(), mu_raw.float(), log_sigma_raw.float(), eta_raw.float(), log_delta_raw.float())
+        mask_exp = mask[:, None, :]
+        if mask_exp.shape != x_tgt.shape:
+            mask_exp = mask_exp.expand_as(x_tgt)
+        loss = sas_nll(
+            x_tgt.float(),
+            mu_raw.float(),
+            log_sigma_raw.float(),
+            eta_raw.float(),
+            log_delta_raw.float(),
+            mask=mask_exp.float(),
+        )
         preds = sas_rate_median(mu_raw, log_sigma_raw, eta_raw, log_delta_raw)
-        abs_err = (preds - x_tgt.float()).abs()
-        mae_rate_sums += float(abs_err.mean().detach().cpu().item())
-        mae_rate_counts += 1
+        abs_err = (preds - x_tgt.float()).abs() * mask_exp
+        valid_count = mask_exp.sum().detach().cpu().item()
+        mae_rate_sums += float(abs_err.sum().detach().cpu().item())
+        mae_rate_counts += max(1.0, valid_count)
         probs = preds
         targs_for_tracker = x_tgt.float()
         total_loss += float(loss.detach().cpu().item())
         total_batches += 1
 
-        tracker.log_validation(epoch=0, batch_idx=batch_idx, predictions=probs, targets=targs_for_tracker, val_loss=float(loss.detach().cpu().item()), compute_auc=False)
+        flat_mask = mask_exp.reshape(-1) > 0.5
+        tracker.log_validation(
+            epoch=0,
+            batch_idx=batch_idx,
+            predictions=probs.reshape(-1)[flat_mask],
+            targets=targs_for_tracker.reshape(-1)[flat_mask],
+            val_loss=float(loss.detach().cpu().item()),
+            compute_auc=False,
+        )
 
     avg_loss = total_loss / max(1, total_batches)
     avg_mae_rate = (mae_rate_sums / max(1, mae_rate_counts)) if mae_rate_counts > 0 else float('nan')
@@ -729,7 +748,7 @@ def save_spike_trace_plots(
         init_stim = stim[:, :context_len, :]
         future_stim = stim[:, context_len:, :]
         gen_seq = model.autoregress(init_x, init_stim, positions, mask, future_stim, n_steps=n_steps, context_len=context_len)
-        gen_only = gen_seq[:, -n_steps:, :]  # (B, L, N) preds in [0,1]
+        gen_only = gen_seq[:, -n_steps:, :]
 
         for b in range(B):
             if images_saved >= num_images:
