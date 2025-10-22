@@ -94,6 +94,7 @@ def create_default_config():
             'original_sampling_rate': None,  # Required for CASCADE
             'target_sampling_rate': None,    # Required for CASCADE
             'return_to_original_rate': False,  # If True, downsample neural data back to original rate after CASCADE
+            'convert_rates_to_probabilities': True,  # If False, keep CASCADE outputs as rates (Hz)
         },
         'cascade': {
             'model_type': 'Global_EXC_2Hz_smoothing500ms',
@@ -159,18 +160,19 @@ def compute_baseline_correction(calcium_data, window_length=30.0, percentile=8, 
     
     return processed_data
 
-def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_2Hz_smoothing500ms', sampling_rate=2.0):
+def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_2Hz_smoothing500ms', sampling_rate=2.0, convert_rates_to_probabilities=True):
     """
-    Run CASCADE inference on calcium data to get spike probabilities.
+    Run CASCADE inference on calcium data to get spike rates or probabilities.
     
     Args:
         calcium_data: (T, N) array of calcium data (raw or baseline-subtracted)
         batch_size: Batch size for CASCADE processing
         model_type: CASCADE model to use
         sampling_rate: Sampling rate in Hz for converting spike rates to probabilities
+        convert_rates_to_probabilities: If True, convert rates (Hz) to probabilities
         
     Returns:
-        prob_data: (N, T) array of spike probabilities converted from CASCADE spike rates
+        out_data: (N, T) array of spike probabilities or rates depending on flag
     """
     if not CASCADE_AVAILABLE:
         raise ImportError("CASCADE not available. Please install neuralib.")
@@ -186,7 +188,7 @@ def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_
         print(f"  → Medium dataset detected ({N} neurons), reducing batch size to {batch_size}")
     
     # Prepare containers
-    prob_data = np.zeros((N, T), dtype=np.float32)
+    out_data = np.zeros((N, T), dtype=np.float32)
     
     # Batched CASCADE inference
     print(f"  → Running CASCADE in batches of {batch_size}…")
@@ -216,23 +218,26 @@ def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_
             # Handle NaN, inf values - CASCADE outputs spike rates in Hz
             batch_rates = np.nan_to_num(batch_rates, nan=0.0, posinf=0.0, neginf=0.0)
             
-            # Convert spike rates to probabilities using Poisson process: P = 1 - e^(-λ/F)
-            # where λ is spike rate (Hz) and F is sampling rate (Hz)
-            batch_probs = 1.0 - np.exp(-batch_rates / sampling_rate)
+            if convert_rates_to_probabilities:
+                # Convert spike rates to probabilities using Poisson process: P = 1 - e^(-λ/F)
+                # where λ is spike rate (Hz) and F is sampling rate (Hz)
+                batch_out = 1.0 - np.exp(-batch_rates / sampling_rate)
+                # Ensure probabilities are in [0, 1] range (should be by construction, but safety check)
+                batch_out = np.clip(batch_out, 0.0, 1.0)
+            else:
+                # Keep as rates (Hz)
+                batch_out = batch_rates
             
-            # Ensure probabilities are in [0, 1] range (should be by construction, but safety check)
-            batch_probs = np.clip(batch_probs, 0.0, 1.0)
-            
-            prob_data[start:end] = batch_probs
+            out_data[start:end] = batch_out
             
             # Clean up batch results
-            del batch_probs, batch
+            del batch_out, batch
             gc.collect()
             
         except Exception as e:
             print(f"Error processing batch {start}-{end}: {e}")
             # Fill with zeros if batch fails
-            prob_data[start:end] = 0
+            out_data[start:end] = 0
             del batch
             gc.collect()
     
@@ -240,7 +245,7 @@ def run_cascade_inference(calcium_data, batch_size=5000, model_type='Global_EXC_
     del traces
     gc.collect()
     
-    return prob_data
+    return out_data
 
 
 
@@ -701,8 +706,7 @@ def process_subject(subject_dir, config):
             # Safety: clip to [0, 1]
             norm_positions = np.clip(norm_positions, 0.0, 1.0)
             
-        # Keep a copy of calcium for visualization
-        calcium_for_viz = calcium[:, :min(config['processing']['num_neurons_viz'] * 2, N)].copy()
+        # (moved) We'll take a copy for visualization after any interpolation so lengths match
             
         # Interpolate calcium traces and temporal data if needed
         orig_rate = config['processing']['original_sampling_rate']
@@ -773,6 +777,9 @@ def process_subject(subject_dir, config):
         # Use actual sampling rate for further processing
         effective_sampling_rate = target_rate or orig_rate or fpsec
 
+        # Now take a copy for visualization that matches current calcium timeline
+        calcium_for_viz = calcium[:, :min(config['processing']['num_neurons_viz'] * 2, N)].copy()
+
         # Depending on config, either run CASCADE (with baseline correction) or skip and use z-scored calcium directly
         skip_cascade = bool(config['processing'].get('skip_cascade', False))
         if not skip_cascade:
@@ -790,11 +797,13 @@ def process_subject(subject_dir, config):
             del calcium
             gc.collect()
 
+            convert_flag = bool(config['processing'].get('convert_rates_to_probabilities', True))
             prob_data = run_cascade_inference(
                 processed_calcium,
                 config['processing']['batch_size'],
                 config['cascade']['model_type'],
-                effective_sampling_rate
+                effective_sampling_rate,
+                convert_rates_to_probabilities=convert_flag
             )
             # Clean up after CASCADE
             del processed_calcium
@@ -1013,9 +1022,13 @@ def process_subject(subject_dir, config):
             f.attrs['includes_additional_data'] = config['output'].get('include_additional_data', True)
             f.attrs['return_to_original_rate'] = return_to_original
             f.attrs['final_sampling_rate'] = effective_sampling_rate  # The actual final rate of all data
+            # Semantics of neuron_values
+            f.attrs['neuron_values_semantics'] = ('probabilities' if ((not skip_cascade) and bool(config['processing'].get('convert_rates_to_probabilities', True))) else ('rates_hz' if (not skip_cascade) else 'zscored_signal'))
         
         # Create visualization PDF
         print("  → Creating visualization PDF...")
+        is_probability = (not skip_cascade) and bool(config['processing'].get('convert_rates_to_probabilities', True))
+        value_label = ("Spike Rates (Hz)" if (not skip_cascade and not is_probability) else ("Z-scored Calcium" if skip_cascade else None))
         create_visualization_pdf(
             calcium_for_viz,
             prob_data,
@@ -1025,8 +1038,8 @@ def process_subject(subject_dir, config):
             stim=(stimuli_features if 'stimuli_features' in locals() and stimuli_features is not None else (stim_full if stim_full is not None else None)),
             behavior=behavior_full,
             eye=eye_full,
-            is_probability=(not skip_cascade),
-            value_label=('Z-scored Calcium' if skip_cascade else None),
+            is_probability=is_probability,
+            value_label=value_label,
         )
             
             # Clean up memory
@@ -1710,6 +1723,7 @@ def process_zapbench(config):
             f.attrs['positions_max'] = maxs
             f.attrs['includes_additional_data'] = False
             f.attrs['final_sampling_rate'] = float(orig_rate) if orig_rate else np.nan
+            f.attrs['neuron_values_semantics'] = 'zscored_signal'
 
             # Save z-score params
             f.create_dataset('zscore_mean', data=mean32.astype(output_dtype), compression='gzip', compression_opts=1)
@@ -1763,12 +1777,14 @@ def process_zapbench(config):
     del traces_full
     gc.collect()
 
-    # CASCADE inference to probabilities
+    # CASCADE inference to probabilities or rates
+    convert_flag = bool(config['processing'].get('convert_rates_to_probabilities', True))
     prob_data = run_cascade_inference(
         processed_calcium,
         int(config['processing']['batch_size']),
         config['cascade']['model_type'],
-        float(tgt_rate)
+        float(tgt_rate),
+        convert_rates_to_probabilities=convert_flag
     )  # returns (N_keep, T)
     del processed_calcium
     gc.collect()
@@ -1822,11 +1838,14 @@ def process_zapbench(config):
         f.attrs['includes_additional_data'] = False
         f.attrs['final_sampling_rate'] = effective_sampling_rate
         f.attrs['cascade_model'] = config['cascade']['model_type']
+        f.attrs['neuron_values_semantics'] = ('probabilities' if convert_flag else 'rates_hz')
 
-    # PDF using probabilities
+    # PDF using probabilities or rates
     try:
         K = config['processing']['num_neurons_viz'] * 2
         values_small = read_small_sample(K)
+        is_probability = bool(convert_flag)
+        value_label = (None if is_probability else 'Spike Rates (Hz)')
         create_visualization_pdf(
             values_small,
             prob_data[:K, :],
@@ -1834,7 +1853,7 @@ def process_zapbench(config):
             pdf_file,
             num_neurons=config['processing']['num_neurons_viz'],
             stim=(stimuli_labels if stimuli_labels is not None else None), behavior=None, eye=None,
-            is_probability=True, value_label=None,
+            is_probability=is_probability, value_label=value_label,
         )
     except Exception as e:
         print(f"  → Skipping PDF viz due to error: {e}")
