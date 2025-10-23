@@ -38,6 +38,8 @@ class NeuralDataset(Dataset):
         start_timepoint: Optional[int] = None,
         end_timepoint: Optional[int] = None,
         spikes_dataset_name: str = 'neuron_values',
+        split_role: str = 'train',
+        test_split_fraction: float = 0.1,
     ) -> None:
         self.data_files = data_files
         self.pad_stimuli_to = pad_stimuli_to
@@ -48,11 +50,15 @@ class NeuralDataset(Dataset):
         self.start_timepoint = start_timepoint
         self.end_timepoint = end_timepoint
         self.spikes_dataset_name = spikes_dataset_name
+        self.split_role = split_role  # 'train' or 'test'
+        self.test_split_fraction = float(test_split_fraction)
 
         self.sequences: List[Dict[str, int]] = []
         self.cached_spikes: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
         self.cached_positions: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
         self.cached_stimulus: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
+        self.cached_log_mean: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
+        self.cached_log_std: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
         # Offset of cached slices within original file (for fast index math)
         self.cache_offset: Optional[Dict[str, int]] = {} if use_cache else None
 
@@ -70,9 +76,19 @@ class NeuralDataset(Dataset):
                 spikes_ds = f[ds_name]  # (T, N)
                 T_total, N = spikes_ds.shape
 
-                # Determine start/end bounds
-                start_point = self.start_timepoint if self.start_timepoint is not None else 0
-                end_point = self.end_timepoint if self.end_timepoint is not None else T_total
+                # Determine start/end bounds based on split_role and optional explicit overrides
+                if self.split_role == 'test':
+                    # last fraction of each subject
+                    split_idx = int((1.0 - self.test_split_fraction) * T_total)
+                    split_idx = max(0, min(split_idx, T_total))
+                    start_point = split_idx if self.start_timepoint is None else max(split_idx, self.start_timepoint)
+                    end_point = T_total if self.end_timepoint is None else min(T_total, self.end_timepoint)
+                else:
+                    # training uses up to the split point
+                    split_idx = int((1.0 - self.test_split_fraction) * T_total)
+                    split_idx = max(0, min(split_idx, T_total))
+                    start_point = 0 if self.start_timepoint is None else self.start_timepoint
+                    end_point = split_idx if self.end_timepoint is None else min(split_idx, self.end_timepoint)
                 end_point = min(end_point, T_total)
 
                 if self.max_timepoints_per_subject is not None:
@@ -140,6 +156,14 @@ class NeuralDataset(Dataset):
                     else:
                         # default to zeros with one channel
                         self.cached_stimulus[file_path] = np.zeros((trimmed_end - trimmed_start, 1), dtype=np.float32)
+                    # Log activity stats per neuron (optional)
+                    try:
+                        if 'log_activity_mean' in f:
+                            self.cached_log_mean[file_path] = f['log_activity_mean'][:].astype(np.float32)
+                        if 'log_activity_std' in f:
+                            self.cached_log_std[file_path] = f['log_activity_std'][:].astype(np.float32)
+                    except Exception:
+                        pass
 
                 # Create sequence indices
                 max_start_idx = trimmed_end - self.sequence_length
@@ -183,6 +207,8 @@ class NeuralDataset(Dataset):
             segment = spikes_TN[rel_start:rel_end]  # (L, N)
             positions = self.cached_positions[file_path]  # (N, 3)
             stimulus = self.cached_stimulus[file_path][rel_start:rel_end]  # (L, K_file)
+            log_mean = self.cached_log_mean.get(file_path, None) if self.cached_log_mean is not None else None
+            log_std = self.cached_log_std.get(file_path, None) if self.cached_log_std is not None else None
         else:
             f = self._get_file_handle(file_path)
             ds_name = self._resolve_spikes_dataset_name(f)
@@ -193,6 +219,13 @@ class NeuralDataset(Dataset):
                 stimulus = f['stimulus_full'][start_idx:end_idx].astype(np.float32)  # (L, K_file)
             else:
                 stimulus = np.zeros((self.sequence_length, 1), dtype=np.float32)
+            # log activity stats
+            try:
+                log_mean = f['log_activity_mean'][:].astype(np.float32) if 'log_activity_mean' in f else None
+                log_std = f['log_activity_std'][:].astype(np.float32) if 'log_activity_std' in f else None
+            except Exception:
+                log_mean = None
+                log_std = None
 
         # Pad stimulus to the global width across files
         stimulus = self._pad_stimulus(stimulus)
@@ -218,6 +251,8 @@ class NeuralDataset(Dataset):
             'positions': positions_tensor,      # (N, 3)
             'neuron_mask': mask_tensor,         # (N,)
             'stimulus': stimulus_tensor,        # (sequence_length, K_file)
+            'log_activity_mean': (torch.from_numpy(log_mean) if log_mean is not None else torch.empty(0)),  # (N,)
+            'log_activity_std': (torch.from_numpy(log_std) if log_std is not None else torch.empty(0)),    # (N,)
             'file_path': file_path,
             'start_idx': start_idx,
         }
@@ -315,25 +350,9 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
     selected_files = all_files
     print(f"Found total files: {len(all_files)}")
 
-    # Train/test split
-    test_subjects = data_config.get('test_subjects', [])
-    test_files = [str(data_dir / f"{s}.h5") for s in test_subjects if (data_dir / f"{s}.h5").exists() and str(data_dir / f"{s}.h5") in all_files]
-    if only_test and test_files:
-        selected_files = test_files
-    train_files = [f for f in selected_files if f not in test_files]
-
-    if not test_files and test_subjects:
-        print(f"Warning: No valid files found for requested test subjects: {test_subjects}")
-
-    if not test_files and not only_test:
-        print("No valid test subjects provided. Creating a random 80/20 train/test split.")
-        num_test = max(1, len(selected_files) // 5)
-        random.seed(training_config.get('seed', 42))
-        test_files = random.sample(selected_files, num_test)
-        train_files = [f for f in selected_files if f not in test_files]
-    elif only_test and test_files:
-        # Mirror test set for train as well (eval-only usage); avoids touching unrelated files
-        train_files = test_files
+    # New split policy: All subjects used in training; test is last X% time of each subject
+    train_files = all_files
+    test_files = all_files
 
     # Compute padding sizes
     # - Neuron padding is handled per-batch, but we keep this for logging/debug
@@ -354,6 +373,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
     # Determine which spikes dataset to read (defaults to neuron_values, can override)
     spikes_dataset_name = data_config.get('spikes_dataset_name', 'neuron_values')
 
+    split_frac = float(training_config.get('test_split_fraction', 0.1))
+
     train_dataset = NeuralDataset(
         train_files,
         pad_stimuli_to=pad_stimuli_to,
@@ -364,6 +385,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
         start_timepoint=start_timepoint,
         end_timepoint=end_timepoint,
         spikes_dataset_name=spikes_dataset_name,
+        split_role='train',
+        test_split_fraction=split_frac,
     )
 
     test_dataset = NeuralDataset(
@@ -376,6 +399,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
         start_timepoint=start_timepoint,
         end_timepoint=end_timepoint,
         spikes_dataset_name=spikes_dataset_name,
+        split_role='test',
+        test_split_fraction=split_frac,
     )
 
     # Safer defaults for memory usage

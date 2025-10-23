@@ -100,10 +100,10 @@ def import_attention_module():
 
 def test_forward_early_return_no_spikes():
     attention = import_attention_module()
-    SpikeSparseConnectomeAttention = attention.SpikeSparseConnectomeAttention
+    SpikeSparseConnectomeRoutingAttention = attention.SpikeSparseConnectomeRoutingAttention
 
     d_model, n_heads = 32, 4
-    model = SpikeSparseConnectomeAttention(
+    model = SpikeSparseConnectomeRoutingAttention(
         d_model=d_model,
         n_heads=n_heads,
         neuron_cluster_size=2,
@@ -129,10 +129,10 @@ def test_forward_early_return_no_spikes():
 
 def test_forward_with_spikes_runs_and_shapes_ok():
     attention = import_attention_module()
-    SpikeSparseConnectomeAttention = attention.SpikeSparseConnectomeAttention
+    SpikeSparseConnectomeRoutingAttention = attention.SpikeSparseConnectomeRoutingAttention
 
     d_model, n_heads = 32, 4
-    model = SpikeSparseConnectomeAttention(
+    model = SpikeSparseConnectomeRoutingAttention(
         d_model=d_model,
         n_heads=n_heads,
         neuron_cluster_size=2,
@@ -157,10 +157,10 @@ def test_forward_with_spikes_runs_and_shapes_ok():
 
 def test_train_forward_and_backward_runs():
     attention = import_attention_module()
-    SpikeSparseConnectomeAttention = attention.SpikeSparseConnectomeAttention
+    SpikeSparseConnectomeRoutingAttention = attention.SpikeSparseConnectomeRoutingAttention
 
     d_model, n_heads = 32, 4
-    model = SpikeSparseConnectomeAttention(
+    model = SpikeSparseConnectomeRoutingAttention(
         d_model=d_model,
         n_heads=n_heads,
         neuron_cluster_size=2,
@@ -189,7 +189,7 @@ def test_train_forward_and_backward_runs():
 
 def test_torch_compile_eager_backend_forward():
     attention = import_attention_module()
-    SpikeSparseConnectomeAttention = attention.SpikeSparseConnectomeAttention
+    SpikeSparseConnectomeRoutingAttention = attention.SpikeSparseConnectomeRoutingAttention
 
     # Use a conservative compile config to maximize portability in CI
     import torch as _torch
@@ -197,7 +197,7 @@ def test_torch_compile_eager_backend_forward():
         return  # skip if compile is unavailable
 
     d_model, n_heads = 32, 4
-    model = SpikeSparseConnectomeAttention(
+    model = SpikeSparseConnectomeRoutingAttention(
         d_model=d_model,
         n_heads=n_heads,
         neuron_cluster_size=2,
@@ -226,14 +226,14 @@ def test_torch_compile_eager_backend_forward():
 
 def test_chunking_effective_batch_gt_65536():
     attention = import_attention_module()
-    SpikeSparseConnectomeAttention = attention.SpikeSparseConnectomeAttention
+    SpikeSparseConnectomeRoutingAttention = attention.SpikeSparseConnectomeRoutingAttention
 
     # Minimal dims to keep memory modest while forcing B_eff > 65536
     d_model, n_heads = 32, 1
     # Some GPUs/kernels can fail exactly at 65536; force chunk size below by tweaking constant
     if hasattr(attention, "MAX_BATCH_SIZE"):
         attention.MAX_BATCH_SIZE = 65535
-    model = SpikeSparseConnectomeAttention(
+    model = SpikeSparseConnectomeRoutingAttention(
         d_model=d_model,
         n_heads=n_heads,
         neuron_cluster_size=1,
@@ -258,6 +258,175 @@ def test_chunking_effective_batch_gt_65536():
     assert not torch.allclose(y.float(), x.float())
 
 
+def test_ssfa_huge_sparse_forward():
+    attention = import_attention_module()
+    SparseSpikeFullAttention = attention.SparseSpikeFullAttention
+
+    # Runtime guard
+    try:
+        import flash_attn.flash_attn_interface as _fa
+        _ = _fa.flash_attn_varlen_kvpacked_func
+    except Exception:
+        pytest.skip("flash-attn not available")
+
+    device = torch.device("cuda")
+
+    # Model (keep dims small to control memory)
+    d_model, n_heads = 128, 4
+    model = SparseSpikeFullAttention(d_model=d_model, n_heads=n_heads).to(device)
+    model.eval()
+
+    # Huge shapes per request
+    B, T, N = 1, 192, 80000
+    # Pad mask: keep only a small fraction to bound Q size
+    keep_prob = 1.0
+    spike_prob = 0.05
+
+    # Memory guard: skip if little free VRAM
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        if free_bytes < 6 * (1024**3):
+            pytest.skip("Insufficient free VRAM for huge SSFA test")
+    except Exception:
+        pass
+
+    # Inputs
+    x = torch.randn(B, T, N, d_model, device=device)
+    positions = torch.randn(B, N, 3, device=device)
+    neuron_pad_mask = (torch.rand(B, N, device=device) < keep_prob)
+    spike_mask = (torch.rand(B, T, N, device=device) < spike_prob)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        y = model(x, positions, neuron_pad_mask, spike_mask)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+
+
+def test_ssfa_huge_sparse_train_backward_and_compile():
+    attention = import_attention_module()
+    SparseSpikeFullAttention = attention.SparseSpikeFullAttention
+
+    try:
+        import flash_attn.flash_attn_interface as _fa
+        _ = _fa.flash_attn_varlen_kvpacked_func
+    except Exception:
+        pytest.skip("flash-attn not available")
+
+    device = torch.device("cuda")
+
+    d_model, n_heads = 128, 4
+    model = SparseSpikeFullAttention(d_model=d_model, n_heads=n_heads).to(device)
+
+    B, T, N = 2, 96, 80000
+    keep_prob = 1.0
+    spike_prob = 0.05
+
+    # Memory guard for backward
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        if free_bytes < 10 * (1024**3):
+            pytest.skip("Insufficient free VRAM for huge SSFA backward test")
+    except Exception:
+        pass
+
+    # Train forward + backward
+    model.train()
+    x = torch.randn(B, T, N, d_model, device=device, requires_grad=True)
+    positions = torch.randn(B, N, 3, device=device)
+    neuron_pad_mask = (torch.rand(B, N, device=device) < keep_prob)
+    spike_mask = (torch.rand(B, T, N, device=device) < spike_prob)
+
+    # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    #     y = model(x, positions, neuron_pad_mask, spike_mask)
+    #     loss = y.pow(2).mean()
+    # loss.backward()
+    # assert x.grad is not None and torch.isfinite(x.grad).all()
+
+    # Compile + train forward/backward
+    import torch as _torch
+    if hasattr(_torch, "compile"):
+        compiled = _torch.compile(model, backend="eager", mode="reduce-overhead")
+        x2 = torch.randn(B, T, N, d_model, device=device, requires_grad=True)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            y2 = compiled(x2, positions, neuron_pad_mask, spike_mask)
+            loss2 = y2.pow(2).mean()
+        loss2.backward()
+        assert x2.grad is not None and torch.isfinite(x2.grad).all()
+
+
+def test_neuron_causal_forward_backward_and_compile():
+    attention = import_attention_module()
+    NeuronCausalAttention = attention.NeuronCausalAttention
+
+    device = torch.device("cuda")
+    d_model, n_heads = 64, 8
+    model = NeuronCausalAttention(d_model=d_model, n_heads=n_heads).to(device)
+
+    B, T, N = 2, 256, 256
+    x = torch.randn(B, T, N, d_model, device=device, requires_grad=True)
+    neuron_pad_mask = torch.ones(B, N, dtype=torch.bool, device=device)  # no padding neurons
+
+    # forward + backward
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        y = model(x, neuron_pad_mask)
+        loss = y.pow(2).mean()
+    loss.backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+    # compile forward
+    import torch as _torch
+    if hasattr(_torch, "compile"):
+        compiled = _torch.compile(model, backend="eager", mode="reduce-overhead")
+        x2 = torch.randn(B, T, N, d_model, device=device, requires_grad=True)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            y2 = compiled(x2, neuron_pad_mask)
+            loss2 = y2.pow(2).mean()
+        loss2.backward()
+        assert x2.grad is not None and torch.isfinite(x2.grad).all()
+
+
+def test_neuron_causal_huge_sparse_rows():
+    attention = import_attention_module()
+    NeuronCausalAttention = attention.NeuronCausalAttention
+
+    try:
+        _ = torch.cuda.mem_get_info()
+    except Exception:
+        pytest.skip("CUDA required")
+
+    device = torch.device("cuda")
+    d_model, n_heads = 64, 8
+    model = NeuronCausalAttention(d_model=d_model, n_heads=n_heads, dropout_p=0.0).to(device)
+    model.eval()
+
+    # Large rows (B*N) with moderate T
+    B, T, N = 1, 96, 80000  # B*N=32768 rows; with H=8 → BH=262144, so internal chunking should trigger
+    x = torch.randn(B, T, N, d_model, device=device, requires_grad=True)
+    neuron_pad_mask = torch.ones(B, N, dtype=torch.bool, device=device)  # no padding neurons
+
+    # # Forward and backward
+    # with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    #     y = model(x, neuron_pad_mask)
+    #     loss = y.pow(2).mean()
+    # loss.backward()
+    # assert y.shape == x.shape
+    # assert torch.isfinite(y).all()
+    # assert x.grad is not None and torch.isfinite(x.grad).all()
+
+    # Compiled forward and backward if available
+    import torch as _torch
+    # if hasattr(_torch, "compile"):
+    compiled = _torch.compile(model, backend="eager", mode="reduce-overhead")
+    x2 = torch.randn(B, T, N, d_model, device=device, requires_grad=True)
+    neuron_pad_mask2 = torch.ones(B, N, dtype=torch.bool, device=device)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        y2 = compiled(x2, neuron_pad_mask2)
+        loss2 = y2.pow(2).mean()
+    loss2.backward()
+    assert y2.shape == x2.shape
+    assert torch.isfinite(y2).all()
+    assert x2.grad is not None and torch.isfinite(x2.grad).all()
+
 def test_huge_forward_backward_compile_spike_sparse_attention():
     # Runtime guard: require CUDA + bf16 and flash-attn available
     attention = import_attention_module()
@@ -275,10 +444,10 @@ def test_huge_forward_backward_compile_spike_sparse_attention():
     device = torch.device("cuda")
 
     # Target sizes per request
-    B, T, N = 1, 12, 80000
-    d_model, n_heads = 128, 8
-    neuron_cluster_size = 264
-    num_clusters_per_head = 264
+    B, T, N = 2, 90, 80000
+    d_model, n_heads = 64, 4
+    neuron_cluster_size = 256
+    num_clusters_per_head = 256
 
     # Memory safety check (rough lower bound):
     # Dominant cost is in/out centroid scores: (S*H*N*C) bf16 for each of in_score and out_score
@@ -300,8 +469,8 @@ def test_huge_forward_backward_compile_spike_sparse_attention():
     # if free_bytes < required_bytes:
     #     pytest.skip(f"Insufficient free VRAM ({free_bytes/1e9:.1f}GB < {required_bytes/1e9:.1f}GB) for huge test")
 
-    SpikeSparseConnectomeAttention = attention.SpikeSparseConnectomeAttention
-    model = SpikeSparseConnectomeAttention(
+    SpikeSparseConnectomeRoutingAttention = attention.SpikeSparseConnectomeRoutingAttention
+    model = SpikeSparseConnectomeRoutingAttention(
         d_model=d_model,
         n_heads=n_heads,
         neuron_cluster_size=neuron_cluster_size,
@@ -312,13 +481,10 @@ def test_huge_forward_backward_compile_spike_sparse_attention():
     neuron_pad_mask = torch.ones(B, N, dtype=torch.bool, device=device)
 
     # Spike mask set randomly per 
-    spike_prob = 0.01
+    spike_prob = 0.05
     spike_mask = torch.rand(B, T, N, device=device) < spike_prob  # randomly True with probability spike_prob
     spike_mask = spike_mask.bool()
 
-    # Spike mask set to all True
-    spike_mask = torch.zeros(B, T, N, dtype=torch.bool, device=device)
-    spike_mask[..., 0] = True  # ensure at least one spiking sender per sample
 
     # Forward (eval)
     model.eval()
@@ -355,6 +521,5 @@ def test_huge_forward_backward_compile_spike_sparse_attention():
             loss = y.pow(2).mean()
         loss.backward()
         assert x.grad is not None and torch.isfinite(x.grad).all()
-
 
 

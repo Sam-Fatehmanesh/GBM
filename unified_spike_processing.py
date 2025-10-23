@@ -102,6 +102,8 @@ def create_default_config():
         'output': {
             'dtype': 'float16',  # Data type for probabilities and positions
             'include_additional_data': True,  # Include anat_stack, stimulus, behavior, eye data
+            'compute_log_activity_stats': False,  # If True, save per-neuron log(activity) mean/std
+            'log_activity_eps': 1e-7,  # Epsilon for log to avoid log(0)
         }
     }
 
@@ -874,6 +876,22 @@ def process_subject(subject_dir, config):
         # Transpose to (T, N) and convert to specified dtype
         prob_data_transposed = prob_data.T.astype(output_dtype)  # (T, N)
 
+        # Optionally compute per-neuron log(activity) mean/std for CASCADE outputs (rates or probabilities)
+        log_activity_mean = None
+        log_activity_std = None
+        if (not skip_cascade) and bool(config['output'].get('compute_log_activity_stats', False)):
+            try:
+                eps = float(config['output'].get('log_activity_eps', 1e-7))
+                vals = np.maximum(prob_data_transposed.astype(np.float32, copy=False), eps)
+                logs = np.log(vals)
+                log_activity_mean = logs.mean(axis=0).astype(np.float32)
+                log_activity_std = logs.std(axis=0).astype(np.float32)
+                del vals, logs
+                gc.collect()
+            except Exception as _e:
+                log_activity_mean = None
+                log_activity_std = None
+
         # Use normalized positions computed above
         cell_positions = norm_positions.astype(output_dtype)  # (N, 3) in [0, 1]
             
@@ -912,6 +930,11 @@ def process_subject(subject_dir, config):
                                  data=zscore_std.astype(output_dtype),
                                  compression='gzip',
                                  compression_opts=1)
+
+            # Save log(activity) stats if computed
+            if (log_activity_mean is not None) and (log_activity_std is not None):
+                f.create_dataset('log_activity_mean', data=log_activity_mean, compression='gzip', compression_opts=1)
+                f.create_dataset('log_activity_std', data=log_activity_std, compression='gzip', compression_opts=1)
 
             # Save additional datasets if requested
             if config['output'].get('include_additional_data', True):
@@ -1024,6 +1047,12 @@ def process_subject(subject_dir, config):
             f.attrs['final_sampling_rate'] = effective_sampling_rate  # The actual final rate of all data
             # Semantics of neuron_values
             f.attrs['neuron_values_semantics'] = ('probabilities' if ((not skip_cascade) and bool(config['processing'].get('convert_rates_to_probabilities', True))) else ('rates_hz' if (not skip_cascade) else 'zscored_signal'))
+            # Log stats metadata
+            if (log_activity_mean is not None) and (log_activity_std is not None):
+                f.attrs['includes_log_activity_stats'] = True
+                f.attrs['log_activity_eps'] = float(config['output'].get('log_activity_eps', 1e-7))
+            else:
+                f.attrs['includes_log_activity_stats'] = False
         
         # Create visualization PDF
         print("  → Creating visualization PDF...")
@@ -1818,6 +1847,22 @@ def process_zapbench(config):
         f.create_dataset('num_timepoints', data=T)
         f.create_dataset('num_neurons', data=N_keep)
         f.create_dataset('original_sampling_rate_hz', data=float(orig_rate))
+        # Optional log(activity) stats for CASCADE outputs
+        if bool(config['output'].get('compute_log_activity_stats', False)):
+            try:
+                eps = float(config['output'].get('log_activity_eps', 1e-7))
+                vals = np.maximum(prob_data.T.astype(np.float32, copy=False), eps)
+                logs = np.log(vals)
+                lam = logs.mean(axis=0).astype(np.float32)
+                las = logs.std(axis=0).astype(np.float32)
+                f.create_dataset('log_activity_mean', data=lam, compression='gzip', compression_opts=1)
+                f.create_dataset('log_activity_std', data=las, compression='gzip', compression_opts=1)
+                del vals, logs
+                gc.collect()
+                f.attrs['includes_log_activity_stats'] = True
+                f.attrs['log_activity_eps'] = eps
+            except Exception:
+                f.attrs['includes_log_activity_stats'] = False
         # Save stimulus features and labels if available
         if 'stimuli_features' in locals() and (stimuli_features is not None):
             f.create_dataset('stimuli_features', data=stimuli_features.astype(np.float32), compression='gzip', compression_opts=1)

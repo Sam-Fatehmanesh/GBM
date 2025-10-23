@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from GenerativeBrainModel.models.rms import RMSNorm
 from GenerativeBrainModel.models.mlp import MLP
+from GenerativeBrainModel.models.conv import CausalResidualNeuralConv1d
 from GenerativeBrainModel.models.spatiotemporal import SpatioTemporalNeuralAttention
 # cimport pdb
 import os
@@ -24,15 +25,17 @@ class GBM(nn.Module):
         self.d_stimuli = d_stimuli
 
         self.layers = nn.ModuleList([SpatioTemporalNeuralAttention(d_model, n_heads) for _ in range(n_layers)])
+
+        self.conv = nn.Sequential(
+                CausalResidualNeuralConv1d(d_model, kernel_size=9),
+                CausalResidualNeuralConv1d(d_model, kernel_size=9),
+            )
         
         self.stimuli_encoder = nn.Sequential(
             nn.Linear(d_stimuli, d_model),
             RMSNorm(d_model),
         )
-        self.neuron_scalar_position_encoder = nn.Sequential(
-            nn.Linear(4, d_model),
-            RMSNorm(d_model),
-        )
+
         self.neuron_scalar_decoder_head = nn.Sequential(
             RMSNorm(d_model),
             nn.Linear(d_model, 4),

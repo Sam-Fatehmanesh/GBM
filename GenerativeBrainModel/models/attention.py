@@ -557,7 +557,7 @@ MAX_BATCH_SIZE = 65535
 #         q = self.q_proj(q_in.to(dtype=module_dtype))
 
 
-class SpikeSparseConnectomeAttention(nn.Module):
+class SpikeSparseConnectomeRoutingAttention(nn.Module):
     """
     Attention which uses routing to split all neuron tokens into receiving and sending neuron groups. All receiving neurons are included in Q, only sending neurons which are deemed spiking are included in KV. Using FlashAttention-2's flash_varlen_qkv.    
     """
@@ -1275,3 +1275,197 @@ class SpikeSparseConnectomeAttention(nn.Module):
         out = out + x  # residual
         _mem_ckpt("end")
         return out
+
+
+class SparseSpikeFullAttention(nn.Module):
+    def __init__(self, d_model, n_heads, n_rope_features: int = 32, dropout: float = 0.0):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.dropout = float(dropout)
+
+        self.norm = RMSNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+        # 3D RoPE
+        self.n_rope_features = int(n_rope_features)
+        dirs = torch.randn(self.n_rope_features, 3)
+        dirs = dirs / dirs.norm(dim=-1, keepdim=True)
+        freqs = torch.logspace(math.log10(1.0), math.log10(10000.0), self.n_rope_features)
+        self.register_buffer('rope_dirs', dirs, persistent=False)
+        self.register_buffer('rope_freqs', freqs, persistent=False)
+
+    @torch.no_grad()
+    def _directional_rope(self, positions):  # positions: (B, N, 3)
+        rope_dirs = self.rope_dirs.to(dtype=positions.dtype, device=positions.device)
+        rope_freqs = self.rope_freqs.to(dtype=positions.dtype, device=positions.device)
+        proj = torch.einsum('bnd,fd->bnf', positions, rope_dirs)
+        angles = proj * rope_freqs
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)  # (B,N,2F)
+
+    @torch.no_grad()
+    def _apply_rope(self, x, rope_emb):  # x: (B*T,N,D)
+        B_T, N, D = x.shape
+        B = rope_emb.shape[0]
+        T = B_T // B
+        # Project rope to model dim (lightweight, front-fill)
+        rope = torch.zeros(B, N, D, dtype=x.dtype, device=x.device)
+        F2 = rope_emb.shape[-1]
+        rope[..., :F2] = rope_emb.to(dtype=x.dtype, device=x.device)
+        return x + rope.unsqueeze(1).expand(B, T, N, D).reshape(B_T, N, D)
+
+    def forward(self, x, point_positions, neuron_pad_mask, spike_mask):
+        # x: (B,T,N,D), positions: (B,N,3), masks as described
+        B, T, N, D = x.shape
+        H, Dh = self.n_heads, self.head_dim
+        S = B * T
+
+        # Normalize and RoPE for Q/K inputs
+        xn = self.norm(x)
+        unit_pos = F.normalize(point_positions, dim=-1)
+        rope_emb = self._directional_rope(unit_pos)
+        xn_bt = xn.view(B, T, N, D).reshape(S, N, D)
+        qk_in = self._apply_rope(xn_bt, rope_emb)
+
+        # Build masks and compact indices BEFORE projections
+        keep_bt = (neuron_pad_mask != 0).unsqueeze(1).expand(B, T, N).reshape(S, N)
+        send_bt = (spike_mask != 0).reshape(S, N) & keep_bt
+
+        lens_q = keep_bt.sum(dim=1, dtype=torch.int32)
+        lens_k = send_bt.sum(dim=1, dtype=torch.int32)
+        cu_q = torch.zeros(S + 1, dtype=torch.int32, device=x.device); cu_q[1:] = torch.cumsum(lens_q, 0)
+        cu_k = torch.zeros(S + 1, dtype=torch.int32, device=x.device); cu_k[1:] = torch.cumsum(lens_k, 0)
+        max_q = int(lens_q.max().item()) if S > 0 else 0
+        max_k = int(lens_k.max().item()) if S > 0 else 0
+
+        # Flatten indices
+        arange_SN = torch.arange(S * N, device=x.device, dtype=torch.long).reshape(S, N)
+        idx_q = arange_SN[keep_bt].reshape(-1)
+        idx_kv = arange_SN[send_bt].reshape(-1)
+
+        # Compact tensors
+        qk_in_flat = qk_in.reshape(S * N, D)
+        xn_flat = xn_bt.reshape(S * N, D)
+        pre_q = qk_in_flat.index_select(0, idx_q)          # (total_q, D)
+        pre_k = qk_in_flat.index_select(0, idx_kv)         # (total_k, D)
+        pre_v = xn_flat.index_select(0, idx_kv)            # (total_k, D)
+
+        # Projections
+        q = self.q_proj(pre_q).view(-1, H, Dh)             # (total_q,H,Dh)
+        k = self.k_proj(pre_k).view(-1, H, Dh)             # (total_k,H,Dh)
+        v = self.v_proj(pre_v).view(-1, H, Dh)             # (total_k,H,Dh)
+
+        # Pack and run FlashAttention-2 varlen
+        q_packed = q.contiguous()                          # (total_q,H,Dh)
+        kv_packed = torch.stack([k, v], dim=1).contiguous()  # (total_k,2,H,Dh)
+        p_drop = self.dropout if self.training else 0.0
+        attn_out = flash_attn_varlen_kvpacked_func(
+            q_packed, kv_packed,
+            cu_q, cu_k,
+            max_q, max_k,
+            p_drop,
+            softmax_scale=None,
+            causal=False
+        )  # (total_q,H,Dh)
+
+        # Scatter back to (S,N,D)
+        out_heads = torch.zeros(S * N, H, Dh, device=x.device, dtype=attn_out.dtype)
+        out_heads.index_copy_(0, idx_q, attn_out)
+        out_D = out_heads.view(S * N, D)
+        out = self.o_proj(out_D).view(B, T, N, D)
+        return out + x
+
+
+        
+        
+class NeuronCausalAttention(nn.Module):
+    """
+    Causal self-attention over time per neuron independently.
+    - Operates on each neuron timeline (length T) with causal attention.
+    - Respects neuron_pad_mask (B,N): skip padded neurons entirely to save compute.
+    - Spike mask is ignored.
+    - Launches at most (2^16 - 1) sequences per FLASH call by chunking rows.
+    """
+    def __init__(self, d_model: int, n_heads: int, dropout_p: float = 0.0,
+                 max_bh_per_call: int = (2**18 )):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.dropout_p = float(dropout_p)
+        self.max_bh_per_call = int(max_bh_per_call)
+
+        self.norm = RMSNorm(d_model)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+
+    def _to_bhld(self, x):  # (B*, L, D) -> (B*, H, L, Dh)
+        Bx, L, D = x.shape
+        return x.view(Bx, L, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
+
+    def _from_bhld(self, x):  # (B*, H, L, Dh) -> (B*, L, D)
+        Bx, H, L, Dh = x.shape
+        return x.permute(0, 2, 1, 3).contiguous().view(Bx, L, H * Dh)
+
+    def forward(self, x: torch.Tensor,
+                neuron_pad_mask: torch.Tensor ):
+        # x: (B, T, N, D)
+        B, T, N, D = x.shape
+        xn = self.norm(x)
+        xt = xn.permute(0, 2, 1, 3).contiguous().view(B * N, T, D)  # (B*N, T, D)
+        res = xt
+
+        # Row filter from neuron_pad_mask
+        valid_rows = (neuron_pad_mask.reshape(-1) != 0)
+
+        out = torch.zeros_like(xt)
+        if valid_rows.any():
+            q_in = xt[valid_rows]
+            k_in = q_in
+            v_in = q_in
+
+            q = self._to_bhld(self.q_proj(q_in))
+            k = self._to_bhld(self.k_proj(k_in))
+            v = self._to_bhld(self.v_proj(v_in))
+
+            # Ensure FLASH dtype
+            if q.dtype not in (torch.bfloat16, torch.float16):
+                q = q.to(torch.bfloat16)
+            if k.dtype not in (torch.bfloat16, torch.float16):
+                k = k.to(torch.bfloat16)
+            if v.dtype not in (torch.bfloat16, torch.float16):
+                v = v.to(torch.bfloat16)
+
+            Bv, H, L, Dh = q.shape
+            if H > self.max_bh_per_call:
+                raise RuntimeError(
+                    f"n_heads={H} exceeds max_bh_per_call={self.max_bh_per_call}; reduce heads or increase cap"
+                )
+            # Choose row chunk so (rows_chunk * H) <= max_bh_per_call
+            rows_step = max(1, min(Bv, self.max_bh_per_call // H))
+            out_chunks = []
+            for i in range(0, Bv, rows_step):
+                qs = q[i:i + rows_step]
+                ks = k[i:i + rows_step]
+                vs = v[i:i + rows_step]
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    out_chunk = F.scaled_dot_product_attention(
+                        qs, ks, vs, is_causal=True, dropout_p=self.dropout_p
+                    )
+                out_chunks.append(out_chunk)
+            out_valid = torch.cat(out_chunks, dim=0)  # (Bv,H,L,Dh)
+            out_valid = self._from_bhld(out_valid).to(res.dtype)
+            out[valid_rows] = out_valid
+
+        out = out + res
+        out = out.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
+        return self.o_proj(out)
+        
