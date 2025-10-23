@@ -83,3 +83,4 @@ class CausalResidualNeuralConv1d(nn.Module):
         x = x + res
 
         return x
+

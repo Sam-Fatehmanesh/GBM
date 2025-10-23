@@ -1054,6 +1054,16 @@ def process_subject(subject_dir, config):
             else:
                 f.attrs['includes_log_activity_stats'] = False
         
+        # Add per-neuron global IDs (random 64-bit) for embedding lookup
+        try:
+            rng = np.random.default_rng(seed=None)
+            neuron_global_ids = rng.integers(low=1, high=np.iinfo(np.int64).max, size=(N,), dtype=np.int64)
+            with h5py.File(final_file, 'a') as f:
+                if 'neuron_global_ids' not in f:
+                    f.create_dataset('neuron_global_ids', data=neuron_global_ids)
+        except Exception as _e:
+            pass
+
         # Create visualization PDF
         print("  → Creating visualization PDF...")
         is_probability = (not skip_cascade) and bool(config['processing'].get('convert_rates_to_probabilities', True))

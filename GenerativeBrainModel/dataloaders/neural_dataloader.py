@@ -59,6 +59,7 @@ class NeuralDataset(Dataset):
         self.cached_stimulus: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
         self.cached_log_mean: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
         self.cached_log_std: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
+        self.cached_neuron_ids: Optional[Dict[str, np.ndarray]] = {} if use_cache else None
         # Offset of cached slices within original file (for fast index math)
         self.cache_offset: Optional[Dict[str, int]] = {} if use_cache else None
 
@@ -149,6 +150,12 @@ class NeuralDataset(Dataset):
                     if file_path not in self.cached_positions:
                         pos = f['cell_positions'][:]  # (N, 3)
                         self.cached_positions[file_path] = pos.astype(np.float32)
+                    if file_path not in self.cached_neuron_ids:
+                        try:
+                            ids = f['neuron_global_ids'][:]
+                        except Exception:
+                            ids = np.arange(N, dtype=np.int64)
+                        self.cached_neuron_ids[file_path] = ids.astype(np.int64)
                     # Stimulus: expect one-hot float dataset at 'stimulus_full'
                     if 'stimulus_full' in f:
                         stim_oh = f['stimulus_full'][trimmed_start:trimmed_end]
@@ -209,6 +216,7 @@ class NeuralDataset(Dataset):
             stimulus = self.cached_stimulus[file_path][rel_start:rel_end]  # (L, K_file)
             log_mean = self.cached_log_mean.get(file_path, None) if self.cached_log_mean is not None else None
             log_std = self.cached_log_std.get(file_path, None) if self.cached_log_std is not None else None
+            neuron_ids_arr = self.cached_neuron_ids[file_path]
         else:
             f = self._get_file_handle(file_path)
             ds_name = self._resolve_spikes_dataset_name(f)
@@ -226,6 +234,10 @@ class NeuralDataset(Dataset):
             except Exception:
                 log_mean = None
                 log_std = None
+            try:
+                neuron_ids_arr = f['neuron_global_ids'][:].astype(np.int64)
+            except Exception:
+                neuron_ids_arr = np.arange(positions.shape[0], dtype=np.int64)
 
         # Pad stimulus to the global width across files
         stimulus = self._pad_stimulus(stimulus)
@@ -245,12 +257,14 @@ class NeuralDataset(Dataset):
         positions_tensor = torch.from_numpy(positions_padded.astype(np.float32))  # (pad_N, 3)
         mask_tensor = torch.from_numpy(neuron_mask)
         stimulus_tensor = torch.from_numpy(stimulus.astype(np.float32))  # (L, K_file)
+        neuron_ids_tensor = torch.from_numpy(neuron_ids_arr.astype(np.int64))  # (N,)
 
         return {
             'spikes': spikes_tensor,            # (sequence_length, N)
             'positions': positions_tensor,      # (N, 3)
             'neuron_mask': mask_tensor,         # (N,)
             'stimulus': stimulus_tensor,        # (sequence_length, K_file)
+            'neuron_ids': neuron_ids_tensor,    # (N,)
             'log_activity_mean': (torch.from_numpy(log_mean) if log_mean is not None else torch.empty(0)),  # (N,)
             'log_activity_std': (torch.from_numpy(log_std) if log_std is not None else torch.empty(0)),    # (N,)
             'file_path': file_path,
@@ -476,16 +490,26 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
             out[:Nx] = m
             return out
 
+        def pad_ids(ids: torch.Tensor, target_n: int) -> torch.Tensor:
+            Nx = ids.shape[0]
+            if Nx == target_n:
+                return ids.to(torch.long)
+            out = torch.zeros((target_n,), dtype=torch.long)
+            out[:Nx] = ids.to(torch.long)
+            return out
+
         spikes = torch.stack([pad_spikes(it['spikes'], max_n) for it in batch], dim=0)
         positions = torch.stack([pad_positions(it['positions'], max_n) for it in batch], dim=0)
         masks = torch.stack([pad_mask(it['neuron_mask'], max_n) for it in batch], dim=0)
         stimulus = torch.stack([it['stimulus'] for it in batch], dim=0)  # (B, L, K) already padded across files
+        neuron_ids = torch.stack([pad_ids(it['neuron_ids'], max_n) for it in batch], dim=0)
 
         return {
             'spikes': spikes,           # (B, L, max_n)
             'positions': positions,     # (B, max_n, 3)
             'neuron_mask': masks,       # (B, max_n)
             'stimulus': stimulus,       # (B, L, K)
+            'neuron_ids': neuron_ids,   # (B, max_n)
             'file_path': [it['file_path'] for it in batch],
             'start_idx': torch.tensor([it['start_idx'] for it in batch], dtype=torch.long),
         }

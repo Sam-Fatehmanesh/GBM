@@ -14,7 +14,9 @@ LOGRATE_EPS = 1e-6
 
 
 class GBM(nn.Module):
-    def __init__(self, d_model, d_stimuli, n_heads, n_layers):
+    def __init__(self, d_model, d_stimuli, n_heads, n_layers,
+                 num_neurons_total: int,
+                 neuron_pad_id: int = 0):
         super(GBM, self).__init__()
 
         assert d_model % 2 == 0, "d_model must be even for rotary embeddings"
@@ -23,12 +25,14 @@ class GBM(nn.Module):
         self.n_heads = n_heads
         self.n_layers = n_layers
         self.d_stimuli = d_stimuli
+        self.neuron_pad_id = int(neuron_pad_id)
 
         self.layers = nn.ModuleList([SpatioTemporalNeuralAttention(d_model, n_heads) for _ in range(n_layers)])
 
         self.conv = nn.Sequential(
-                CausalResidualNeuralConv1d(d_model, kernel_size=9),
-                CausalResidualNeuralConv1d(d_model, kernel_size=9),
+                CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=1),
+                CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=2),
+                CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=4),
             )
         
         self.stimuli_encoder = nn.Sequential(
@@ -47,15 +51,16 @@ class GBM(nn.Module):
         # Treat encoders as "embed", attention stack as "body", decoder head as "head", muon optimizer is applied to the body only and adamw is applied to the embed and head
         self.embed = nn.ModuleDict({
             'stim': self.stimuli_encoder,
-            'neuron': self.neuron_scalar_position_encoder,
         })
         self.body = self.layers
         self.head = nn.ModuleDict({
             'neuron': self.neuron_scalar_decoder_head,
         })
 
+        # Per-neuron embeddings (added after conv stack)
+        self.neuron_embed = nn.Embedding(int(num_neurons_total) + 1, d_model, padding_idx=self.neuron_pad_id)
 
-    def forward(self, x, x_stimuli, point_positions, neuron_pad_mask, get_logits=True, input_log_rates=False):
+    def forward(self, x, x_stimuli, point_positions, neuron_pad_mask, neuron_ids, get_logits=True, input_log_rates=False):
         # Takes as input sequences of shape x: (batch_size, seq_len, n_neurons)
         # x_stimuli: (batch_size, seq_len, d_stimuli)
         # point_positions: (batch_size, n_neurons, 3)
@@ -91,19 +96,42 @@ class GBM(nn.Module):
         scale = (r2.mean(dim=1, keepdim=True).clamp_min(1e-6).sqrt()).unsqueeze(-1)  # (B, 1, 1)
         rel_point_positions = pos_centered / scale             # (B, N, 3) -- zero mean, unit RMS
 
-        # Concatenate the neuron scalars and the relative point positions by repeating for the entire sequence
-        x = torch.cat([x, rel_point_positions.unsqueeze(1).repeat(1, T, 1, 1)], dim=3)
-
-        # Encode the neuron scalars and the point positions
-        x = self.neuron_scalar_position_encoder(x)
 
         # (B, T, d_stimuli) -> (B, T, 1, d_model), acts as a global stimulus embedding as a token for each time step
         x_stimuli = x_stimuli.to(params_dtype).unsqueeze(2)
         x_stimuli = self.stimuli_encoder(x_stimuli) # (B, T, 1, d_model)
 
+        # Tile x to (B, T, n_neurons, d_model)
+        x = x.repeat(1, 1, N, 1)
+
         # concatenate the stimulus embedding to the input
         x = torch.cat([x, x_stimuli], dim=2) # (B, T, n_neurons + 1, d_model)
-        
+
+        # Apply the convolutional layers
+        x = self.conv(x)
+
+        # Add per-neuron embeddings
+        # neuron_ids: (B, N) long; pad entries should be neuron_pad_id (0)
+        if neuron_ids.dtype != torch.long:
+            neuron_ids = neuron_ids.to(torch.long)
+        # Map arbitrary 64-bit IDs into embedding table range while preserving 0 as pad
+        num_emb = int(self.neuron_embed.num_embeddings)
+        if num_emb > 1:
+            mod_base = num_emb - 1
+            # ids==0 stays 0; real ids mapped to [1, num_emb-1]
+            ids_mod = torch.where(
+                neuron_ids == self.neuron_pad_id,
+                torch.zeros_like(neuron_ids),
+                ((neuron_ids - 1) % mod_base) + 1,
+            )
+        else:
+            ids_mod = torch.zeros_like(neuron_ids)
+        emb = self.neuron_embed(ids_mod)  # (B,N,d_embed)
+        # Only add to the neuron tokens (exclude stimulus token at index N)
+        x_neurons = x[:, :, :N, :]
+        x_neurons = x_neurons + emb.unsqueeze(1)
+        x = torch.cat([x_neurons, x[:, :, N:, :]], dim=2)
+    
         # Adds an additional 1 value to neuron_pad_mask to account for the stimulus token
         neuron_pad_mask = torch.cat([neuron_pad_mask, torch.ones(B, 1, device=neuron_pad_mask.device)], dim=1) # (B, n_neurons + 1)
 
