@@ -498,11 +498,24 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
             out[:Nx] = ids.to(torch.long)
             return out
 
+        def pad_vec_or_zero(v: torch.Tensor, target_n: int, dtype: torch.dtype) -> torch.Tensor:
+            # v may be empty (numel==0) => return zeros
+            if v.numel() == 0:
+                return torch.zeros((target_n,), dtype=dtype)
+            Nx = v.shape[0]
+            if Nx == target_n:
+                return v.to(dtype)
+            out = torch.zeros((target_n,), dtype=dtype)
+            out[:Nx] = v.to(dtype)
+            return out
+
         spikes = torch.stack([pad_spikes(it['spikes'], max_n) for it in batch], dim=0)
         positions = torch.stack([pad_positions(it['positions'], max_n) for it in batch], dim=0)
         masks = torch.stack([pad_mask(it['neuron_mask'], max_n) for it in batch], dim=0)
         stimulus = torch.stack([it['stimulus'] for it in batch], dim=0)  # (B, L, K) already padded across files
         neuron_ids = torch.stack([pad_ids(it['neuron_ids'], max_n) for it in batch], dim=0)
+        log_mean = torch.stack([pad_vec_or_zero(it['log_activity_mean'], max_n, torch.float32) for it in batch], dim=0)
+        log_std  = torch.stack([pad_vec_or_zero(it['log_activity_std'],  max_n, torch.float32) for it in batch], dim=0)
 
         return {
             'spikes': spikes,           # (B, L, max_n)
@@ -510,6 +523,8 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
             'neuron_mask': masks,       # (B, max_n)
             'stimulus': stimulus,       # (B, L, K)
             'neuron_ids': neuron_ids,   # (B, max_n)
+            'log_activity_mean': log_mean,  # (B, max_n)
+            'log_activity_std': log_std,    # (B, max_n)
             'file_path': [it['file_path'] for it in batch],
             'start_idx': torch.tensor([it['start_idx'] for it in batch], dtype=torch.long),
         }

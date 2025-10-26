@@ -6,6 +6,7 @@ from GenerativeBrainModel.models.rms import RMSNorm
 from GenerativeBrainModel.models.mlp import MLP
 from GenerativeBrainModel.models.conv import CausalResidualNeuralConv1d
 from GenerativeBrainModel.models.spatiotemporal import SpatioTemporalNeuralAttention
+from GenerativeBrainModel.utils.debug import assert_no_nan, debug_enabled
 # cimport pdb
 import os
 
@@ -30,10 +31,12 @@ class GBM(nn.Module):
         self.layers = nn.ModuleList([SpatioTemporalNeuralAttention(d_model, n_heads) for _ in range(n_layers)])
 
         self.conv = nn.Sequential(
-                CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=1),
-                CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=2),
-                CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=4),
-            )
+            CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=1),
+            CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=2),
+            CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=4),
+        )
+
+        self.post_embed_conv_rmsnorm = RMSNorm(d_model)
         
         self.stimuli_encoder = nn.Sequential(
             nn.Linear(d_stimuli, d_model),
@@ -47,30 +50,36 @@ class GBM(nn.Module):
 
 
 
+
+
+        # Per-neuron embeddings (added after conv stack)
+        self.neuron_embed = nn.Embedding(int(num_neurons_total) + 1, d_model, padding_idx=self.neuron_pad_id)
+
         # Parameter groups for optimizers
         # Treat encoders as "embed", attention stack as "body", decoder head as "head", muon optimizer is applied to the body only and adamw is applied to the embed and head
         self.embed = nn.ModuleDict({
             'stim': self.stimuli_encoder,
+            'neuron': self.neuron_embed,
         })
         self.body = self.layers
         self.head = nn.ModuleDict({
             'neuron': self.neuron_scalar_decoder_head,
         })
 
-        # Per-neuron embeddings (added after conv stack)
-        self.neuron_embed = nn.Embedding(int(num_neurons_total) + 1, d_model, padding_idx=self.neuron_pad_id)
-
-    def forward(self, x, x_stimuli, point_positions, neuron_pad_mask, neuron_ids, get_logits=True, input_log_rates=False):
+    def forward(self, x, x_stimuli, point_positions, neuron_pad_mask, neuron_ids, neuron_spike_probs, get_logits=True, input_log_rates=False):
         # Takes as input sequences of shape x: (batch_size, seq_len, n_neurons)
         # x_stimuli: (batch_size, seq_len, d_stimuli)
         # point_positions: (batch_size, n_neurons, 3)
         # neuron_pad_mask: (batch_size, n_neurons)
+        # neuron_spike_probs: (batch_size, seq_len, n_neurons)
         # Returns sequences of shape (batch_size, seq_len, n_neurons, d_model)
         B, T, N = x.shape
 
         if not input_log_rates:
             # Convert input spike rates to log-rates immediately for downstream processing
             x = torch.log(x.clamp_min(LOGRATE_EPS))
+        if debug_enabled():
+            assert_no_nan(x, 'GBM.forward.x_log')
 
         target_dtype = next(self.parameters()).dtype
 
@@ -102,13 +111,15 @@ class GBM(nn.Module):
         x_stimuli = self.stimuli_encoder(x_stimuli) # (B, T, 1, d_model)
 
         # Tile x to (B, T, n_neurons, d_model)
-        x = x.repeat(1, 1, N, 1)
+        x = x.repeat(1, 1, 1, self.d_model)
 
         # concatenate the stimulus embedding to the input
         x = torch.cat([x, x_stimuli], dim=2) # (B, T, n_neurons + 1, d_model)
 
         # Apply the convolutional layers
         x = self.conv(x)
+        if debug_enabled():
+            assert_no_nan(x, 'GBM.after_conv')
 
         # Add per-neuron embeddings
         # neuron_ids: (B, N) long; pad entries should be neuron_pad_id (0)
@@ -126,11 +137,15 @@ class GBM(nn.Module):
             )
         else:
             ids_mod = torch.zeros_like(neuron_ids)
-        emb = self.neuron_embed(ids_mod)  # (B,N,d_embed)
-        # Only add to the neuron tokens (exclude stimulus token at index N)
-        x_neurons = x[:, :, :N, :]
-        x_neurons = x_neurons + emb.unsqueeze(1)
-        x = torch.cat([x_neurons, x[:, :, N:, :]], dim=2)
+        emb = self.neuron_embed(ids_mod)  # (B, N, d_embed)
+        # Repeat embeddings across the time dimension
+        emb = emb.unsqueeze(1).expand(-1, x.shape[1], -1, -1)  # (B, T, N, d_embed)
+        # Add only to the neuron tokens (exclude stimulus token at index N)
+        x[:, :, :N, :] = x[:, :, :N, :] + emb
+
+        x = self.post_embed_conv_rmsnorm(x)
+        if debug_enabled():
+            assert_no_nan(x, 'GBM.after_post_embed_norm')
     
         # Adds an additional 1 value to neuron_pad_mask to account for the stimulus token
         neuron_pad_mask = torch.cat([neuron_pad_mask, torch.ones(B, 1, device=neuron_pad_mask.device)], dim=1) # (B, n_neurons + 1)
@@ -138,9 +153,27 @@ class GBM(nn.Module):
         # Adds a zero vector to point_positions to account for the stimulus token
         point_positions = torch.cat([point_positions, torch.zeros(B, 1, 3, device=point_positions.device, dtype=params_dtype)], dim=1) # (B, n_neurons + 1, 3)
 
+        # Add a one to the neuron_spike_probs to account for the stimulus token
+        neuron_spike_probs = torch.cat([
+            neuron_spike_probs,
+            torch.ones(B, T, 1, device=neuron_spike_probs.device, dtype=torch.float32)
+        ], dim=2) # (B, T, n_neurons + 1)
+
+        # Sample spike mask robustly: clamp to [0,1] in fp32 to avoid bf16 rounding issues
+        if neuron_spike_probs.dtype != torch.float32:
+            probs_fp32 = neuron_spike_probs.to(torch.float32)
+        else:
+            probs_fp32 = neuron_spike_probs
+        probs_fp32 = torch.nan_to_num(probs_fp32, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+        if debug_enabled():
+            assert_no_nan(probs_fp32, 'GBM.probs_fp32_before_bernoulli')
+        neuron_spike_probs = torch.bernoulli(probs_fp32).to(torch.bool)
+
         # Apply the layers
         for i, layer in enumerate(self.layers):
-            x = layer(x, point_positions, neuron_pad_mask)
+            x = layer(x, point_positions, neuron_pad_mask, neuron_spike_probs)
+            if debug_enabled():
+                assert_no_nan(x, f'GBM.layer_{i}_out')
 
         # Remove the stimulus token
         x = x[:, :, :-1, :]
@@ -148,6 +181,8 @@ class GBM(nn.Module):
 
         # Decode the neuron scalars
         x = self.neuron_scalar_decoder_head(x)
+        if debug_enabled():
+            assert_no_nan(x, 'GBM.head_out')
 
         # SAS parameters: mu, log_sigma_raw, eta, log_delta_raw
         mu = x[..., 0]

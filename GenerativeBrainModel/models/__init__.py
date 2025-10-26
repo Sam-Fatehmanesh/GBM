@@ -3,18 +3,14 @@ Models package exports for GBM components.
 """
 
 from .gbm import GBM
-from .attention import SpatialNeuralAttention, TemporalNeuralAttention
+from .attention import SparseSpikeFullAttention, NeuronCausalAttention
 from .spatiotemporal import SpatioTemporalNeuralAttention
 from .mlp import MLP, FFN
 from .rms import RMSNorm
 
 __all__ = [
     'GBM',
-    'SpatialNeuralAttention',
-    'TemporalNeuralAttention',
+    'SparseSpikeFullAttention',
+    'NeuronCausalAttention',
     'SpatioTemporalNeuralAttention',
-    'MLP',
-    'FFN',
-    'RMSNorm',
 ]
-
