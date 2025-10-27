@@ -802,8 +802,21 @@ class SpikeSparseConnectomeRoutingAttention(nn.Module):
         return out
 
 
+
 class SparseSpikeFullAttention(nn.Module):
-    def __init__(self, d_model, n_heads, n_rope_features: int = 32, dropout: float = 0.0):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_rope_features: int = 32,     # number of (direction, freq) angles available for RoPE
+        dropout: float = 0.0,
+        # ---- new, all optional (keeps Dh fixed) ----
+        pos_tail_dim: int = 16,        # Dp: channels per head reserved for positional tail (<= Dh)
+        n_rff: int = 32,               # M: random Fourier features; tail uses a learned (2M -> Dp) compression
+        rff_sigma: float = 1.0,        # bandwidth for RFF wrt your RMS-scaled coords
+        pos_tail_scale: float = 0.1,   # γ: strength of positional kernel in logits
+        n_rot_pairs: int | None = None # m: rotary pairs per head (first 2m dims rotated)
+    ):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
@@ -817,32 +830,69 @@ class SparseSpikeFullAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
-        # 3D RoPE
+        # ---- RoPE basis (post-projection; direction-sensitive) ----
         self.n_rope_features = int(n_rope_features)
         dirs = torch.randn(self.n_rope_features, 3)
         dirs = dirs / dirs.norm(dim=-1, keepdim=True)
+        # tune upper band to your scale; 1..1e4 is fine for wide range, but you can lower upper band
         freqs = torch.logspace(math.log10(1.0), math.log10(10000.0), self.n_rope_features)
         self.register_buffer('rope_dirs', dirs, persistent=False)
         self.register_buffer('rope_freqs', freqs, persistent=False)
 
+        # ---- In-place positional tail (relative bias inside dot product), keeps Dh fixed ----
+        # Random Fourier features Ω ~ N(0, σ^2 I), φ(p) = [cos(Ωp), sin(Ωp)] ∈ R^{2M}
+        self.n_rff = int(n_rff)
+        Omega = torch.randn(self.n_rff, 3) * float(rff_sigma)
+        self.register_buffer('rff_Omega', Omega, persistent=False)
+
+        # compress 2M -> Dp once (shared across heads) + per-head gain
+        self.pos_tail_dim = int(pos_tail_dim)  # Dp
+        assert 0 <= self.pos_tail_dim <= self.head_dim, "pos_tail_dim must be <= head_dim"
+        self.pos_C = nn.Linear(2 * self.n_rff, self.pos_tail_dim, bias=False)  # shared compression
+        self.pos_head_gain = nn.Parameter(torch.ones(self.n_heads, self.pos_tail_dim))  # per-head scaling
+        self.pos_tail_scale = float(pos_tail_scale)  # γ
+
+        # ---- Rotary slice config (first 2m dims rotated; tail occupies last Dp dims) ----
+        # we must leave room: 2m + Dp <= Dh
+        max_m = max(0, (self.head_dim - self.pos_tail_dim) // 2)
+        self.n_rot_pairs = int(n_rot_pairs) if n_rot_pairs is not None else min(16, max_m)
+        self.n_rot_pairs = min(self.n_rot_pairs, max_m)  # safety
+
+    # -------- helpers --------
     @torch.no_grad()
-    def _directional_rope(self, positions):  # positions: (B, N, 3)
+    def _rope_angles(self, positions):  # positions: (B, N, 3)  (do NOT normalize; you said RMS-scaled & centered)
         rope_dirs = self.rope_dirs.to(dtype=positions.dtype, device=positions.device)
-        rope_freqs = self.rope_freqs.to(dtype=positions.dtype, device=positions.device)
-        proj = torch.einsum('bnd,fd->bnf', positions, rope_dirs)
-        angles = proj * rope_freqs
-        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)  # (B,N,2F)
+        rope_freqs = self.rope_freqs.to(dtype=positions.dtype, device=positions.device)  # (F,)
+        proj = torch.einsum('bnd,fd->bnf', positions, rope_dirs)  # (B,N,F)
+        angles = proj * rope_freqs  # broadcast (B,N,F)
+        return angles  # (B,N,F)
 
     @torch.no_grad()
-    def _apply_rope(self, x, rope_emb):  # x: (B*T,N,D)
-        B_T, N, D = x.shape
-        B = rope_emb.shape[0]
-        T = B_T // B
-        # Project rope to model dim (lightweight, front-fill)
-        rope = torch.zeros(B, N, D, dtype=x.dtype, device=x.device)
-        F2 = rope_emb.shape[-1]
-        rope[..., :F2] = rope_emb.to(dtype=x.dtype, device=x.device)
-        return x + rope.unsqueeze(1).expand(B, T, N, D).reshape(B_T, N, D)
+    def _rff_phi(self, positions):  # positions: (B, N, 3)
+        # φ(p) = [cos(Ωp), sin(Ωp)] with Ω: (M,3)
+        Omega = self.rff_Omega.to(dtype=positions.dtype, device=positions.device)  # (M,3)
+        proj = torch.einsum('bnd,md->bnm', positions, Omega)  # (B,N,M)
+        return torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)  # (B,N,2M)
+
+    @staticmethod
+    def _apply_rotary_inplace(x, theta, m):
+        """
+        x: (total_tokens, H, Dh)
+        theta: (total_tokens, F)  -> we use only first m angles
+        m: number of rotary pairs (first 2m dims per head will be rotated)
+        """
+        if m <= 0:
+            return x
+        # pairwise rotate: (even, odd)
+        x_even = x[..., :2*m:2]   # (total, H, m)
+        x_odd  = x[..., 1:2*m:2]  # (total, H, m)
+        sin = torch.sin(theta[:, :m]).unsqueeze(1)  # (total,1,m)
+        cos = torch.cos(theta[:, :m]).unsqueeze(1)  # (total,1,m)
+        xe = x_even * cos - x_odd * sin
+        xo = x_even * sin + x_odd * cos
+        x[..., :2*m:2] = xe
+        x[..., 1:2*m:2] = xo
+        return x
 
     #@torch._dynamo.disable
     def forward(self, x, point_positions, neuron_pad_mask, spike_mask):
@@ -850,37 +900,66 @@ class SparseSpikeFullAttention(nn.Module):
         B, T, N, D = x.shape
         H, Dh = self.n_heads, self.head_dim
         S = B * T
+        m = self.n_rot_pairs
+        Dp = self.pos_tail_dim
 
-        # Normalize and RoPE for Q/K inputs
+        # 1) Normalize activations (not positions)
         xn = self.norm(x)
-        unit_pos = F.normalize(point_positions, dim=-1)
-        rope_emb = self._directional_rope(unit_pos)
-        xn_bt = xn.view(B, T, N, D).reshape(S, N, D)
-        qk_in = self._apply_rope(xn_bt, rope_emb)
 
-        # Build masks and compact indices BEFORE projections
+        # 2) Precompute RoPE angles and φ(p) once per (B,N)
+        angles_BNF = self._rope_angles(point_positions)   # (B,N,F_rope)
+        phi_BN2M   = self._rff_phi(point_positions)       # (B,N,2M)
+
+        # 3) Flatten to (S,N,*) for (B,T) "sequence"
+        xn_bt = xn.view(B, T, N, D).reshape(S, N, D)
+
+        # 4) Build masks and compact indices BEFORE projections (your existing varlen flow)
         keep_bt = (neuron_pad_mask != 0).unsqueeze(1).expand(B, T, N).reshape(S, N)
         send_bt = (spike_mask != 0).reshape(S, N) & keep_bt
-
-        # Build varlen metadata and flat indices outside the compiled graph
         idx_q, idx_kv, cu_q, cu_k, lens_q, lens_k, max_q, max_k = _build_varlen_metadata_from_masks(keep_bt, send_bt)
 
-        # Compact tensors
-        qk_in_flat = qk_in.reshape(S * N, D)
-        xn_flat = xn_bt.reshape(S * N, D)
-        pre_q = qk_in_flat.index_select(0, idx_q)          # (total_q, D)
-        pre_k = qk_in_flat.index_select(0, idx_kv)         # (total_k, D)
-        pre_v = xn_flat.index_select(0, idx_kv)            # (total_k, D)
+        # 5) Compact inputs for projections
+        x_flat = xn_bt.reshape(S * N, D)
+        pre_q  = x_flat.index_select(0, idx_q)   # (total_q, D)
+        pre_kv = x_flat.index_select(0, idx_kv)  # (total_k, D)
 
-        # Projections
-        q = self.q_proj(pre_q).view(-1, H, Dh)             # (total_q,H,Dh)
-        k = self.k_proj(pre_k).view(-1, H, Dh)             # (total_k,H,Dh)
-        v = self.v_proj(pre_v).view(-1, H, Dh)             # (total_k,H,Dh)
+        # 6) Project to Q/K/V
+        q = self.q_proj(pre_q).view(-1, H, Dh)   # (total_q,H,Dh)
+        k = self.k_proj(pre_kv).view(-1, H, Dh)  # (total_k,H,Dh)
+        v = self.v_proj(pre_kv).view(-1, H, Dh)  # (total_k,H,Dh)
 
-        # Pack and run FlashAttention-2 varlen
-        q_packed = q.contiguous()                          # (total_q,H,Dh)
-        kv_packed = torch.stack([k, v], dim=1).contiguous()  # (total_k,2,H,Dh)
+        # 7) Gather angles for compacted tokens and apply RoPE to first 2m dims (post-proj)
+        angles_SN = angles_BNF.unsqueeze(1).expand(B, T, N, -1).reshape(S*N, -1)  # (S*N, F_rope)
+        theta_q = angles_SN.index_select(0, idx_q)   # (total_q, F_rope)
+        theta_k = angles_SN.index_select(0, idx_kv)  # (total_k, F_rope)
+        self._apply_rotary_inplace(q, theta_q, m)
+        self._apply_rotary_inplace(k, theta_k, m)
+
+        # 8) In-place positional tail (distance/sector kernel) in the LAST Dp dims of Q/K; zero same slice in V
+        if Dp > 0:
+            # compress φ(p) -> Dp using shared linear, then per-head gain; scale by sqrt(γ)
+            phi_SN = phi_BN2M.unsqueeze(1).expand(B, T, N, -1).reshape(S*N, -1)  # (S*N, 2M)
+            phi_q  = phi_SN.index_select(0, idx_q)                                # (total_q, 2M)
+            phi_k  = phi_SN.index_select(0, idx_kv)                               # (total_k, 2M)
+
+            tail_q = self.pos_C(phi_q)  # (total_q, Dp)
+            tail_k = self.pos_C(phi_k)  # (total_k, Dp)
+
+            # apply per-head gain and global scale √γ, then overwrite last Dp dims
+            scale = (self.pos_tail_scale ** 0.5)
+            # (total, H, Dp)
+            q_tail = scale * (tail_q.unsqueeze(1) * self.pos_head_gain.unsqueeze(0))
+            k_tail = scale * (tail_k.unsqueeze(1) * self.pos_head_gain.unsqueeze(0))
+
+            q[..., Dh-Dp:] = q_tail
+            k[..., Dh-Dp:] = k_tail
+            v[..., Dh-Dp:] = 0.0  # ensure tail affects logits only
+
+        # 9) FlashAttention-2 varlen (unchanged)
+        q_packed = q.contiguous()                                        # (total_q,H,Dh)
+        kv_packed = torch.stack([k, v], dim=1).contiguous()              # (total_k,2,H,Dh)
         p_drop = self.dropout if self.training else 0.0
+
         attn_out = flash_attn_varlen_kvpacked_func(
             q_packed, kv_packed,
             cu_q, cu_k,
@@ -890,11 +969,18 @@ class SparseSpikeFullAttention(nn.Module):
             causal=False
         )  # (total_q,H,Dh)
 
-        # Scatter back to (S,N,D)
+        # 10) (Optional) zero positional tail in out before o_proj (should already be ~0 since V tail is 0)
+        if Dp > 0:
+            zero_tail = attn_out[..., :Dp].detach().new_zeros(attn_out.shape[:-1] + (Dp,))
+            attn_out = torch.cat([attn_out[..., :Dh - Dp], zero_tail], dim=-1)
+
+        # 11) Scatter back to (S,N,D) and output proj + residual
         out_heads = torch.zeros(S * N, H, Dh, device=x.device, dtype=attn_out.dtype)
         out_heads = out_heads.index_copy(0, idx_q, attn_out)
         out_D = out_heads.view(S * N, D)
         out = self.o_proj(out_D).view(B, T, N, D)
+
+        # Add residual connection
         return out + x
     
 
