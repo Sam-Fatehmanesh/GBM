@@ -34,6 +34,9 @@ class GBM(nn.Module):
             CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=1),
             CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=2),
             CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=4),
+            #CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=8),
+            # CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=16),
+            # CausalResidualNeuralConv1d(d_model, kernel_size=5, dilation=32),
         )
 
         self.post_embed_conv_rmsnorm = RMSNorm(d_model)
@@ -151,7 +154,7 @@ class GBM(nn.Module):
         neuron_pad_mask = torch.cat([neuron_pad_mask, torch.ones(B, 1, device=neuron_pad_mask.device)], dim=1) # (B, n_neurons + 1)
 
         # Adds a zero vector to point_positions to account for the stimulus token
-        point_positions = torch.cat([point_positions, torch.zeros(B, 1, 3, device=point_positions.device, dtype=params_dtype)], dim=1) # (B, n_neurons + 1, 3)
+        point_positions = torch.cat([point_positions, (1e-8) * torch.ones(B, 1, 3, device=point_positions.device, dtype=params_dtype)], dim=1) # (B, n_neurons + 1, 3)
 
         # Add a one to the neuron_spike_probs to account for the stimulus token
         neuron_spike_probs = torch.cat([

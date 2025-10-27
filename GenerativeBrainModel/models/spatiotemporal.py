@@ -52,7 +52,7 @@ class SpatioTemporalNeuralAttention(nn.Module):
         global_mean_pool = self.FFN_global_mean_pool(x)
         x = torch.cat([x, global_mean_pool], dim=2) # (B, T, n_neurons + 1, d_model)
         neuron_pad_mask = torch.cat([neuron_pad_mask, torch.ones(B, 1, device=neuron_pad_mask.device)], dim=1) # (B, n_neurons + 1)
-        point_positions = torch.cat([point_positions, torch.zeros(B, 1, 3, device=point_positions.device, dtype=x.dtype)], dim=1) # (B, n_neurons + 1, 3)
+        point_positions = torch.cat([point_positions, (1e-6) * torch.ones(B, 1, 3, device=point_positions.device, dtype=x.dtype)], dim=1) # (B, n_neurons + 1, 3)
         
         # Add a one to the neuron_spike_probs to account for the stimulus token
         neuron_spike_probs = torch.cat(

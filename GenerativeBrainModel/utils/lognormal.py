@@ -25,6 +25,7 @@ def lognormal_nll(
     raw_log_sigma: torch.Tensor,
     eps: float = 1e-8,
     mask: torch.Tensor | None = None,
+    weight_by_rate: bool = False,
 ) -> torch.Tensor:
     """Negative log-likelihood for LogNormal on rate domain.
 
@@ -55,12 +56,22 @@ def lognormal_nll(
     )
 
     nll = -log_pdf
+
+
+    if weight_by_rate:
+        y0 = torch.quantile(y.detach(), 0.5)  # median as a reference
+        w = torch.exp(0.7*(y - y0)).clamp(max=20)
+        nll = nll * w
+
+
     if mask is not None:
         mask = mask.to(dtype=nll.dtype, device=nll.device)
         if mask.shape != nll.shape:
             mask = mask.expand_as(nll)
         total = mask.sum().clamp_min(1.0)
         return (nll * mask).sum() / total
+
+
     return nll.mean()
 
 

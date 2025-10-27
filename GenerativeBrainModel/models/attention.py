@@ -844,6 +844,7 @@ class SparseSpikeFullAttention(nn.Module):
         rope[..., :F2] = rope_emb.to(dtype=x.dtype, device=x.device)
         return x + rope.unsqueeze(1).expand(B, T, N, D).reshape(B_T, N, D)
 
+    #@torch._dynamo.disable
     def forward(self, x, point_positions, neuron_pad_mask, spike_mask):
         # x: (B,T,N,D), positions: (B,N,3), masks as described
         B, T, N, D = x.shape
@@ -896,17 +897,18 @@ class SparseSpikeFullAttention(nn.Module):
         out = self.o_proj(out_D).view(B, T, N, D)
         return out + x
     
-        
+
 class NeuronCausalAttention(nn.Module):
     """
-    Causal self-attention over time per neuron independently.
+    Causal self-attention over time per neuron independently, with timewise RoPE.
     - Operates on each neuron timeline (length T) with causal attention.
     - Respects neuron_pad_mask (B,N): skip padded neurons entirely to save compute.
     - Spike mask is ignored.
     - Launches at most (2^18) sequences per FLASH call by chunking rows.
+    - Adds rotary positional embeddings over time axis per neuron.
     """
     def __init__(self, d_model: int, n_heads: int, dropout_p: float = 0.0,
-                 max_bh_per_call: int = (2**16 - 1)):
+                 max_bh_per_call: int = (2**16 - 1), max_seq_len: int = 512):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
@@ -921,6 +923,18 @@ class NeuronCausalAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
+        # --- Timewise RoPE (rotary) ---
+        self.max_seq_len = max_seq_len
+        # Precompute sin/cos tables for rotary, with 32 rotary dims per head by default (or as many as fit)
+        self.rotary_frac = 0.5
+        self.rotary_dim = int(self.head_dim * self.rotary_frac)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.rotary_dim, 2).float() / self.rotary_dim))
+        t = torch.arange(self.max_seq_len)
+        freqs = torch.outer(t, inv_freq)  # (T, rotary_dim // 2)
+        sin, cos = freqs.sin(), freqs.cos()
+        self.register_buffer("rope_sin", sin, persistent=False)
+        self.register_buffer("rope_cos", cos, persistent=False)
+
     def _to_bhld(self, x):  # (B*, L, D) -> (B*, H, L, Dh)
         Bx, L, D = x.shape
         return x.view(Bx, L, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
@@ -929,6 +943,37 @@ class NeuronCausalAttention(nn.Module):
         Bx, H, L, Dh = x.shape
         return x.permute(0, 2, 1, 3).contiguous().view(Bx, L, H * Dh)
 
+    def _apply_timewise_rope(self, x, seq_len):
+        """
+        Apply rotary positional embeddings along the time axis.
+        x: (batch*, H, seq_len, Dh)
+        Only applies to the first rotary_dim of Dh.
+        """
+        rotary_dim = self.rotary_dim
+        if rotary_dim == 0:
+            return x
+        # get sin/cos for this seq_len, shape (seq_len, rotary_dim // 2)
+        sin = self.rope_sin[:seq_len].to(dtype=x.dtype, device=x.device)
+        cos = self.rope_cos[:seq_len].to(dtype=x.dtype, device=x.device)
+        # Shape to (1,1,seq_len, rotary_dim), broadcast along batch/H
+        sin = sin[None, None, :, :]
+        cos = cos[None, None, :, :]
+
+        x1 = x[..., :rotary_dim]
+        x2 = x[..., rotary_dim:]
+        # Reshape for pairwise treatment
+        x1 = x1.reshape(*x.shape[:-1], rotary_dim // 2, 2)
+        sin, cos = sin, cos
+        x1_0 = x1[..., 0]
+        x1_1 = x1[..., 1]
+        rope_x0 = x1_0 * cos - x1_1 * sin
+        rope_x1 = x1_0 * sin + x1_1 * cos
+        # Stack and reshape back
+        x1_rope = torch.stack([rope_x0, rope_x1], dim=-1).reshape(*x.shape[:-1], rotary_dim)
+        # Concatenate with remaining dims
+        return torch.cat([x1_rope, x2], dim=-1)
+
+    #@torch._dynamo.disable
     def forward(self, x: torch.Tensor,
                 neuron_pad_mask: torch.Tensor ):
         # x: (B, T, N, D)
@@ -946,9 +991,14 @@ class NeuronCausalAttention(nn.Module):
             k_in = q_in
             v_in = q_in
 
-            q = self._to_bhld(self.q_proj(q_in))
+            # Projections
+            q = self._to_bhld(self.q_proj(q_in))   # (Bv, H, L, Dh)
             k = self._to_bhld(self.k_proj(k_in))
             v = self._to_bhld(self.v_proj(v_in))
+
+            # Apply timewise RoPE to q/k
+            q = self._apply_timewise_rope(q, seq_len=q.shape[2])
+            k = self._apply_timewise_rope(k, seq_len=k.shape[2])
 
             # Ensure FLASH dtype
             if q.dtype not in (torch.bfloat16, torch.float16):
@@ -982,3 +1032,4 @@ class NeuronCausalAttention(nn.Module):
         out = out + res
         out = out.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
         return self.o_proj(out)
+
