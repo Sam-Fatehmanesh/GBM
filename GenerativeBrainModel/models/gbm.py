@@ -51,6 +51,11 @@ class GBM(nn.Module):
             nn.Linear(d_model, 4),
         )
 
+        # Encodes 3D position with magnitude as an independent input feature.
+        self.pos_encoder = nn.Sequential(
+            nn.Linear(4, d_model),  # [unit_dir_x, unit_dir_y, unit_dir_z, ||p||]
+            RMSNorm(d_model),
+        )
 
 
 
@@ -61,6 +66,7 @@ class GBM(nn.Module):
         # Parameter groups for optimizers
         # Treat encoders as "embed", attention stack as "body", decoder head as "head", muon optimizer is applied to the body only and adamw is applied to the embed and head
         self.embed = nn.ModuleDict({
+            'pos': self.pos_encoder,
             'stim': self.stimuli_encoder,
             'neuron': self.neuron_embed,
         })
@@ -146,6 +152,13 @@ class GBM(nn.Module):
         # Add only to the neuron tokens (exclude stimulus token at index N)
         x[:, :, :N, :] = x[:, :, :N, :] + emb
 
+        # Add position encoding
+        point_magnitudes = torch.norm(rel_point_positions, dim=-1, keepdim=True)
+        rel_point_positions_with_magnitude = torch.cat([rel_point_positions.div(point_magnitudes.clamp_min(1e-8)), point_magnitudes], dim=-1)
+
+        x[:, :, :N, :] = x[:, :, :N, :] + self.pos_encoder(rel_point_positions_with_magnitude) # (B, T, n_neurons, d_model)
+        
+
         x = self.post_embed_conv_rmsnorm(x)
         if debug_enabled():
             assert_no_nan(x, 'GBM.after_post_embed_norm')
@@ -153,8 +166,8 @@ class GBM(nn.Module):
         # Adds an additional 1 value to neuron_pad_mask to account for the stimulus token
         neuron_pad_mask = torch.cat([neuron_pad_mask, torch.ones(B, 1, device=neuron_pad_mask.device)], dim=1) # (B, n_neurons + 1)
 
-        # Adds a zero vector to point_positions to account for the stimulus token
-        point_positions = torch.cat([point_positions, (1e-8) * torch.ones(B, 1, 3, device=point_positions.device, dtype=params_dtype)], dim=1) # (B, n_neurons + 1, 3)
+        # Adds a zero vector to rel_point_positions to account for the stimulus token
+        rel_point_positions = torch.cat([rel_point_positions, torch.zeros(B, 1, 3, device=rel_point_positions.device, dtype=params_dtype)], dim=1) # (B, n_neurons + 1, 3)
 
         # Add a one to the neuron_spike_probs to account for the stimulus token
         neuron_spike_probs = torch.cat([
@@ -174,7 +187,7 @@ class GBM(nn.Module):
 
         # Apply the layers
         for i, layer in enumerate(self.layers):
-            x = layer(x, point_positions, neuron_pad_mask, neuron_spike_probs)
+            x = layer(x, rel_point_positions, neuron_pad_mask, neuron_spike_probs)
             if debug_enabled():
                 assert_no_nan(x, f'GBM.layer_{i}_out')
 

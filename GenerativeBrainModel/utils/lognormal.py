@@ -89,3 +89,9 @@ def lognormal_rate_mean(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch.
     """Mean in the rate domain for LogNormal: E[X] = exp(mu + 0.5*sigma^2)."""
     sigma = _positive(raw_log_sigma)
     return torch.exp(mu + 0.5 * sigma.pow(2))
+
+
+def sample_lognormal(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch.Tensor:
+    """Sample from the LogNormal distribution."""
+    sigma = _positive(raw_log_sigma)
+    return torch.exp(mu + sigma * torch.randn_like(mu))
