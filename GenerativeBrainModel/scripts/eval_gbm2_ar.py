@@ -107,6 +107,149 @@ def make_validation_plots(step_dir: Path,
 
 
 @torch.no_grad()
+def make_mu_sigma_scatter(step_dir: Path,
+                          mu_last: torch.Tensor,      # (N,) in log-rate (z or y domain depending on caller)
+                          sigma_last: torch.Tensor,   # (N,) positive
+                          valid_mask: torch.Tensor,   # (N,) bool or float
+                          title: str) -> None:
+    step_dir.mkdir(parents=True, exist_ok=True)
+    x = mu_last.to(torch.float32).detach().cpu().numpy()
+    y = sigma_last.to(torch.float32).detach().cpu().numpy()
+    m = valid_mask.detach().cpu().numpy().astype(bool)
+    x = x[m]
+    y = y[m]
+    if x.size == 0:
+        return
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.scatter(x, y, s=6, alpha=0.6, color='tab:blue', edgecolors='none')
+    ax.set_xlabel('predicted mu (log-rate)')
+    ax.set_ylabel('predicted sigma (log-rate)')
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(step_dir / 'mu_sigma_scatter.png')
+    plt.close(fig)
+
+@torch.no_grad()
+def make_mean_rate_plot(step_dir: Path,
+                        context_truth: torch.Tensor,
+                        future_truth: torch.Tensor,
+                        future_pred: torch.Tensor,
+                        title: str) -> None:
+    """Plot mean rate over neurons vs time for context, true future, and AR prediction."""
+    step_dir.mkdir(parents=True, exist_ok=True)
+    Tc, N = context_truth.shape
+    Tf = future_truth.shape[0]
+    # Means across neurons
+    ctx_mean = context_truth.to(torch.float32).mean(dim=1).cpu().numpy() if context_truth.numel() > 0 else np.zeros((0,), dtype=np.float32)
+    fut_mean = future_truth.to(torch.float32).mean(dim=1).cpu().numpy() if future_truth.numel() > 0 else np.zeros((0,), dtype=np.float32)
+    pred_mean = future_pred.to(torch.float32).mean(dim=1).cpu().numpy() if future_pred.numel() > 0 else np.zeros((0,), dtype=np.float32)
+
+    x_context = np.arange(Tc)
+    x_future = np.arange(Tc, Tc + Tf)
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 3))
+    if ctx_mean.size:
+        ax.plot(x_context, ctx_mean, color='gray', lw=1.5, label='context mean rate')
+    if fut_mean.size:
+        ax.plot(x_future, fut_mean, color='tab:blue', lw=1.5, label='future truth mean')
+    if pred_mean.size:
+        ax.plot(x_future, pred_mean, color='tab:orange', lw=1.5, label='future pred mean')
+    ax.set_xlabel('time')
+    ax.set_ylabel('mean rate')
+    ax.set_title(title)
+    ax.legend(loc='upper right', fontsize=8)
+    fig.tight_layout()
+    out = step_dir / 'mean_rate_over_time.png'
+    fig.savefig(out)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def make_next_step_scatter(step_dir: Path,
+                           true_last: torch.Tensor,   # (N,)
+                           pred_last: torch.Tensor,   # (N,)
+                           valid_mask: torch.Tensor,  # (N,) bool or float
+                           title: str) -> None:
+    step_dir.mkdir(parents=True, exist_ok=True)
+    t = true_last.to(torch.float32).detach().cpu().numpy()
+    p = pred_last.to(torch.float32).detach().cpu().numpy()
+    m = valid_mask.detach().cpu().numpy().astype(bool)
+    t = t[m]
+    p = p[m]
+    if t.size == 0:
+        return
+    # sort by true ascending
+    order = np.argsort(t)
+    t_sorted = t[order]
+    p_sorted = p[order]
+    # Pearson r
+    if t_sorted.size >= 2:
+        r = float(np.corrcoef(t_sorted, p_sorted)[0, 1])
+    else:
+        r = float('nan')
+    # limits
+    lo = float(min(t_sorted.min(), p_sorted.min()))
+    hi = float(max(t_sorted.max(), p_sorted.max()))
+    pad = 0.02 * (hi - lo + 1e-8)
+    lo -= pad
+    hi += pad
+    # plot
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.scatter(t_sorted, p_sorted, s=6, alpha=0.6, color='tab:orange', edgecolors='none')
+    ax.plot([lo, hi], [lo, hi], color='gray', lw=1.2, linestyle='--', label='y = x')
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel('true next-step rate')
+    ax.set_ylabel('predicted next-step rate')
+    ax.set_title(title)
+    ax.text(0.02, 0.98, f"r = {r:.3f}", transform=ax.transAxes, ha='left', va='top')
+    ax.legend(loc='lower right', fontsize=8)
+    fig.tight_layout()
+    fig.savefig(step_dir / 'next_step_scatter.png')
+    plt.close(fig)
+
+@torch.no_grad()
+def make_log_rate_scatter(step_dir: Path,
+                          true_last: torch.Tensor,   # (N,) rate
+                          pred_last: torch.Tensor,   # (N,) rate
+                          valid_mask: torch.Tensor,  # (N,) bool or float
+                          title: str,
+                          eps: float = 1e-7) -> None:
+    step_dir.mkdir(parents=True, exist_ok=True)
+    t = torch.log(true_last.clamp_min(eps)).to(torch.float32).detach().cpu().numpy()
+    p = torch.log(pred_last.clamp_min(eps)).to(torch.float32).detach().cpu().numpy()
+    m = valid_mask.detach().cpu().numpy().astype(bool)
+    t = t[m]
+    p = p[m]
+    if t.size == 0:
+        return
+    order = np.argsort(t)
+    t_sorted = t[order]
+    p_sorted = p[order]
+    if t_sorted.size >= 2:
+        r = float(np.corrcoef(t_sorted, p_sorted)[0, 1])
+    else:
+        r = float('nan')
+    lo = float(min(t_sorted.min(), p_sorted.min()))
+    hi = float(max(t_sorted.max(), p_sorted.max()))
+    pad = 0.02 * (hi - lo + 1e-8)
+    lo -= pad
+    hi += pad
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.scatter(t_sorted, p_sorted, s=6, alpha=0.6, color='tab:green', edgecolors='none')
+    ax.plot([lo, hi], [lo, hi], color='gray', lw=1.2, linestyle='--', label='y = x')
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel('log true next-step rate')
+    ax.set_ylabel('log predicted next-step rate')
+    ax.set_title(title)
+    ax.text(0.02, 0.98, f"r = {r:.3f}", transform=ax.transAxes, ha='left', va='top')
+    ax.legend(loc='lower right', fontsize=8)
+    fig.tight_layout()
+    fig.savefig(step_dir / 'log_next_step_scatter.png')
+    plt.close(fig)
+
+@torch.no_grad()
 def autoregressive_rollout(model: GBM,
                            init_context: torch.Tensor,   # (1, Tc, N) rates
                            stim_full: torch.Tensor,      # (1, Tc+Tf, K)
@@ -193,7 +336,8 @@ def main():
         pass
 
     # Dataloaders (use extended window for eval so we have future ground truth)
-    train_loader, val_loader, _, _ = create_dataloaders(cfg_eval)
+    # Also receive global unique neuron IDs for collision-free embeddings
+    train_loader, val_loader, _, _, unique_neuron_ids = create_dataloaders(cfg_eval)
 
     # Infer d_stimuli from a sample if needed
     try:
@@ -204,7 +348,8 @@ def main():
 
     model = GBM(d_model=cfg['model']['d_model'], d_stimuli=d_stimuli,
                 n_heads=cfg['model']['n_heads'], n_layers=cfg['model']['n_layers'],
-                num_neurons_total=int(cfg['model']['num_neurons_total'])).to(device)
+                num_neurons_total=int(cfg['model']['num_neurons_total']),
+                global_neuron_ids=unique_neuron_ids).to(device)
 
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -298,7 +443,7 @@ def main():
             # Prepare one AR visualization with future truth beyond original window
             if final_ctx is None:
                 B, Lm1_full, N = x_in_full.shape
-                Tf = min(horizon, max(1, Lm1_full - Lm1_orig)) if Lm1_full > Lm1_orig else min(horizon, Lm1_full)
+                Tf = 32#min(horizon, max(1, Lm1_full - Lm1_orig)) if Lm1_full > Lm1_orig else min(horizon, Lm1_full)
                 Tc = Lm1_orig
                 # Ensure bounds
                 Tf = max(1, min(Tf, max(1, Lm1_full - Tc)))
@@ -308,6 +453,18 @@ def main():
                 final_ctx = init_context[0].cpu()
                 final_truth = x_in_full[0, Tc:Tc+Tf, :].cpu()
                 final_pred = pred_future.cpu()
+
+                # Next-step scatter for last step of teacher-forced window
+                true_last = x_tg[0, -1, :]                      # (N,)
+                pred_last = sample_lognormal(mu[0:1, -1:, :], raw_log_sigma[0:1, -1:, :])[0, 0, :]
+                step_dir = plots_dir / 'eval_ar'
+                make_next_step_scatter(step_dir, true_last, pred_last, mask[0] != 0, title='Eval next-step scatter (last step)')
+                # Mu vs Sigma scatter (last step, z/LogNormal params)
+                mu_last = mu[0, -1, :].to(torch.float32)
+                sigma_last = (F.softplus(raw_log_sigma[0, -1, :].to(torch.float32)) + 1e-6)
+                make_mu_sigma_scatter(step_dir, mu_last, sigma_last, mask[0] != 0, title='Eval mu vs sigma (last step)')
+                # Log-rate scatter (last step)
+                make_log_rate_scatter(step_dir, true_last, pred_last, mask[0] != 0, title='Eval log-rate scatter (last step)')
 
             if vb >= val_batches_limit:
                 break
@@ -320,6 +477,7 @@ def main():
     if final_ctx is not None and final_truth is not None and final_pred is not None:
         step_dir = plots_dir / 'eval_ar'
         make_validation_plots(step_dir, final_ctx, final_truth, final_pred, title=f"Eval autoreg 16 neurons")
+        make_mean_rate_plot(step_dir, final_ctx, final_truth, final_pred, title=f"Eval mean rate over time")
 
     print(f"Eval complete. Val loss: {val_loss:.6f} over {vb} batches. Outputs in: {exp_dir}")
 

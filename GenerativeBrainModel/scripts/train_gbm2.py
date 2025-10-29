@@ -65,6 +65,9 @@ def create_default_config() -> Dict[str, Any]:
             'seed': 42,
             'plots_dir': 'experiments/gbm2/plots',
             'sampling_rate_hz': 3.0,
+            # Left-censored LogNormal threshold for loss (rates below are treated as "≤ r_min")
+            # Set to 0.0 to disable; e.g., 1e-2 to ignore exact values below 0.01
+            'loss_r_min': 0.0,
         }
     }
 
@@ -442,7 +445,7 @@ def main():
             else:
                 z_tg = y_tg
 
-            # Normal NLL on z_tg with model's (mu, sigma) in z-domain
+            # Normal NLL on z_tg with optional left-censoring below r_min
             sigma_y = F.softplus(raw_log_sigma.to(torch.float32)) + 1e-6
             if lam.numel() > 0 and las.numel() > 0:
                 mu_z = (mu.to(torch.float32) - lam_e_loss.to(torch.float32)) / las_e_loss.to(torch.float32)
@@ -450,8 +453,25 @@ def main():
             else:
                 mu_z = mu.to(torch.float32)
                 sigma_z = sigma_y
-            z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
-            nll = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
+
+            r_min = float(cfg['training'].get('loss_r_min', 0.0) or 0.0)
+            if r_min > 0.0:
+                y_min = math.log(r_min)
+                if lam.numel() > 0 and las.numel() > 0:
+                    z_min = (torch.tensor(y_min, dtype=mu_z.dtype, device=mu_z.device) - lam_e_loss.to(mu_z.dtype)) / las_e_loss.to(mu_z.dtype)
+                else:
+                    z_min = torch.tensor(y_min, dtype=mu_z.dtype, device=mu_z.device)
+                is_cens = (x_tg <= r_min)
+                z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
+                nll_pdf = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
+                alpha = (z_min - mu_z) / sigma_z
+                # log CDF of standard normal using erf; clamp for stability
+                log_cdf = torch.log((0.5 * (1.0 + torch.erf(alpha / math.sqrt(2.0)))).clamp_min(1e-12))
+                nll_cdf = -log_cdf
+                nll = torch.where(is_cens.to(nll_pdf.dtype), nll_cdf, nll_pdf)
+            else:
+                z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
+                nll = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
             # Build mask for loss to match target shape
             mask_exp = mask[:, None, :].expand_as(x_tg).float()
             if mask_exp is not None:
@@ -519,7 +539,7 @@ def main():
 
                             spike_probs_v = 1.0 - torch.exp(-x_in_v.float() / sr_v)
                             mu_v, raw_log_sigma_v, _, _ = model(x_in_z_v, stim_in_v, positions_v, mask_v, neuron_ids_v, spike_probs_v, get_logits=True, input_log_rates=True)
-                            # Z-normalized validation target and Normal NLL in z-domain
+                            # Z-normalized validation target with optional left-censored NLL
                             y_tg_v = torch.log(x_tg_v.clamp_min(1e-7))
                             if lam_v.numel() > 0 and las_v.numel() > 0:
                                 lam_e_v2 = lam_v[:, None, :].to(dtype=y_tg_v.dtype)
@@ -534,8 +554,23 @@ def main():
                             else:
                                 mu_z_v = mu_v.to(torch.float32)
                                 sigma_z_v = sigma_y_v
-                            z_err_v = (z_tg_v.to(torch.float32) - mu_z_v) / sigma_z_v
-                            nll_v = 0.5 * z_err_v.pow(2) + torch.log(sigma_z_v) + 0.5 * math.log(2.0 * math.pi)
+                            r_min_v = float(cfg['training'].get('loss_r_min', 0.0) or 0.0)
+                            if r_min_v > 0.0:
+                                y_min_v = math.log(r_min_v)
+                                if lam_v.numel() > 0 and las_v.numel() > 0:
+                                    z_min_v = (torch.tensor(y_min_v, dtype=mu_z_v.dtype, device=mu_z_v.device) - lam_e_v2.to(mu_z_v.dtype)) / las_e_v2.to(mu_z_v.dtype)
+                                else:
+                                    z_min_v = torch.tensor(y_min_v, dtype=mu_z_v.dtype, device=mu_z_v.device)
+                                is_cens_v = (x_tg_v <= r_min_v)
+                                z_err_v = (z_tg_v.to(torch.float32) - mu_z_v) / sigma_z_v
+                                nll_pdf_v = 0.5 * z_err_v.pow(2) + torch.log(sigma_z_v) + 0.5 * math.log(2.0 * math.pi)
+                                alpha_v = (z_min_v - mu_z_v) / sigma_z_v
+                                log_cdf_v = torch.log((0.5 * (1.0 + torch.erf(alpha_v / math.sqrt(2.0)))).clamp_min(1e-12))
+                                nll_cdf_v = -log_cdf_v
+                                nll_v = torch.where(is_cens_v.to(nll_pdf_v.dtype), nll_cdf_v, nll_pdf_v)
+                            else:
+                                z_err_v = (z_tg_v.to(torch.float32) - mu_z_v) / sigma_z_v
+                                nll_v = 0.5 * z_err_v.pow(2) + torch.log(sigma_z_v) + 0.5 * math.log(2.0 * math.pi)
                             mask_exp_v = mask_v[:, None, :].expand_as(x_tg_v).float()
                             vloss = (nll_v * mask_exp_v).sum() / mask_exp_v.sum().clamp_min(1.0)
                             total_v += float(vloss.detach().cpu().item())
@@ -618,7 +653,7 @@ def main():
                     spike_probs = 1.0 - torch.exp(-x_in.to(torch.float32) / sr)
                     spike_probs = torch.nan_to_num(spike_probs, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
                     mu, raw_log_sigma, _, _ = model(x_in_z, stim_in, positions, mask, neuron_ids, spike_probs, get_logits=True, input_log_rates=True)
-                    # Z-normalized validation target and Normal NLL in z-domain
+                    # Z-normalized validation target with optional left-censored NLL
                     y_tg = torch.log(x_tg.clamp_min(1e-7))
                     if lam.numel() > 0 and las.numel() > 0:
                         lam_e2 = lam[:, None, :].to(dtype=y_tg.dtype)
@@ -633,8 +668,23 @@ def main():
                     else:
                         mu_z = mu.to(torch.float32)
                         sigma_z = sigma_y
-                    z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
-                    nll = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
+                    r_min_e = float(cfg['training'].get('loss_r_min', 0.0) or 0.0)
+                    if r_min_e > 0.0:
+                        y_min_e = math.log(r_min_e)
+                        if lam.numel() > 0 and las.numel() > 0:
+                            z_min_e = (torch.tensor(y_min_e, dtype=mu_z.dtype, device=mu_z.device) - lam_e2.to(mu_z.dtype)) / las_e2.to(mu_z.dtype)
+                        else:
+                            z_min_e = torch.tensor(y_min_e, dtype=mu_z.dtype, device=mu_z.device)
+                        is_cens_e = (x_tg <= r_min_e)
+                        z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
+                        nll_pdf = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
+                        alpha_e = (z_min_e - mu_z) / sigma_z
+                        log_cdf_e = torch.log((0.5 * (1.0 + torch.erf(alpha_e / math.sqrt(2.0)))).clamp_min(1e-12))
+                        nll_cdf = -log_cdf_e
+                        nll = torch.where(is_cens_e.to(nll_pdf.dtype), nll_cdf, nll_pdf)
+                    else:
+                        z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
+                        nll = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
                     mask_exp = mask[:, None, :].expand_as(x_tg).float()
                     vloss = (nll * mask_exp).sum() / mask_exp.sum().clamp_min(1.0)
                     total += float(vloss.detach().cpu().item())
