@@ -17,7 +17,8 @@ LOGRATE_EPS = 1e-6
 class GBM(nn.Module):
     def __init__(self, d_model, d_stimuli, n_heads, n_layers,
                  num_neurons_total: int,
-                 neuron_pad_id: int = 0):
+                 neuron_pad_id: int = 0,
+                 global_neuron_ids: torch.Tensor | None = None):
         super(GBM, self).__init__()
 
         assert d_model % 2 == 0, "d_model must be even for rotary embeddings"
@@ -60,8 +61,16 @@ class GBM(nn.Module):
 
 
 
-        # Per-neuron embeddings (added after conv stack)
-        self.neuron_embed = nn.Embedding(int(num_neurons_total) + 1, d_model, padding_idx=self.neuron_pad_id)
+        # If a global mapping of unique neuron IDs is provided, build a compact embedding table
+        if global_neuron_ids.dtype != torch.long:
+            global_neuron_ids = global_neuron_ids.to(torch.long)
+        # Sorted unique IDs for deterministic behavior
+        uniq_ids, _ = torch.sort(global_neuron_ids.unique())
+        # Build an ID->index map via a hash table (Python dict) for CPU lookups; moved to device on forward
+        self.register_buffer('global_neuron_ids_sorted', uniq_ids, persistent=True)
+        self.register_buffer('has_global_id_map', torch.tensor([1], dtype=torch.uint8), persistent=False)
+        self.neuron_embed = nn.Embedding(int(uniq_ids.numel()) + 1, d_model, padding_idx=self.neuron_pad_id)
+
 
         # Parameter groups for optimizers
         # Treat encoders as "embed", attention stack as "body", decoder head as "head", muon optimizer is applied to the body only and adamw is applied to the embed and head
@@ -134,19 +143,30 @@ class GBM(nn.Module):
         # neuron_ids: (B, N) long; pad entries should be neuron_pad_id (0)
         if neuron_ids.dtype != torch.long:
             neuron_ids = neuron_ids.to(torch.long)
-        # Map arbitrary 64-bit IDs into embedding table range while preserving 0 as pad
-        num_emb = int(self.neuron_embed.num_embeddings)
-        if num_emb > 1:
-            mod_base = num_emb - 1
-            # ids==0 stays 0; real ids mapped to [1, num_emb-1]
-            ids_mod = torch.where(
-                neuron_ids == self.neuron_pad_id,
-                torch.zeros_like(neuron_ids),
-                ((neuron_ids - 1) % mod_base) + 1,
-            )
+        if bool(self.has_global_id_map.item()):
+            # Map true 64-bit IDs to compact indices via binary search over sorted unique IDs
+            # Keep 0 as pad id if present
+            ids_flat = neuron_ids.view(-1)
+            # torch.searchsorted requires sorted 1D sequence
+            idx = torch.searchsorted(self.global_neuron_ids_sorted, ids_flat)
+            # Handle IDs not found: set to pad (0) when out-of-range or mismatch
+            valid = (idx < self.global_neuron_ids_sorted.numel()) & (self.global_neuron_ids_sorted[idx] == ids_flat)
+            idx = torch.where(valid, idx + 1, torch.zeros_like(idx))  # +1 to keep 0 as pad index
+            ids_compact = idx.view_as(neuron_ids)
+            emb = self.neuron_embed(ids_compact)
         else:
-            ids_mod = torch.zeros_like(neuron_ids)
-        emb = self.neuron_embed(ids_mod)  # (B, N, d_embed)
+            # Legacy modulo mapping
+            num_emb = int(self.neuron_embed.num_embeddings)
+            if num_emb > 1:
+                mod_base = num_emb - 1
+                ids_mod = torch.where(
+                    neuron_ids == self.neuron_pad_id,
+                    torch.zeros_like(neuron_ids),
+                    ((neuron_ids - 1) % mod_base) + 1,
+                )
+            else:
+                ids_mod = torch.zeros_like(neuron_ids)
+            emb = self.neuron_embed(ids_mod)  # (B, N, d_embed)
         # Repeat embeddings across the time dimension
         emb = emb.unsqueeze(1).expand(-1, x.shape[1], -1, -1)  # (B, T, N, d_embed)
         # Add only to the neuron tokens (exclude stimulus token at index N)

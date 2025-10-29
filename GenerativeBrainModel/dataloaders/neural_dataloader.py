@@ -336,7 +336,34 @@ def _max_stimuli_in_files(files: List[str]) -> int:
     return max_k
 
 
-def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler], Optional[DistributedSampler]]:
+def _unique_neuron_ids_in_files(files: List[str]) -> np.ndarray:
+    """Collect sorted unique neuron IDs across all files.
+    Falls back to [0..N-1] if 'neuron_global_ids' missing in a file.
+    """
+    uniq: set[int] = set()
+    for fp in files:
+        try:
+            with h5py.File(fp, 'r') as f:
+                if 'neuron_global_ids' in f:
+                    arr = f['neuron_global_ids'][:]
+                else:
+                    if 'cell_positions' in f:
+                        n = int(f['cell_positions'].shape[0])
+                    else:
+                        n = int(f['num_neurons'][()]) if 'num_neurons' in f else 0
+                    arr = np.arange(n, dtype=np.int64)
+                # Update python set; casting to Python int to ensure hashability
+                for v in arr:
+                    uniq.add(int(v))
+        except Exception:
+            continue
+    if not uniq:
+        return np.zeros((0,), dtype=np.int64)
+    out = np.array(sorted(uniq), dtype=np.int64)
+    return out
+
+
+def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler], Optional[DistributedSampler], torch.Tensor]:
     """
     Create train/test DataLoaders for neural spike probability data.
 
@@ -375,6 +402,9 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
     pad_stimuli_to = _max_stimuli_in_files(all_files)
     print(f"Padding neuron dimension to: {pad_neurons_to}")
     print(f"Padding stimulus dimension to: {pad_stimuli_to}")
+    # Global unique neuron IDs across all subjects in the folder
+    unique_ids_np = _unique_neuron_ids_in_files(all_files)
+    unique_ids_tensor = torch.from_numpy(unique_ids_np.astype(np.int64)) if unique_ids_np.size > 0 else torch.empty(0, dtype=torch.long)
 
     # Parameters
     sequence_length = training_config.get('sequence_length', 1)
@@ -532,4 +562,4 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, Optional[D
     train_loader = DataLoader(train_dataset, shuffle=(train_sampler is None), sampler=train_sampler, collate_fn=collate_pad, **dl_kwargs)
     test_loader = DataLoader(test_dataset, shuffle=False, sampler=test_sampler, collate_fn=collate_pad, **dl_kwargs)
 
-    return train_loader, test_loader, train_sampler, test_sampler
+    return train_loader, test_loader, train_sampler, test_sampler, unique_ids_tensor

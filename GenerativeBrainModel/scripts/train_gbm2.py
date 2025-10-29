@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 
 from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
-from GenerativeBrainModel.utils.lognormal import lognormal_nll, lognormal_rate_median
+from GenerativeBrainModel.utils.lognormal import lognormal_nll, lognormal_rate_median, sample_lognormal
 from GenerativeBrainModel.utils.debug import assert_no_nan, debug_enabled
 
 
@@ -88,6 +88,18 @@ def set_seeds(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def _maybe_empty_cuda_cache() -> None:
+    """Free cached CUDA memory at safe points to reduce VRAM pressure.
+    Called only outside hot training loops to avoid perf impact.
+    """
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def build_optimizer(model: GBM, cfg: Dict[str, Any]) -> optim.Optimizer:
@@ -166,11 +178,17 @@ def autoregressive_rollout(model: GBM,
                            sampling_rate_hz: float = 3.0) -> torch.Tensor:      # returns (Tf, N) rates
     model.eval()
     context = init_context.clone()  # (1, Tc, N)
+    Lc = int(init_context.shape[1])
     preds = []
     eps = 1e-7
+    # Pre-sample spike mask for initial context (0/1 floats)
+    sr_f = float(sampling_rate_hz)
+    prob_init = 1.0 - torch.exp(-context.to(torch.float32) / sr_f)
+    prob_init = torch.nan_to_num(prob_init, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+    spike_mask_ctx = torch.bernoulli(prob_init).to(torch.float32)  # (1,Tc,N)
     for t in range(Tf):
-        # Use last frame as input (next-step model); or use last Lc window if desired
-        x_in = context[:, -1:, :]  # (1,1,N)
+        # Use sliding window of last Lc steps
+        x_in = context[:, -Lc:, :]  # (1,Lc,N)
         x_log = torch.log(x_in.clamp_min(eps))
         if (lam is not None) and (lam.numel() > 0) and (las is not None) and (las.numel() > 0):
             lam_e = lam[:, None, :].to(dtype=x_log.dtype)
@@ -178,16 +196,25 @@ def autoregressive_rollout(model: GBM,
             x_in_z = (x_log - lam_e) / las_e
         else:
             x_in_z = x_log
-        stim_step = stim_full[:, (context.shape[1]-1):(context.shape[1]), :]  # align single step
+        # Align stimuli to the sliding window
+        stim_step = stim_full[:, (context.shape[1]-Lc):(context.shape[1]), :]
         if device.type == 'cuda':
             x_in_z = x_in_z.to(torch.bfloat16)
             stim_step = stim_step.to(torch.bfloat16)
-        spike_probs = 1.0 - torch.exp(-x_in.to(torch.float32) / float(sampling_rate_hz))
-        mu, raw_log_sigma, _, _ = model(x_in_z, stim_step, positions, neuron_mask, neuron_ids, spike_probs, get_logits=True, input_log_rates=True)
-        med = lognormal_rate_median(mu, raw_log_sigma)  # (1,1,N)
-        preds.append(med[:, 0, :].to(torch.float32))
-        # Append prediction to context
-        context = torch.cat([context, med.to(context.dtype)], dim=1)
+        # Use pre-sampled spike mask window (0/1 floats) to make routing deterministic
+        spike_probs_window = spike_mask_ctx[:, -Lc:, :]
+        mu, raw_log_sigma, _, _ = model(x_in_z, stim_step, positions, neuron_mask, neuron_ids, spike_probs_window, get_logits=True, input_log_rates=True)
+        # Sample from LogNormal for stochastic rollout
+        mu_last = mu[:, -1:, :]
+        sig_last = raw_log_sigma[:, -1:, :]
+        samp = sample_lognormal(mu_last, sig_last)  # (1,1,N)
+        preds.append(samp[:, 0, :].to(torch.float32))
+        # Append prediction and its pre-sampled spike mask
+        context = torch.cat([context, samp.to(context.dtype)], dim=1)
+        next_prob = 1.0 - torch.exp(-samp.to(torch.float32) / sr_f)
+        next_prob = torch.nan_to_num(next_prob, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+        next_mask = torch.bernoulli(next_prob).to(torch.float32)
+        spike_mask_ctx = torch.cat([spike_mask_ctx, next_mask], dim=1)
     return torch.cat(preds, dim=0)  # (Tf,N)
 
 
@@ -227,8 +254,8 @@ def main():
     except Exception:
         pass
 
-    # Data
-    train_loader, val_loader, _, _ = create_dataloaders(cfg)
+    # Data (with global unique neuron IDs)
+    train_loader, val_loader, _, _, unique_neuron_ids = create_dataloaders(cfg)
 
     # Model
     try:
@@ -241,7 +268,8 @@ def main():
 
     model = GBM(d_model=cfg['model']['d_model'], d_stimuli=d_stimuli,
                 n_heads=cfg['model']['n_heads'], n_layers=cfg['model']['n_layers'],
-                num_neurons_total=int(cfg['model']['num_neurons_total'])).to(device)
+                num_neurons_total=int(cfg['model']['num_neurons_total']),
+                global_neuron_ids=unique_neuron_ids).to(device)
 
     # Run bf16 on CUDA
     if device.type == 'cuda':
@@ -453,6 +481,7 @@ def main():
 
             # Lightweight intra-epoch validation at configured steps
             if train and (count in triggers):
+                _maybe_empty_cuda_cache()
                 model.eval()
                 try:
                     total_v = 0.0
@@ -512,10 +541,10 @@ def main():
                             total_v += float(vloss.detach().cpu().item())
                             vb += 1
 
-                            # prepare small rollout visualization
+                            # prepare small rollout visualization using full available context with sliding window
                             Bv, Lm1_v, Nv = x_in_v.shape
-                            Tc_v = max(1, Lm1_v // 2)
-                            Tf_v = min(Lm1_v - Tc_v, 16) if (Lm1_v - Tc_v) > 0 else 1
+                            Tf_v = min(Lm1_v, 16) if Lm1_v > 0 else 1
+                            Tc_v = max(1, Lm1_v - Tf_v)
                             init_context_v = x_in_v[0:1, :Tc_v, :].to(torch.float32)
                             stim_full_v = stim_v[0:1, :Tc_v+Tf_v, :]
                             pred_future_v = autoregressive_rollout(model, init_context_v, stim_full_v, positions_v[0:1], mask_v[0:1], neuron_ids_v[0:1], lam_v[0:1] if lam_v.numel()>0 else None, las_v[0:1] if las_v.numel()>0 else None, device, Tf_v, sampling_rate_hz=sr_v)
@@ -537,6 +566,8 @@ def main():
                 except Exception:
                     pass
                 model.train()
+                # Free cached VRAM after validation + plotting to reduce peak usage
+                _maybe_empty_cuda_cache()
         return total_loss / max(1, count)
 
     best_val = float('inf')
@@ -608,10 +639,10 @@ def main():
                     vloss = (nll * mask_exp).sum() / mask_exp.sum().clamp_min(1.0)
                     total += float(vloss.detach().cpu().item())
                     vb += 1
-                    # keep one for plot: multi-step autoregressive rollout using last half as horizon
+                    # keep one for plot: multi-step AR using full context with sliding window
                     B, Lm1, N = x_in.shape
-                    Tc = max(1, Lm1 // 2)
-                    Tf = min(Lm1 - Tc, 16) if (Lm1 - Tc) > 0 else 1
+                    Tf = min(Lm1, 16) if Lm1 > 0 else 1
+                    Tc = max(1, Lm1 - Tf)
                     init_context = x_in[0:1, :Tc, :].to(torch.float32)
                     stim_full = stim[0:1, :Tc+Tf, :]
                     pred_future = autoregressive_rollout(model, init_context, stim_full, positions[0:1], mask[0:1], neuron_ids[0:1], lam[0:1] if lam.numel()>0 else None, las[0:1] if las.numel()>0 else None, device, Tf, sampling_rate_hz=sr)
@@ -627,6 +658,8 @@ def main():
                 f.write(f"epoch {epoch}, train {train_loss:.6f}, val {val_loss:.6f}\n")
             val_points.append((global_step, float(val_loss)))
             _update_loss_plot()
+            # Safe VRAM cleanup after plotting and optional checkpoint save
+            _maybe_empty_cuda_cache()
             # Autoregressive visualization (context + future) for 16 neurons on the kept batch
             if final_ctx is not None and final_truth is not None and final_pred is not None:
                 step_dir = Path(plots_dir) / f"epoch_{epoch}"
@@ -645,8 +678,12 @@ def main():
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save({'epoch': epoch, 'model': model.state_dict()}, ckpt_dir / 'best_model.pth')
+            # Safe VRAM cleanup after end-of-epoch validation
+            _maybe_empty_cuda_cache()
 
     print("Training complete. Best val:", best_val)
+    # Final cleanup
+    _maybe_empty_cuda_cache()
 
 
 if __name__ == '__main__':
