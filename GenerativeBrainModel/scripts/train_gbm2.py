@@ -468,7 +468,7 @@ def main():
                 # log CDF of standard normal using erf; clamp for stability
                 log_cdf = torch.log((0.5 * (1.0 + torch.erf(alpha / math.sqrt(2.0)))).clamp_min(1e-12))
                 nll_cdf = -log_cdf
-                nll = torch.where(is_cens.to(nll_pdf.dtype), nll_cdf, nll_pdf)
+                nll = torch.where(is_cens, nll_cdf, nll_pdf)
             else:
                 z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
                 nll = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
@@ -567,7 +567,7 @@ def main():
                                 alpha_v = (z_min_v - mu_z_v) / sigma_z_v
                                 log_cdf_v = torch.log((0.5 * (1.0 + torch.erf(alpha_v / math.sqrt(2.0)))).clamp_min(1e-12))
                                 nll_cdf_v = -log_cdf_v
-                                nll_v = torch.where(is_cens_v.to(nll_pdf_v.dtype), nll_cdf_v, nll_pdf_v)
+                                nll_v = torch.where(is_cens_v, nll_cdf_v, nll_pdf_v)
                             else:
                                 z_err_v = (z_tg_v.to(torch.float32) - mu_z_v) / sigma_z_v
                                 nll_v = 0.5 * z_err_v.pow(2) + torch.log(sigma_z_v) + 0.5 * math.log(2.0 * math.pi)
@@ -681,7 +681,7 @@ def main():
                         alpha_e = (z_min_e - mu_z) / sigma_z
                         log_cdf_e = torch.log((0.5 * (1.0 + torch.erf(alpha_e / math.sqrt(2.0)))).clamp_min(1e-12))
                         nll_cdf = -log_cdf_e
-                        nll = torch.where(is_cens_e.to(nll_pdf.dtype), nll_cdf, nll_pdf)
+                        nll = torch.where(is_cens_e, nll_cdf, nll_pdf)
                     else:
                         z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
                         nll = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
