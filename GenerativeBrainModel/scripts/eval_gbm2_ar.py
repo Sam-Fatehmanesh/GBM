@@ -306,7 +306,7 @@ def main():
     ap.add_argument('--exp_dir', type=str, required=True, help='Path to experiments/gbm2/<YYYYmmdd_HHMMSS>')
     ap.add_argument('--ckpt', type=str, default=None, help='Optional checkpoint path; defaults to <exp_dir>/checkpoints/best_model.pth')
     ap.add_argument('--val_batches', type=int, default=None, help='Number of validation batches to average (defaults to cfg.training.val_sample_batches or all)')
-    ap.add_argument('--horizon', type=int, default=16, help='AR prediction horizon steps for visualization')
+    ap.add_argument('--horizon', type=int, default=64, help='AR prediction horizon steps for visualization')
     args = ap.parse_args()
 
     exp_dir = Path(args.exp_dir)
@@ -443,7 +443,7 @@ def main():
             # Prepare one AR visualization with future truth beyond original window
             if final_ctx is None:
                 B, Lm1_full, N = x_in_full.shape
-                Tf = 32#min(horizon, max(1, Lm1_full - Lm1_orig)) if Lm1_full > Lm1_orig else min(horizon, Lm1_full)
+                Tf = min(horizon, max(1, Lm1_full - Lm1_orig)) if Lm1_full > Lm1_orig else min(horizon, Lm1_full)
                 Tc = Lm1_orig
                 # Ensure bounds
                 Tf = max(1, min(Tf, max(1, Lm1_full - Tc)))
