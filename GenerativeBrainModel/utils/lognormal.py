@@ -82,7 +82,7 @@ def lognormal_log_median(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch
 
 def lognormal_rate_median(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch.Tensor:
     """Median in the rate domain for LogNormal."""
-    return torch.exp(mu)
+    return torch.exp(mu).clamp(min=0.003)
 
 
 def lognormal_rate_mean(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch.Tensor:
@@ -93,6 +93,6 @@ def lognormal_rate_mean(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch.
 
 def sample_lognormal(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch.Tensor:
     """Sample from the LogNormal distribution, clamping to 2 stds on either side."""
-    sigma = _positive(raw_log_sigma)#.clamp(min=0.0, max=1.0)
-    eps = torch.randn_like(mu) # 86.4% of samples are within 1.5 stds
+    sigma = _positive(raw_log_sigma)
+    eps = torch.randn_like(mu) 
     return torch.exp(mu + sigma * eps).clamp(min=0.003)

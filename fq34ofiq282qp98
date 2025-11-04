@@ -15,16 +15,20 @@ more seq length aka to 256 - in prog
 
 investigate nan stuff
 
-use loss censoring using cdf 
+use loss censoring using cdf - in prog
+
+figure out if rope in spike attention could be done better?
 
 replace the neuron causal attn with flash attn
 
 Upweight higher rate neurons in the loss, high weight for high predicted rate not nessarily for high true rate
 
-test short context but large layers aka 4 layres but 48 seqlen
+test short context but large layers aka 4 layres but 48 seqlen - done
 test super long context but only 1 lr aka 1 lr but 192 seqlen
 
-test masking out same neuron to same neuron attention, ways to try, remove spiking neurons from Q, switch to flexattn which has attn bias support
+test masking out same neuron to same neuron attention, ways to try, remove spiking neurons from Q [in prog], switch to flexattn which has attn bias support
+
+test using log mse
 
 interneuron dependent loss function:
 

@@ -18,7 +18,8 @@ class GBM(nn.Module):
     def __init__(self, d_model, d_stimuli, n_heads, n_layers,
                  num_neurons_total: int,
                  neuron_pad_id: int = 0,
-                 global_neuron_ids: torch.Tensor | None = None):
+                 global_neuron_ids: torch.Tensor | None = None,
+                 cov_rank: int = 32):
         super(GBM, self).__init__()
 
         assert d_model % 2 == 0, "d_model must be even for rotary embeddings"
@@ -52,6 +53,11 @@ class GBM(nn.Module):
             nn.Linear(d_model, 4),
         )
 
+        # Low-rank correlation/covariance factors head (for dependence in loss)
+        self.cov_factor_head = nn.Linear(d_model, int(cov_rank), bias=False)
+        # Initialize near-zero so early MVN term is small but learnable
+        nn.init.normal_(self.cov_factor_head.weight, mean=0.0, std=1e-3)
+
         # Encodes 3D position with magnitude as an independent input feature.
         self.pos_encoder = nn.Sequential(
             nn.Linear(4, d_model),  # [unit_dir_x, unit_dir_y, unit_dir_z, ||p||]
@@ -82,9 +88,10 @@ class GBM(nn.Module):
         self.body = self.layers
         self.head = nn.ModuleDict({
             'neuron': self.neuron_scalar_decoder_head,
+            'cov': self.cov_factor_head,
         })
 
-    def forward(self, x, x_stimuli, point_positions, neuron_pad_mask, neuron_ids, neuron_spike_probs, get_logits=True, input_log_rates=False):
+    def forward(self, x, x_stimuli, point_positions, neuron_pad_mask, neuron_ids, neuron_spike_probs, get_logits=True, input_log_rates=False, return_factors: bool = False):
         # Takes as input sequences of shape x: (batch_size, seq_len, n_neurons)
         # x_stimuli: (batch_size, seq_len, d_stimuli)
         # point_positions: (batch_size, n_neurons, 3)
@@ -214,9 +221,19 @@ class GBM(nn.Module):
         # Remove the stimulus token
         x = x[:, :, :-1, :]
 
+        # Add the learned neuron embeddings back to the input
+        # Only add the *last half* of the embedding, zeros elsewhere
+        half = emb.shape[-1] // 2
+        pad = emb[:, :, :N, :].new_zeros(emb[:, :, :N, :].shape)
+        pad[..., half:] = emb[:, :, :N, half:]
+        x[:, :, :N, :] = x[:, :, :N, :] + pad
 
-        # Decode the neuron scalars
-        x = self.neuron_scalar_decoder_head(x)
+
+        # Decode the neuron scalars and low-rank covariance factors from the same normalized hidden
+        # Reuse the RMSNorm inside the sequential to keep representation consistent
+        h = self.neuron_scalar_decoder_head[0](x)
+        x = self.neuron_scalar_decoder_head[1](h)
+        factors = self.cov_factor_head(h)  # (B, T, N, r)
         if debug_enabled():
             assert_no_nan(x, 'GBM.head_out')
 
@@ -227,6 +244,8 @@ class GBM(nn.Module):
         log_delta_raw = x[..., 3]
 
         if get_logits:
+            if return_factors:
+                return mu, log_sigma_raw, eta, log_delta_raw, factors
             return mu, log_sigma_raw, eta, log_delta_raw
 
         from GenerativeBrainModel.utils.sas import sas_rate_median

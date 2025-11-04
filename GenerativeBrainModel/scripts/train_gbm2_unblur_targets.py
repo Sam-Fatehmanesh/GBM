@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
-Clean training script for GBM:
- - Dataloader provides spikes (rates), stimulus, positions, neuron_mask, neuron_ids, and optional per-neuron log stats.
- - Inputs to model are log(rates) z-normalized per neuron using provided log_activity_mean/std when available.
- - Model predicts LogNormal parameters (mu, raw_log_sigma) and is trained with LogNormal NLL.
- - Uses Muon optimizer for attention body and AdamW for embeddings/head.
- - Validates periodically and writes scalar plots and a 16-neuron autoregressive visualization comparing prediction vs truth.
- - Train/test split is last X% of time per subject, already enforced by the dataset construction.
+Train GBM with blurred inputs but UNBLURRED targets.
+This mirrors train_gbm2.py but applies spatial blur only to the input sequence x_in,
+while targets x_tg remain from the original (unblurred) spikes.
 """
 
 from __future__ import annotations
@@ -14,7 +10,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any
 import math
 
 import torch
@@ -27,31 +23,33 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from GenerativeBrainModel.models.gbm import GBM
-from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
-from GenerativeBrainModel.utils.lognormal import lognormal_nll, lognormal_rate_median, sample_lognormal
+from GenerativeBrainModel.dataloaders.single_subject_dataloader import create_single_subject_dataloaders
+from GenerativeBrainModel.utils.lognormal import sample_lognormal
 from GenerativeBrainModel.utils.debug import assert_no_nan, debug_enabled
 
 
 def create_default_config() -> Dict[str, Any]:
     return {
-        'experiment': {'name': 'gbm2_neural_training'},
+        'experiment': {'name': 'gbm2_neural_training_unblur_targets'},
         'data': {
             'data_dir': 'processed_spike_voxels_2018',
             'use_cache': True,
+            'include_files': None,
+            'spatial_blur_voxel_size': 0.0,
         },
         'model': {
             'd_model': 256,
             'n_heads': 8,
             'n_layers': 4,
-            'd_stimuli': None,  # infer from data
-            'num_neurons_total': 4_000_000,  # capacity of neuron embedding table (>= max distinct IDs)
-            'cov_rank': 32,                  # rank of low-rank correlation factors U
+            'd_stimuli': None,
+            'num_neurons_total': 4_000_000,
+            'cov_rank': 32,
         },
         'training': {
             'batch_size': 2,
             'num_epochs': 20,
-            'learning_rate': 5e-4,          # AdamW for non-body
-            'muon_lr': 2e-2,                # Muon for attention body
+            'learning_rate': 5e-4,
+            'muon_lr': 2e-2,
             'weight_decay': 1e-4,
             'sequence_length': 12,
             'stride': 3,
@@ -66,16 +64,10 @@ def create_default_config() -> Dict[str, Any]:
             'seed': 42,
             'plots_dir': 'experiments/gbm2/plots',
             'sampling_rate_hz': 3.0,
-            # Left-censored LogNormal threshold for loss (rates below are treated as "≤ r_min")
-            # Set to 0.0 to disable; e.g., 1e-2 to ignore exact values below 0.01
             'loss_r_min': 0.0,
-            # Gaussian copula dependence term (correlation-only)
             'copula_weight': 0.05,
-            # Start the copula term at floor*copula_weight and ramp linearly to copula_weight by run end
             'copula_warmup_floor': 1e-3,
-            # Jitter added to correlation base (R derived from L = (1+jitter)I + U U^T)
             'copula_jitter': 1e-3,
-            # Optional burn-in steps where μ,σ are detached in copula term to stabilize early learning
             'copula_detach_burnin_steps': 0,
         }
     }
@@ -103,9 +95,6 @@ def set_seeds(seed: int) -> None:
 
 
 def _maybe_empty_cuda_cache() -> None:
-    """Free cached CUDA memory at safe points to reduce VRAM pressure.
-    Called only outside hot training loops to avoid perf impact.
-    """
     if torch.cuda.is_available():
         try:
             torch.cuda.synchronize()
@@ -114,96 +103,41 @@ def _maybe_empty_cuda_cache() -> None:
             pass
 
 
-def build_optimizer(model: GBM, cfg: Dict[str, Any]) -> optim.Optimizer:
-    try:
-        from muon import MuonWithAuxAdam
-    except ImportError as e:
-        raise ImportError("Muon optimizer not found. Install: pip install git+https://github.com/KellerJordan/Muon") from e
+def _apply_spatial_voxel_blur(spikes: torch.Tensor,
+                               positions: torch.Tensor,
+                               mask: torch.Tensor,
+                               voxel_size: float) -> torch.Tensor:
+    if voxel_size is None or float(voxel_size) <= 0.0:
+        return spikes
+    B, L, N = spikes.shape
+    device = spikes.device
+    dtype = spikes.dtype
+    out = torch.zeros_like(spikes)
+    for b in range(B):
+        valid = (mask[b] != 0)
+        if not bool(valid.any().item()):
+            continue
+        pos_bn = positions[b, valid].to(torch.float32)
+        vox = torch.floor(pos_bn / float(voxel_size)).to(torch.long)
+        vx_min, _ = vox.min(dim=0)
+        vox0 = vox - vx_min
+        sx = int(vox0[:, 0].max().item()) + 1
+        sy = int(vox0[:, 1].max().item()) + 1
+        code = vox0[:, 0] + vox0[:, 1] * sx + vox0[:, 2] * (sx * sy)
+        num_groups = int(code.max().item()) + 1 if code.numel() > 0 else 0
+        spikes_bn = spikes[b, :, valid].to(torch.float32)
+        if num_groups == 0:
+            out[b, :, valid] = spikes_bn.to(dtype)
+            continue
+        sums = spikes_bn.new_zeros((L, num_groups))
+        sums.index_add_(1, code, spikes_bn)
+        counts = torch.bincount(code, minlength=num_groups).to(sums.dtype)
+        counts = counts.clamp_min(1)
+        means = sums / counts.unsqueeze(0)
+        blurred = means.index_select(1, code)
+        out[b, :, valid] = blurred.to(dtype)
+    return out
 
-    # Body vs non-body
-    hidden_weights = [p for p in model.body.parameters() if p.ndim >= 2 and p.requires_grad]
-    hidden_gains_biases = [p for p in model.body.parameters() if p.ndim < 2 and p.requires_grad]
-    nonhidden_params = []
-    for m in model.embed.values():
-        nonhidden_params += [p for p in m.parameters() if p.requires_grad]
-    for m in model.head.values():
-        nonhidden_params += [p for p in m.parameters() if p.requires_grad]
-
-    muon_lr = float(cfg.get('muon_lr', 2e-2))
-    muon_wd = float(cfg.get('weight_decay', 1e-4))
-    adamw_lr = float(cfg.get('learning_rate', 5e-4))
-    adamw_wd = float(cfg.get('weight_decay', 1e-4))
-    adamw_betas = (0.9, 0.95)
-
-    param_groups = []
-    if hidden_weights:
-        param_groups.append(dict(params=hidden_weights, use_muon=True, lr=muon_lr, weight_decay=muon_wd))
-    if hidden_gains_biases or nonhidden_params:
-        param_groups.append(dict(params=hidden_gains_biases + nonhidden_params, use_muon=False,
-                                 lr=adamw_lr, betas=adamw_betas, weight_decay=adamw_wd))
-    return MuonWithAuxAdam(param_groups)
-
-
-def _copula_lowrank_nll(q: torch.Tensor,
-                        factors: torch.Tensor,
-                        mask_exp: torch.Tensor,
-                        jitter: float = 1e-3) -> torch.Tensor:
-    """Gaussian copula dependence NLL with low-rank correlation.
-    q: (B, L-1, N) standardized residuals; factors U: (B, L-1, N, r)
-    mask_exp: (B, L-1, N) float mask in {0,1}. Returns mean over (B, L-1).
-    R := S^{-1/2} L S^{-1/2} with L = a I + U U^T, a = 1 + jitter, s_i = diag(L).
-    Loss per (B,t): 0.5 [logdet R + q^T (R^{-1} - I) q], normalized by N_eff.
-    """
-    dtype = torch.float32
-    q = q.to(dtype)
-    U = factors.to(dtype)
-    mask_exp = mask_exp.to(dtype)
-    a = 1.0 + float(jitter)
-
-    # Apply mask
-    q = q * mask_exp
-    U = U * mask_exp[..., None]
-
-    # s_i = a + ||U_i||^2
-    row_norm2 = (U * U).sum(dim=-1)
-    s = a + row_norm2
-    s = torch.nan_to_num(s, nan=a, posinf=1e6, neginf=a)
-    s_sqrt = s.sqrt()
-
-    # Small r x r system: M = I + (1/a) U^T U
-    UTU = torch.matmul(U.transpose(-1, -2), U)
-    rdim = int(U.shape[-1])
-    I_r = torch.eye(rdim, dtype=dtype, device=U.device).expand_as(UTU)
-    M = 0.5 * (I_r + (1.0 / a) * UTU + (I_r + (1.0 / a) * UTU).transpose(-1, -2))  # symm
-
-    # Cholesky or eig fallback
-    try:
-        chol = torch.linalg.cholesky(M)
-        logdetM = 2.0 * torch.log(torch.diagonal(chol, dim1=-2, dim2=-1).clamp_min(1e-12)).sum(dim=-1)
-        Minv = torch.cholesky_inverse(chol)
-    except Exception:
-        w, Q = torch.linalg.eigh(M + 1e-4 * I_r)
-        w = w.clamp_min(1e-8)
-        logdetM = torch.log(w).sum(dim=-1)
-        Minv = torch.matmul(Q, torch.matmul(torch.diag_embed(1.0 / w), Q.transpose(-1, -2)))
-
-    # logdet R = logdet L - sum log s_i
-    Ndim = q.shape[-1]
-    logdetL = Ndim * math.log(a) + logdetM
-    logdetR = logdetL - torch.log(s.clamp_min(1e-12)).sum(dim=-1)
-
-    # Quadratic form
-    y = s_sqrt * q
-    y2 = (y * y).sum(dim=-1)
-    q2 = (q * q).sum(dim=-1)
-    v = torch.matmul(U.transpose(-1, -2), y[..., None])
-    vTMinvV = (v.squeeze(-1) * torch.matmul(Minv, v).squeeze(-1)).sum(dim=-1)
-    yTLinvY = (1.0 / a) * y2 - (1.0 / (a * a)) * vTMinvV
-    quad = yTLinvY - q2
-
-    nll = 0.5 * (logdetR + quad)
-    N_eff = mask_exp.sum(dim=-1).clamp_min(1.0)
-    return (nll / N_eff).mean()
 
 @torch.no_grad()
 def make_validation_plots(step_dir: Path,
@@ -214,7 +148,12 @@ def make_validation_plots(step_dir: Path,
                           max_neurons: int = 16) -> None:
     step_dir.mkdir(parents=True, exist_ok=True)
     Tc, N = context_truth.shape
-    Tf = future_truth.shape[0]
+    # ensure same horizon length for truth and pred
+    Tf_tg = int(future_truth.shape[0])
+    Tf_pr = int(future_pred.shape[0])
+    Tf = min(Tf_tg, Tf_pr)
+    future_truth = future_truth[:Tf]
+    future_pred = future_pred[:Tf]
     K = min(max_neurons, N)
     idx = torch.linspace(0, N - 1, K).round().long().tolist()
     fig, axes = plt.subplots(K, 1, figsize=(10, 2*K), sharex=True)
@@ -239,29 +178,27 @@ def make_validation_plots(step_dir: Path,
 
 @torch.no_grad()
 def autoregressive_rollout(model: GBM,
-                           init_context: torch.Tensor,   # (1, Tc, N) rates
-                           stim_full: torch.Tensor,      # (1, Tc+Tf, K)
-                           positions: torch.Tensor,      # (1, N, 3)
-                           neuron_mask: torch.Tensor,    # (1, N)
-                           neuron_ids: torch.Tensor,     # (1, N)
-                           lam: torch.Tensor | None,     # (1, N)
-                           las: torch.Tensor | None,     # (1, N)
+                           init_context: torch.Tensor,
+                           stim_full: torch.Tensor,
+                           positions: torch.Tensor,
+                           neuron_mask: torch.Tensor,
+                           neuron_ids: torch.Tensor,
+                           lam: torch.Tensor | None,
+                           las: torch.Tensor | None,
                            device: torch.device,
                            Tf: int,
-                           sampling_rate_hz: float = 3.0) -> torch.Tensor:      # returns (Tf, N) rates
+                           sampling_rate_hz: float = 3.0) -> torch.Tensor:
     model.eval()
-    context = init_context.clone()  # (1, Tc, N)
+    context = init_context.clone()
     Lc = int(init_context.shape[1])
     preds = []
     eps = 1e-7
-    # Pre-sample spike mask for initial context (0/1 floats)
     sr_f = float(sampling_rate_hz)
     prob_init = 1.0 - torch.exp(-context.to(torch.float32) / sr_f)
     prob_init = torch.nan_to_num(prob_init, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-    spike_mask_ctx = torch.bernoulli(prob_init).to(torch.float32)  # (1,Tc,N)
+    spike_mask_ctx = torch.bernoulli(prob_init).to(torch.float32)
     for t in range(Tf):
-        # Use sliding window of last Lc steps
-        x_in = context[:, -Lc:, :]  # (1,Lc,N)
+        x_in = context[:, -Lc:, :]
         x_log = torch.log(x_in.clamp_min(eps))
         if (lam is not None) and (lam.numel() > 0) and (las is not None) and (las.numel() > 0):
             lam_e = lam[:, None, :].to(dtype=x_log.dtype)
@@ -269,30 +206,26 @@ def autoregressive_rollout(model: GBM,
             x_in_z = (x_log - lam_e) / las_e
         else:
             x_in_z = x_log
-        # Align stimuli to the sliding window
         stim_step = stim_full[:, (context.shape[1]-Lc):(context.shape[1]), :]
         if device.type == 'cuda':
             x_in_z = x_in_z.to(torch.bfloat16)
             stim_step = stim_step.to(torch.bfloat16)
-        # Use pre-sampled spike mask window (0/1 floats) to make routing deterministic
         spike_probs_window = spike_mask_ctx[:, -Lc:, :]
         mu, raw_log_sigma, _, _ = model(x_in_z, stim_step, positions, neuron_mask, neuron_ids, spike_probs_window, get_logits=True, input_log_rates=True)
-        # Sample from LogNormal for stochastic rollout
         mu_last = mu[:, -1:, :]
         sig_last = raw_log_sigma[:, -1:, :]
-        samp = sample_lognormal(mu_last, sig_last)  # (1,1,N)
+        samp = sample_lognormal(mu_last, sig_last)
         preds.append(samp[:, 0, :].to(torch.float32))
-        # Append prediction and its pre-sampled spike mask
         context = torch.cat([context, samp.to(context.dtype)], dim=1)
         next_prob = 1.0 - torch.exp(-samp.to(torch.float32) / sr_f)
         next_prob = torch.nan_to_num(next_prob, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         next_mask = torch.bernoulli(next_prob).to(torch.float32)
         spike_mask_ctx = torch.cat([spike_mask_ctx, next_mask], dim=1)
-    return torch.cat(preds, dim=0)  # (Tf,N)
+    return torch.cat(preds, dim=0)
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Train GBM (clean) with LogNormal NLL and Muon optimizer')
+    ap = argparse.ArgumentParser(description='Train GBM with blurred inputs and UNBLURRED targets')
     ap.add_argument('--config', type=str, default=None, help='YAML config for overrides')
     args = ap.parse_args()
 
@@ -305,7 +238,6 @@ def main():
     device = torch.device('cuda' if (cfg['training']['use_gpu'] and torch.cuda.is_available()) else 'cpu')
     set_seeds(int(cfg['training']['seed']))
 
-    # Allow Muon optimizer to run single-process by stubbing minimal torch.distributed APIs
     try:
         import torch.distributed as dist
         if dist.is_available() and not dist.is_initialized():
@@ -314,7 +246,6 @@ def main():
             def _fake_all_gather(tensor_list, tensor, group=None):
                 if tensor_list is None or len(tensor_list) == 0:
                     return
-                # Ensure tensor_list[0] receives a copy of tensor
                 if len(tensor_list) == 1:
                     if tensor_list[0].shape == tensor.shape:
                         tensor_list[0].copy_(tensor)
@@ -327,17 +258,13 @@ def main():
     except Exception:
         pass
 
-    # Data (with global unique neuron IDs)
-    train_loader, val_loader, _, _, unique_neuron_ids = create_dataloaders(cfg)
+    train_loader, val_loader, _, _, unique_neuron_ids = create_single_subject_dataloaders(cfg)
 
-    # Model
     try:
         sample = next(iter(train_loader))
         d_stimuli = int(sample['stimulus'].shape[-1])
-        max_n = int(sample['positions'].shape[1])
     except Exception:
         d_stimuli = cfg['model'].get('d_stimuli') or 1
-        max_n = 100_000
 
     model = GBM(d_model=cfg['model']['d_model'], d_stimuli=d_stimuli,
                 n_heads=cfg['model']['n_heads'], n_layers=cfg['model']['n_layers'],
@@ -345,12 +272,10 @@ def main():
                 global_neuron_ids=unique_neuron_ids,
                 cov_rank=int(cfg['model'].get('cov_rank', 32))).to(device)
 
-    # Run bf16 on CUDA
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = True
         model = model.to(dtype=torch.bfloat16)
 
-    # Enable autograd anomaly and grad NaN/Inf checks in debug mode
     if debug_enabled():
         try:
             torch.autograd.set_detect_anomaly(True)
@@ -371,9 +296,13 @@ def main():
         except Exception:
             pass
 
-    optimizer = build_optimizer(model, cfg['training'])
+    # Optimizer (reuse factory from original script)
+    try:
+        from GenerativeBrainModel.scripts.train_gbm2 import build_optimizer
+        optimizer = build_optimizer(model, cfg['training'])
+    except Exception:
+        optimizer = optim.AdamW(model.parameters(), lr=float(cfg['training'].get('learning_rate', 5e-4)), weight_decay=float(cfg['training'].get('weight_decay', 1e-4)))
 
-    # Per-run directory under experiments/gbm2/<YYYYmmdd_HHMMSS>
     base_dir = Path('experiments/gbm2')
     run_dir = base_dir / datetime.now().strftime('%Y%m%d_%H%M%S')
     plots_dir = run_dir / 'plots'
@@ -381,26 +310,13 @@ def main():
     logs_dir = run_dir / 'logs'
     for p in (plots_dir, ckpt_dir, logs_dir):
         p.mkdir(parents=True, exist_ok=True)
-    # Save resolved config for reproducibility
     with open(run_dir / 'config.yaml', 'w') as f:
         yaml.dump(cfg, f, default_flow_style=False, indent=2, sort_keys=False)
-    # Write a simple architecture summary
-    try:
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        with open(run_dir / 'architecture.txt', 'w') as f:
-            f.write(f"Total params: {total_params:,}\nTrainable: {trainable_params:,}\n\n")
-            f.write(str(model))
-            f.write("\n")
-    except Exception:
-        pass
 
-    # ---- Loss tracking state (for plotting) ----
     train_batch_losses: list[float] = []
     train_batch_ema: list[float] = []
-    # Track EMA of TOTAL loss (independent + lambda*copula)
     ema_total_value: float | None = None
-    val_points: list[tuple[int, float]] = []  # (global_step, val_loss)
+    val_points: list[tuple[int, float]] = []
     ema_beta: float = 0.98
     ema_value: float | None = None
     global_step: int = 0
@@ -413,7 +329,6 @@ def main():
         floor = float(cfg['training'].get('copula_warmup_floor', 1e-3))
         floor = max(0.0, min(floor, 1.0))
         frac = min(1.0, max(0.0, step / max(1, total_train_steps)))
-        # Linear ramp from floor to 1.0 over the full run
         scale = floor + (1.0 - floor) * frac
         return base * scale
 
@@ -430,7 +345,6 @@ def main():
             ax0.set_title('Training loss (batch + EMA)')
             ax0.set_ylabel('loss')
             ax0.legend(loc='upper right', fontsize=8)
-            # Val subplot
             if val_points:
                 vx, vy = zip(*val_points)
                 ax1.plot(vx, vy, marker='o', linestyle='-', color='tab:green', lw=1.0, ms=3)
@@ -447,8 +361,7 @@ def main():
         nonlocal global_step, ema_value, ema_total_value
         total_loss = 0.0
         count = 0
-        mdl = model.train() if train else model.eval()
-        # Intra-epoch validation triggers (evenly spaced + step 4)
+        model.train() if train else model.eval()
         val_freq_local = int(cfg['training'].get('validation_frequency') or 0)
         val_sample_batches_local = int(cfg['training'].get('val_sample_batches') or 1)
         triggers: set[int] = set()
@@ -461,48 +374,41 @@ def main():
                 triggers.add(4)
         pbar = tqdm(loader, desc=('Train' if train else 'Val'))
         for batch in pbar:
-            spikes = batch['spikes'].to(device)            # (B, L, N) rates
-            positions = batch['positions'].to(device)      # (B, N, 3)
-            mask = batch['neuron_mask'].to(device)         # (B, N)
-            stim = batch['stimulus'].to(device)            # (B, L, K)
-            neuron_ids = batch['neuron_ids'].to(device)    # (B, N)
+            spikes = batch['spikes'].to(device)
+            positions = batch['positions'].to(device)
+            mask = batch['neuron_mask'].to(device)
+            stim = batch['stimulus'].to(device)
+            neuron_ids = batch['neuron_ids'].to(device)
             lam = batch.get('log_activity_mean', torch.empty(0)).to(device)
             las = batch.get('log_activity_std', torch.empty(0)).to(device)
             sr = float(cfg['training'].get('sampling_rate_hz', 3.0))
 
-            # Prepare autoregressive pairs
-            x_in = spikes[:, :-1, :]   # (B, L-1, N)
-            x_tg = spikes[:, 1:, :].float()
-            if debug_enabled():
-                assert_no_nan(x_in, 'batch.x_in_raw')
-                assert_no_nan(x_tg, 'batch.x_tg_raw')
-            # Guard against NaNs/Infs in raw data
+            # Keep a copy of original spikes for targets
+            spikes_orig = spikes
+
+            # Optional blur only for inputs
+            blur_vox = float(cfg['data'].get('spatial_blur_voxel_size', 0.0) or 0.0)
+            spikes_blur = _apply_spatial_voxel_blur(spikes, positions, mask, blur_vox) if blur_vox > 0.0 else spikes
+
+            x_in = spikes_blur[:, :-1, :]
+            x_tg = spikes_orig[:, 1:, :].float()
+
             x_in = torch.nan_to_num(x_in, nan=0.0, posinf=0.0, neginf=0.0)
             x_tg = torch.nan_to_num(x_tg, nan=0.0, posinf=0.0, neginf=0.0)
             stim_in = stim[:, :-1, :]
 
-            # Spike probabilities from rates for attention routing
             spike_probs = 1.0 - torch.exp(-x_in.to(torch.float32) / sr)
-            # Robustify probs to [0,1] and finite before model use
             spike_probs = torch.nan_to_num(spike_probs, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-            if debug_enabled():
-                assert_no_nan(spike_probs, 'routing.spike_probs')
 
-            # z-normalize log input when stats available: z = (log(x+eps) - mean)/std
             eps = 1e-7
             x_log = torch.log(x_in.clamp_min(eps))
-            if debug_enabled():
-                assert_no_nan(x_log, 'pre.zlog.x_log')
             if lam.numel() > 0 and las.numel() > 0:
                 lam_e = lam[:, None, :].to(dtype=x_log.dtype)
                 las_e = las[:, None, :].to(dtype=x_log.dtype).clamp_min(1e-6)
                 x_in_z = (x_log - lam_e) / las_e
             else:
                 x_in_z = x_log
-            # Ensure inputs are finite before entering model
             x_in_z = torch.nan_to_num(x_in_z, nan=0.0, posinf=0.0, neginf=0.0)
-            if debug_enabled():
-                assert_no_nan(x_in_z, 'pre.model.x_in_z')
 
             if device.type == 'cuda':
                 x_in_z = x_in_z.to(torch.bfloat16)
@@ -517,17 +423,9 @@ def main():
             else:
                 mu, raw_log_sigma, _a, _b = out
                 factors = None
-            if debug_enabled():
-                assert_no_nan(mu, 'model.mu')
-                assert_no_nan(raw_log_sigma, 'model.raw_log_sigma')
-            # Post-check for non-finite params
-            if not torch.isfinite(mu).all() or not torch.isfinite(raw_log_sigma).all():
-                mu = torch.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
-                raw_log_sigma = torch.nan_to_num(raw_log_sigma, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # Z-normalized target for loss in Normal(z) domain
             eps_n = 1e-7
-            y_tg = torch.log(x_tg.clamp_min(eps_n))  # (B, L-1, N)
+            y_tg = torch.log(x_tg.clamp_min(eps_n))
             if lam.numel() > 0 and las.numel() > 0:
                 lam_e_loss = lam[:, None, :].to(dtype=y_tg.dtype)
                 las_e_loss = las[:, None, :].to(dtype=y_tg.dtype).clamp_min(1e-6)
@@ -535,7 +433,6 @@ def main():
             else:
                 z_tg = y_tg
 
-            # Normal NLL on z_tg with optional left-censoring below r_min
             sigma_y = F.softplus(raw_log_sigma.to(torch.float32)) + 1e-6
             if lam.numel() > 0 and las.numel() > 0:
                 mu_z = (mu.to(torch.float32) - lam_e_loss.to(torch.float32)) / las_e_loss.to(torch.float32)
@@ -555,35 +452,19 @@ def main():
                 z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
                 nll_pdf = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
                 alpha = (z_min - mu_z) / sigma_z
-                # log CDF of standard normal using erf; clamp for stability
                 log_cdf = torch.log((0.5 * (1.0 + torch.erf(alpha / math.sqrt(2.0)))).clamp_min(1e-12))
                 nll_cdf = -log_cdf
                 nll = torch.where(is_cens, nll_cdf, nll_pdf)
             else:
                 z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
                 nll = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
-            # Build mask for loss to match target shape
-            mask_exp = mask[:, None, :].expand_as(x_tg).float()
-            if mask_exp is not None:
-                total_m = mask_exp.sum().clamp_min(1.0)
-                loss = (nll * mask_exp).sum() / total_m
-            else:
-                loss = nll.mean()
-            if debug_enabled():
-                assert_no_nan(loss, 'loss.nll')
 
-            # Optional low-rank MVN coupling loss
-            lambda_cop = _lambda_copula_for_step(global_step)
-            if (lambda_cop != 0.0) and (factors is not None):
-                burn = int(cfg['training'].get('copula_detach_burnin_steps', 0) or 0)
-                mu_c = mu_z.detach() if global_step < burn else mu_z
-                sig_c = sigma_z.detach() if global_step < burn else sigma_z
-                q = (z_tg.to(torch.float32) - mu_c) / sig_c
-                jitter = float(cfg['training'].get('copula_jitter', 1e-3))
-                loss_cop = _copula_lowrank_nll(q, factors, mask_exp, jitter=jitter)
-                loss_total = loss + lambda_cop * loss_cop
-            else:
-                loss_total = loss
+            mask_exp = mask[:, None, :].expand_as(x_tg).float()
+            total_m = mask_exp.sum().clamp_min(1.0)
+            loss = (nll * mask_exp).sum() / total_m
+
+            # No copula in this minimal variant (optional): reuse loss only
+            loss_total = loss
 
             if train:
                 loss_total.backward()
@@ -594,18 +475,16 @@ def main():
             total_loss += float(loss.detach().cpu().item())
             count += 1
 
-            # Update trackers and tqdm
             global_step += 1
             batch_loss_f = float(loss.detach().cpu())
             train_batch_losses.append(batch_loss_f)
             ema_value = (ema_value * ema_beta + batch_loss_f * (1.0 - ema_beta)) if (ema_value is not None) else batch_loss_f
-            # Update EMA of total loss for logging
             batch_total_loss_f = float(loss_total.detach().cpu())
             ema_total_value = (ema_total_value * ema_beta + batch_total_loss_f * (1.0 - ema_beta)) if (ema_total_value is not None) else batch_total_loss_f
             train_batch_ema.append(float(ema_value))
             pbar.set_postfix({'loss': f"{batch_loss_f:.4f}", 'ema': f"{float(ema_value):.4f}"})
 
-            # Lightweight intra-epoch validation at configured steps
+            # Intra-epoch validation
             if train and (count in triggers):
                 _maybe_empty_cuda_cache()
                 model.eval()
@@ -626,8 +505,12 @@ def main():
                             las_v = vbatch.get('log_activity_std', torch.empty(0)).to(device)
                             sr_v = float(cfg['training'].get('sampling_rate_hz', 3.0))
 
-                            x_in_v = spikes_v[:, :-1, :]
-                            x_tg_v = spikes_v[:, 1:, :].float()
+                            spikes_orig_v = spikes_v
+                            blur_vox_v = float(cfg['data'].get('spatial_blur_voxel_size', 0.0) or 0.0)
+                            spikes_blur_v = _apply_spatial_voxel_blur(spikes_v, positions_v, mask_v, blur_vox_v) if blur_vox_v > 0.0 else spikes_v
+
+                            x_in_v = spikes_blur_v[:, :-1, :]
+                            x_tg_v = spikes_orig_v[:, 1:, :].float()
                             stim_in_v = stim_v[:, :-1, :]
 
                             eps_v = 1e-7
@@ -650,7 +533,6 @@ def main():
                             else:
                                 mu_v, raw_log_sigma_v, _aa_v, _bb_v = out_v
                                 factors_v = None
-                            # Z-normalized validation target with optional left-censored NLL
                             y_tg_v = torch.log(x_tg_v.clamp_min(1e-7))
                             if lam_v.numel() > 0 and las_v.numel() > 0:
                                 lam_e_v2 = lam_v[:, None, :].to(dtype=y_tg_v.dtype)
@@ -684,16 +566,10 @@ def main():
                                 nll_v = 0.5 * z_err_v.pow(2) + torch.log(sigma_z_v) + 0.5 * math.log(2.0 * math.pi)
                             mask_exp_v = mask_v[:, None, :].expand_as(x_tg_v).float()
                             vloss = (nll_v * mask_exp_v).sum() / mask_exp_v.sum().clamp_min(1.0)
-                            lambda_cop_v = _lambda_copula_for_step(global_step)
-                            if (lambda_cop_v != 0.0) and (factors_v is not None):
-                                q_v = (z_tg_v.to(torch.float32) - mu_z_v) / sigma_z_v
-                                jitter_v = float(cfg['training'].get('copula_jitter', 1e-3))
-                                vloss_cop = _copula_lowrank_nll(q_v, factors_v, mask_exp_v, jitter=jitter_v)
-                                vloss = vloss + lambda_cop_v * vloss_cop
                             total_v += float(vloss.detach().cpu().item())
                             vb += 1
 
-                            # prepare small rollout visualization using full available context with sliding window
+                            # small rollout viz: context from blurred inputs, truth from original
                             Bv, Lm1_v, Nv = x_in_v.shape
                             Tf_v = min(Lm1_v, 16) if Lm1_v > 0 else 1
                             Tc_v = max(1, Lm1_v - Tf_v)
@@ -701,16 +577,14 @@ def main():
                             stim_full_v = stim_v[0:1, :Tc_v+Tf_v, :]
                             pred_future_v = autoregressive_rollout(model, init_context_v, stim_full_v, positions_v[0:1], mask_v[0:1], neuron_ids_v[0:1], lam_v[0:1] if lam_v.numel()>0 else None, las_v[0:1] if las_v.numel()>0 else None, device, Tf_v, sampling_rate_hz=sr_v)
                             final_ctx = init_context_v[0].cpu()
-                            final_truth = x_in_v[0, Tc_v:Tc_v+Tf_v, :].cpu()
+                            final_truth = x_tg_v[0, Tc_v:Tc_v+Tf_v, :].cpu()
                             final_pred = pred_future_v.cpu()
                             if vb >= val_sample_batches_local:
                                 break
 
                     val_loss_step = total_v / max(1, vb)
                     val_points.append((global_step, float(val_loss_step)))
-                    # Log step-level validation
                     with open(logs_dir / 'loss.txt', 'a') as f:
-                        # Log EMA of TOTAL loss for the train field
                         tr = float(ema_total_value) if (ema_total_value is not None) else float(loss_total.detach().cpu().item())
                         f.write(f"epoch {epoch}, step {count}, train {tr:.6f}, val {val_loss_step:.6f}\n")
                     if final_ctx is not None and final_truth is not None and final_pred is not None:
@@ -720,7 +594,6 @@ def main():
                 except Exception:
                     pass
                 model.train()
-                # Free cached VRAM after validation + plotting to reduce peak usage
                 _maybe_empty_cuda_cache()
         return total_loss / max(1, count)
 
@@ -731,9 +604,7 @@ def main():
     for epoch in range(1, int(cfg['training']['num_epochs']) + 1):
         train_loss = train_or_val_loop(train_loader, epoch, train=True)
 
-        # Periodic validation within epoch
         if val_freq > 0:
-            # sample a few batches, aggregate mean
             model.eval()
             total = 0.0
             vb = 0
@@ -751,8 +622,12 @@ def main():
                     las = batch.get('log_activity_std', torch.empty(0)).to(device)
                     sr = float(cfg['training'].get('sampling_rate_hz', 3.0))
 
-                    x_in = spikes[:, :-1, :]
-                    x_tg = spikes[:, 1:, :].float()
+                    spikes_orig = spikes
+                    blur_vox = float(cfg['data'].get('spatial_blur_voxel_size', 0.0) or 0.0)
+                    spikes_blur = _apply_spatial_voxel_blur(spikes, positions, mask, blur_vox) if blur_vox > 0.0 else spikes
+
+                    x_in = spikes_blur[:, :-1, :]
+                    x_tg = spikes_orig[:, 1:, :].float()
                     stim_in = stim[:, :-1, :]
 
                     eps = 1e-7
@@ -768,16 +643,13 @@ def main():
                         x_in_z = x_in_z.to(torch.bfloat16)
                         stim_in = stim_in.to(torch.bfloat16)
 
-                    # Spike probabilities for routing during validation
                     spike_probs = 1.0 - torch.exp(-x_in.to(torch.float32) / sr)
-                    spike_probs = torch.nan_to_num(spike_probs, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
                     out_e = model(x_in_z, stim_in, positions, mask, neuron_ids, spike_probs, get_logits=True, input_log_rates=True, return_factors=True)
                     if isinstance(out_e, tuple) and len(out_e) == 5:
                         mu, raw_log_sigma, _ee, _dd, factors_e = out_e
                     else:
                         mu, raw_log_sigma, _aaa, _bbb = out_e
                         factors_e = None
-                    # Z-normalized validation target with optional left-censored NLL
                     y_tg = torch.log(x_tg.clamp_min(1e-7))
                     if lam.numel() > 0 and las.numel() > 0:
                         lam_e2 = lam[:, None, :].to(dtype=y_tg.dtype)
@@ -811,15 +683,9 @@ def main():
                         nll = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
                     mask_exp = mask[:, None, :].expand_as(x_tg).float()
                     vloss = (nll * mask_exp).sum() / mask_exp.sum().clamp_min(1.0)
-                    lambda_cop_e = _lambda_copula_for_step(global_step)
-                    if (lambda_cop_e != 0.0) and (factors_e is not None):
-                        q_e = (z_tg.to(torch.float32) - mu_z) / sigma_z
-                        jitter_e = float(cfg['training'].get('copula_jitter', 1e-3))
-                        vloss_cop = _copula_lowrank_nll(q_e, factors_e, mask_exp, jitter=jitter_e)
-                        vloss = vloss + lambda_cop_e * vloss_cop
                     total += float(vloss.detach().cpu().item())
                     vb += 1
-                    # keep one for plot: multi-step AR using full context with sliding window
+
                     B, Lm1, N = x_in.shape
                     Tf = min(Lm1, 16) if Lm1 > 0 else 1
                     Tc = max(1, Lm1 - Tf)
@@ -827,42 +693,34 @@ def main():
                     stim_full = stim[0:1, :Tc+Tf, :]
                     pred_future = autoregressive_rollout(model, init_context, stim_full, positions[0:1], mask[0:1], neuron_ids[0:1], lam[0:1] if lam.numel()>0 else None, las[0:1] if las.numel()>0 else None, device, Tf, sampling_rate_hz=sr)
                     final_ctx = init_context[0].cpu()
-                    final_truth = x_in[0, Tc:Tc+Tf, :].cpu()
+                    final_truth = x_tg[0, Tc:Tc+Tf, :].cpu()
                     final_pred = pred_future.cpu()
                     if vb >= val_sample_batches:
                         break
             val_loss = total / max(1, vb)
-
-            # Write scalar text and plot
             with open(logs_dir / 'loss.txt', 'a') as f:
                 f.write(f"epoch {epoch}, train {train_loss:.6f}, val {val_loss:.6f}\n")
             val_points.append((global_step, float(val_loss)))
             _update_loss_plot()
-            # Safe VRAM cleanup after plotting and optional checkpoint save
             _maybe_empty_cuda_cache()
-            # Autoregressive visualization (context + future) for 16 neurons on the kept batch
             if final_ctx is not None and final_truth is not None and final_pred is not None:
                 step_dir = Path(plots_dir) / f"epoch_{epoch}"
                 make_validation_plots(step_dir, final_ctx, final_truth, final_pred, title=f"E{epoch} autoreg 16 neurons")
 
-            # Track best
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save({'epoch': epoch, 'model': model.state_dict()}, ckpt_dir / 'best_model.pth')
 
         else:
-            # End-of-epoch validation only
             val_loss = train_or_val_loop(val_loader, epoch, train=False)
             with open(logs_dir / 'loss.txt', 'a') as f:
                 f.write(f"epoch {epoch}, train {train_loss:.6f}, val {val_loss:.6f}\n")
             if val_loss < best_val:
                 best_val = val_loss
                 torch.save({'epoch': epoch, 'model': model.state_dict()}, ckpt_dir / 'best_model.pth')
-            # Safe VRAM cleanup after end-of-epoch validation
             _maybe_empty_cuda_cache()
 
     print("Training complete. Best val:", best_val)
-    # Final cleanup
     _maybe_empty_cuda_cache()
 
 

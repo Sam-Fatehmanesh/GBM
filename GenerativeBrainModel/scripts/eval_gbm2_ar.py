@@ -150,6 +150,53 @@ def make_log_true_vs_log_sigma_scatter(step_dir: Path,
     fig.savefig(step_dir / 'log_true_vs_log_sigma_scatter.png')
     plt.close(fig)
 
+
+@torch.no_grad()
+def make_log_true_vs_log_mu_scatter(step_dir: Path,
+                                    true_last: torch.Tensor,   # (N,) rate
+                                    mu_last: torch.Tensor,     # (N,) predicted mean in log-rate domain
+                                    valid_mask: torch.Tensor,  # (N,) bool or float
+                                    title: str,
+                                    eps: float = 1e-7) -> None:
+    step_dir.mkdir(parents=True, exist_ok=True)
+    # x-axis: log of true rate; y-axis: predicted mu (already log-rate)
+    x = torch.log(true_last.clamp_min(eps)).to(torch.float32).detach().cpu().numpy()
+    y = mu_last.to(torch.float32).detach().cpu().numpy()
+    m = valid_mask.detach().cpu().numpy().astype(bool)
+    x = x[m]
+    y = y[m]
+    if x.size == 0:
+        return
+    order = np.argsort(x)
+    xs = x[order]
+    ys = y[order]
+    if xs.size >= 2:
+        r = float(np.corrcoef(xs, ys)[0, 1])
+    else:
+        r = float('nan')
+    # Build square extent to align the y=x reference line
+    lo_x = float(xs.min()); hi_x = float(xs.max())
+    lo_y = float(ys.min()); hi_y = float(ys.max())
+    lo = min(lo_x, lo_y)
+    hi = max(hi_x, hi_y)
+    pad = 0.02 * (hi - lo + 1e-8)
+    lo -= pad
+    hi += pad
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    hb = ax.hexbin(xs, ys, gridsize=80, extent=(lo, hi, lo, hi), cmap='magma', bins='log', mincnt=1)
+    ax.plot([lo, hi], [lo, hi], color='gray', lw=1.2, linestyle='--', label='y = x')
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel('log true next-step rate')
+    ax.set_ylabel('predicted mu (log-rate)')
+    ax.set_title(title)
+    ax.text(0.02, 0.98, f"r = {r:.3f}", transform=ax.transAxes, ha='left', va='top')
+    cbar = plt.colorbar(hb, ax=ax)
+    cbar.set_label('count (log)')
+    fig.tight_layout()
+    fig.savefig(step_dir / 'log_true_vs_log_mu_scatter.png')
+    plt.close(fig)
+
 @torch.no_grad()
 def make_mu_sigma_scatter(step_dir: Path,
                          mu_last: torch.Tensor,      # (N,) in log-rate (z or y domain depending on caller)
@@ -245,6 +292,125 @@ def make_median_rate_plot(step_dir: Path,
     fig.savefig(out)
     plt.close(fig)
 
+
+@torch.no_grad()
+def make_mean_rate_plots_stacked(step_dir: Path,
+                                 contexts: list[torch.Tensor],
+                                 futures: list[torch.Tensor],
+                                 preds: list[torch.Tensor],
+                                 title: str) -> None:
+    step_dir.mkdir(parents=True, exist_ok=True)
+    K = len(contexts)
+    if K == 0:
+        return
+    fig, axes = plt.subplots(K, 1, figsize=(10, 2*K), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i in range(K):
+        context_truth = contexts[i]
+        future_truth = futures[i]
+        future_pred = preds[i]
+        Tc = int(context_truth.shape[0])
+        Tf = int(future_truth.shape[0])
+        ctx_mean = context_truth.to(torch.float32).mean(dim=1).cpu().numpy() if context_truth.numel() > 0 else np.zeros((0,), dtype=np.float32)
+        fut_mean = future_truth.to(torch.float32).mean(dim=1).cpu().numpy() if future_truth.numel() > 0 else np.zeros((0,), dtype=np.float32)
+        pred_mean = future_pred.to(torch.float32).mean(dim=1).cpu().numpy() if future_pred.numel() > 0 else np.zeros((0,), dtype=np.float32)
+        x_context = np.arange(Tc)
+        x_future = np.arange(Tc, Tc + Tf)
+        ax = axes[i]
+        if ctx_mean.size:
+            ax.plot(x_context, ctx_mean, color='gray', lw=1.2, label='context mean rate')
+        if fut_mean.size:
+            ax.plot(x_future, fut_mean, color='tab:blue', lw=1.2, label='future truth mean')
+        if pred_mean.size:
+            ax.plot(x_future, pred_mean, color='tab:orange', lw=1.2, label='future pred mean')
+        if i == 0:
+            ax.legend(loc='upper right', fontsize=8)
+        ax.set_ylabel(f'AR {i+1}')
+    axes[-1].set_xlabel('time')
+    fig.suptitle(title)
+    fig.tight_layout()
+    out = step_dir / 'mean_rate_over_time_stacked.png'
+    fig.savefig(out)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def make_median_rate_plots_stacked(step_dir: Path,
+                                   contexts: list[torch.Tensor],
+                                   futures: list[torch.Tensor],
+                                   preds: list[torch.Tensor],
+                                   title: str) -> None:
+    step_dir.mkdir(parents=True, exist_ok=True)
+    K = len(contexts)
+    if K == 0:
+        return
+    fig, axes = plt.subplots(K, 1, figsize=(10, 2*K), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i in range(K):
+        context_truth = contexts[i]
+        future_truth = futures[i]
+        future_pred = preds[i]
+        Tc = int(context_truth.shape[0])
+        Tf = int(future_truth.shape[0])
+        ctx_med = context_truth.to(torch.float32).median(dim=1).values.cpu().numpy() if context_truth.numel() > 0 else np.zeros((0,), dtype=np.float32)
+        fut_med = future_truth.to(torch.float32).median(dim=1).values.cpu().numpy() if future_truth.numel() > 0 else np.zeros((0,), dtype=np.float32)
+        pred_med = future_pred.to(torch.float32).median(dim=1).values.cpu().numpy() if future_pred.numel() > 0 else np.zeros((0,), dtype=np.float32)
+        x_context = np.arange(Tc)
+        x_future = np.arange(Tc, Tc + Tf)
+        ax = axes[i]
+        if ctx_med.size:
+            ax.plot(x_context, ctx_med, color='gray', lw=1.2, label='context median rate')
+        if fut_med.size:
+            ax.plot(x_future, fut_med, color='tab:blue', lw=1.2, label='future truth median')
+        if pred_med.size:
+            ax.plot(x_future, pred_med, color='tab:orange', lw=1.2, label='future pred median')
+        if i == 0:
+            ax.legend(loc='upper right', fontsize=8)
+        ax.set_ylabel(f'AR {i+1}')
+    axes[-1].set_xlabel('time')
+    fig.suptitle(title)
+    fig.tight_layout()
+    out = step_dir / 'median_rate_over_time_stacked.png'
+    fig.savefig(out)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def make_spike_counts_plots_stacked(step_dir: Path,
+                                    ctx_counts_list: list[torch.Tensor],
+                                    true_counts_list: list[torch.Tensor],
+                                    pred_counts_list: list[torch.Tensor],
+                                    title: str) -> None:
+    step_dir.mkdir(parents=True, exist_ok=True)
+    K = len(ctx_counts_list)
+    if K == 0:
+        return
+    fig, axes = plt.subplots(K, 1, figsize=(10, 2*K), sharex=True)
+    axes = np.atleast_1d(axes)
+    for i in range(K):
+        ctx_counts = ctx_counts_list[i]
+        true_counts = true_counts_list[i]
+        pred_counts = pred_counts_list[i]
+        Tc = int(ctx_counts.shape[0])
+        Tf = int(pred_counts.shape[0])
+        x_context = np.arange(Tc)
+        x_future = np.arange(Tc, Tc + Tf)
+        ax = axes[i]
+        if Tc > 0:
+            ax.plot(x_context, ctx_counts.to(torch.float32).cpu().numpy(), color='gray', lw=1.2, label='context spike count')
+        if Tf > 0 and true_counts.numel() == Tf:
+            ax.plot(x_future, true_counts.to(torch.float32).cpu().numpy(), color='tab:blue', lw=1.2, label='future truth spike count')
+        if Tf > 0:
+            ax.plot(x_future, pred_counts.to(torch.float32).cpu().numpy(), color='tab:orange', lw=1.2, label='future pred spike count')
+        if i == 0:
+            ax.legend(loc='upper right', fontsize=8)
+        ax.set_ylabel(f'AR {i+1}')
+    axes[-1].set_xlabel('time')
+    fig.suptitle(title)
+    fig.tight_layout()
+    out = step_dir / 'spike_counts_over_time_stacked.png'
+    fig.savefig(out)
+    plt.close(fig)
 
 @torch.no_grad()
 def make_next_step_scatter(step_dir: Path,
@@ -365,6 +531,94 @@ def make_log_rate_scatter(step_dir: Path,
     fig.savefig(step_dir / 'log_next_step_scatter.png')
     plt.close(fig)
 
+
+@torch.no_grad()
+def make_per_index_loss_plot(step_dir: Path,
+                             per_index_mean: np.ndarray,
+                             title: str) -> None:
+    """Plot mean next-step loss vs sequence index (proxy for available context length)."""
+    step_dir.mkdir(parents=True, exist_ok=True)
+    if per_index_mean.size == 0:
+        return
+    x = np.arange(1, per_index_mean.size + 1)
+    fig, ax = plt.subplots(1, 1, figsize=(8, 3))
+    ax.plot(x, per_index_mean, color='tab:purple', lw=1.5)
+    ax.set_xlabel('sequence index t (predicts t+1)')
+    ax.set_ylabel('mean NLL')
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(step_dir / 'per_index_next_step_loss.png')
+    plt.close(fig)
+
+
+@torch.no_grad()
+def make_pca_population_plot(step_dir: Path,
+                             true_list: list[torch.Tensor],  # list of (N,)
+                             pred_list: list[torch.Tensor],  # list of (N,)
+                             mask_list: list[torch.Tensor],  # list of (N,) bool
+                             title: str) -> None:
+    """Compute a 2D PCA on next-step TRUE rate vectors (samples x neurons),
+    then project PRED vectors with the same PCA, and plot both distributions.
+    Uses only neurons valid across all samples to avoid missing-data handling.
+    """
+    if len(true_list) == 0 or len(pred_list) == 0:
+        return
+    try:
+        X_true = torch.stack([t.to(torch.float32) for t in true_list], dim=0)  # (S,N)
+        X_pred = torch.stack([p.to(torch.float32) for p in pred_list], dim=0)  # (S,N)
+        M = torch.stack([m.to(torch.bool) for m in mask_list], dim=0)          # (S,N)
+    except Exception:
+        return
+    # Require at least 2 samples and 2 neurons
+    S, N = int(X_true.shape[0]), int(X_true.shape[1])
+    if S < 2 or N < 2:
+        return
+    # Keep neurons observed in at least 20% of samples
+    counts = M.sum(dim=0)
+    thresh = max(2, int(0.2 * S))
+    keep_cols = counts >= thresh
+    if not bool(keep_cols.any().item()):
+        return
+    Xtrue = X_true[:, keep_cols]
+    Xpred = X_pred[:, keep_cols]
+    Mkeep = M[:, keep_cols]
+    K = int(Xtrue.shape[1])
+    if K < 2:
+        return
+    # Compute column means over available TRUE entries and impute missing with mean
+    denom = Mkeep.sum(dim=0).clamp_min(1).to(Xtrue.dtype)
+    col_mean = (Xtrue.masked_fill(~Mkeep, 0.0).sum(dim=0) / denom)  # (K,)
+    Xtrue_imp = torch.where(Mkeep, Xtrue, col_mean.unsqueeze(0))
+    Xpred_imp = torch.where(Mkeep, Xpred, col_mean.unsqueeze(0))  # use same mean for pred
+    # Center with true means
+    mu = col_mean.unsqueeze(0)
+    Xtrue_c = (Xtrue_imp - mu).cpu().numpy()
+    Xpred_c = (Xpred_imp - mu).cpu().numpy()
+    # PCA via SVD on TRUE
+    try:
+        U, Svals, VT = np.linalg.svd(Xtrue_c, full_matrices=False)
+    except Exception:
+        return
+    comps = VT[:2].T  # (K,2)
+    Zt = Xtrue_c @ comps  # (S,2)
+    Zp = Xpred_c @ comps  # (S,2)
+    # Single-axes scatter overlay (true vs pred) with shared limits
+    lo = np.minimum(Zt.min(axis=0), Zp.min(axis=0))
+    hi = np.maximum(Zt.max(axis=0), Zp.max(axis=0))
+    pad = 0.05 * (hi - lo + 1e-8)
+    lo -= pad
+    hi += pad
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+    ax.scatter(Zt[:, 0], Zt[:, 1], s=6, alpha=0.35, color='tab:blue', label='true')
+    ax.scatter(Zp[:, 0], Zp[:, 1], s=6, alpha=0.35, color='tab:orange', label='pred')
+    ax.set_xlim(lo[0], hi[0]); ax.set_ylim(lo[1], hi[1])
+    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+    ax.set_title(title)
+    ax.legend(loc='best', fontsize=8)
+    fig.tight_layout()
+    fig.savefig(step_dir / 'pca_population_distribution.png')
+    plt.close(fig)
+
 @torch.no_grad()
 def autoregressive_rollout(model: GBM,
                            init_context: torch.Tensor,   # (1, Tc, N) rates
@@ -433,6 +687,7 @@ def main():
     ap.add_argument('--ckpt', type=str, default=None, help='Optional checkpoint path; defaults to <exp_dir>/checkpoints/best_model.pth')
     ap.add_argument('--val_batches', type=int, default=None, help='Number of validation batches to average (defaults to cfg.training.val_sample_batches or all)')
     ap.add_argument('--horizon', type=int, default=64, help='AR prediction horizon steps for visualization')
+    ap.add_argument('--num_ars', type=int, default=16, help='Number of unique AR rollouts to run and visualize')
     args = ap.parse_args()
 
     exp_dir = Path(args.exp_dir)
@@ -494,10 +749,27 @@ def main():
 
     # Validation pass and one AR visualization
     total = 0.0
-    vb = 0
+    vb_loss_count = 0
     final_ctx = None
     final_truth = None
     final_pred = None
+    first_ctx_counts = None
+    first_true_counts = None
+    first_pred_counts = None
+    # Accumulators for multiple AR runs
+    num_ars = int(args.num_ars)
+    ar_contexts: list[torch.Tensor] = []
+    ar_truths: list[torch.Tensor] = []
+    ar_preds: list[torch.Tensor] = []
+    ar_ctx_counts: list[torch.Tensor] = []
+    ar_pred_counts: list[torch.Tensor] = []
+    ar_true_counts: list[torch.Tensor] = []
+    # Accumulators for ensembled scatter/density
+    scat_true_last: list[torch.Tensor] = []
+    scat_pred_last: list[torch.Tensor] = []
+    scat_mu_last: list[torch.Tensor] = []
+    scat_sigma_last: list[torch.Tensor] = []
+    scat_mask_last: list[torch.Tensor] = []
 
     val_batches_limit = args.val_batches if args.val_batches is not None else int(cfg['training'].get('val_sample_batches') or 0)
     if val_batches_limit <= 0:
@@ -507,7 +779,13 @@ def main():
     orig_seq_len = int(cfg['training'].get('sequence_length', 48))
     Lm1_orig = max(1, orig_seq_len - 1)
 
+    # Accumulators for mean next-step loss vs sequence index across validation batches
+    per_index_sum = torch.zeros(Lm1_orig, dtype=torch.float64)
+    per_index_count = torch.zeros(Lm1_orig, dtype=torch.float64)
+
     with torch.no_grad():
+        # Track one AR per subject/file
+        seen_subjects: set[str] = set()
         for batch in val_loader:
             spikes = batch['spikes'].to(device)
             positions = batch['positions'].to(device)
@@ -563,60 +841,133 @@ def main():
             nll = 0.5 * z_err.pow(2) + torch.log(sigma_z) + 0.5 * math.log(2.0 * math.pi)
             mask_exp = mask[:, None, :].expand_as(x_tg).float()
             vloss = (nll * mask_exp).sum() / mask_exp.sum().clamp_min(1.0)
-            total += float(vloss.detach().cpu().item())
-            vb += 1
 
-            # Prepare one AR visualization with future truth beyond original window
-            if final_ctx is None:
+            # Accumulate per-sequence-index masked loss (sum and count) for averaging later
+            per_pos_sum = (nll * mask_exp).sum(dim=2).to(torch.float64)   # (B, Lm1_use)
+            per_pos_cnt = (mask_exp.sum(dim=2)).to(torch.float64)         # (B, Lm1_use)
+            per_index_sum[:Lm1_use] += per_pos_sum.sum(dim=0).cpu()
+            per_index_count[:Lm1_use] += per_pos_cnt.sum(dim=0).cpu()
+            # Count only up to the requested number of validation batches for loss
+            if vb_loss_count < val_batches_limit:
+                total += float(vloss.detach().cpu().item())
+                vb_loss_count += 1
+
+            # Collect up to num_ars unique-subject AR visualizations
+            if len(ar_contexts) < num_ars:
                 B, Lm1_full, N = x_in_full.shape
-                Tf = min(horizon, max(1, Lm1_full - Lm1_orig)) if Lm1_full > Lm1_orig else min(horizon, Lm1_full)
+                file_paths = batch.get('file_path', [])
+                Tf_all = min(horizon, max(1, Lm1_full - Lm1_orig)) if Lm1_full > Lm1_orig else min(horizon, Lm1_full)
                 Tc = Lm1_orig
-                # Ensure bounds
-                Tf = max(1, min(Tf, max(1, Lm1_full - Tc)))
-                init_context = x_in_full[0:1, :Tc, :].to(torch.float32)
-                stim_full = stim[0:1, :Tc+Tf, :]
-                pred_future, ctx_spike_counts, pred_spike_counts = autoregressive_rollout(model, init_context, stim_full, positions[0:1], mask[0:1], neuron_ids[0:1], lam[0:1] if lam.numel()>0 else None, las[0:1] if las.numel()>0 else None, device, Tf, sampling_rate_hz=sr)
-                final_ctx = init_context[0].cpu()
-                final_truth = x_in_full[0, Tc:Tc+Tf, :].cpu()
-                final_pred = pred_future.cpu()
+                Tf_all = max(1, min(Tf_all, max(1, Lm1_full - Tc)))
 
-                # Compute true-future spike counts using Bernoulli mask from truth rates
-                prob_true = 1.0 - torch.exp(-final_truth.to(torch.float32) / sr)
-                prob_true = torch.nan_to_num(prob_true, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-                true_future_mask = torch.bernoulli(prob_true).to(torch.float32)
-                true_spike_counts = true_future_mask.sum(dim=1)  # (Tf,)
+                # Iterate within batch to find first sample from a new subject
+                for bi in range(B):
+                    if len(ar_contexts) >= num_ars:
+                        break
+                    try:
+                        fp = file_paths[bi]
+                    except Exception:
+                        fp = None
+                    if fp is not None and fp in seen_subjects:
+                        continue
 
-                # Next-step scatter for last step of teacher-forced window
-                true_last = x_tg[0, -1, :]                      # (N,)
-                pred_last = sample_lognormal(mu[0:1, -1:, :], raw_log_sigma[0:1, -1:, :])[0, 0, :]
-                step_dir = plots_dir / 'eval_ar'
-                make_next_step_scatter(step_dir, true_last, pred_last, mask[0] != 0, title='Eval next-step scatter (last step)')
-                # Mu vs Sigma scatter (last step, z/LogNormal params), colored by true rate
-                mu_last = mu[0, -1, :].to(torch.float32)
-                sigma_last = (F.softplus(raw_log_sigma[0, -1, :].to(torch.float32)) + 1e-6)
-                make_mu_sigma_scatter(step_dir, mu_last, sigma_last, true_last, mask[0] != 0, title='Eval mu vs sigma (last step)')
-                # Log-rate scatter (last step)
-                make_log_rate_scatter(step_dir, true_last, pred_last, mask[0] != 0, title='Eval log-rate scatter (last step)')
-                # Log true vs log sigma scatter (last step)
-                make_log_true_vs_log_sigma_scatter(step_dir, true_last, sigma_last, mask[0] != 0, title='Eval log(true) vs log(sigma) (last step)')
+                    # Mark subject as seen
+                    if fp is not None:
+                        seen_subjects.add(fp)
 
-            if vb >= val_batches_limit:
+                    # Prepare sample-specific tensors
+                    init_context = x_in_full[bi:bi+1, :Tc, :].to(torch.float32)
+                    stim_full = stim[bi:bi+1, :Tc+Tf_all, :]
+                    pred_future, ctx_spike_counts, pred_spike_counts = autoregressive_rollout(
+                        model, init_context, stim_full,
+                        positions[bi:bi+1], mask[bi:bi+1], neuron_ids[bi:bi+1],
+                        lam[bi:bi+1] if lam.numel()>0 else None,
+                        las[bi:bi+1] if las.numel()>0 else None,
+                        device, Tf_all, sampling_rate_hz=sr)
+
+                    # Save the first AR for legacy single-run plots
+                    if final_ctx is None:
+                        final_ctx = init_context[0].cpu()
+                        final_truth = x_in_full[bi, Tc:Tc+Tf_all, :].cpu()
+                        final_pred = pred_future.cpu()
+                        first_ctx_counts = ctx_spike_counts.cpu()
+                        # Compute true-future spike counts for first AR
+                        prob_true_first = 1.0 - torch.exp(-final_truth.to(torch.float32) / sr)
+                        prob_true_first = torch.nan_to_num(prob_true_first, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+                        true_future_mask_first = torch.bernoulli(prob_true_first).to(torch.float32)
+                        first_true_counts = true_future_mask_first.sum(dim=1).cpu()
+                        first_pred_counts = pred_spike_counts.cpu()
+
+                    # Accumulate for stacked over-time plots
+                    ar_contexts.append(init_context[0].cpu())
+                    ar_truths.append(x_in_full[bi, Tc:Tc+Tf_all, :].cpu())
+                    ar_preds.append(pred_future.cpu())
+                    ar_ctx_counts.append(ctx_spike_counts.cpu())
+                    # Compute true-future spike counts using Bernoulli mask from truth rates
+                    prob_true = 1.0 - torch.exp(-ar_truths[-1].to(torch.float32) / sr)
+                    prob_true = torch.nan_to_num(prob_true, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+                    true_future_mask = torch.bernoulli(prob_true).to(torch.float32)
+                    true_spike_counts = true_future_mask.sum(dim=1)  # (Tf,)
+                    ar_true_counts.append(true_spike_counts.cpu())
+                    ar_pred_counts.append(pred_spike_counts.cpu())
+
+                    # Accumulate for ensembled scatter/density (last teacher-forced step)
+                    true_last = x_tg[bi, -1, :]  # (N,)
+                    pred_last = sample_lognormal(mu[bi:bi+1, -1:, :], raw_log_sigma[bi:bi+1, -1:, :])[0, 0, :]
+                    mu_last = mu[bi, -1, :].to(torch.float32)
+                    sigma_last = (F.softplus(raw_log_sigma[bi, -1, :].to(torch.float32)) + 1e-6)
+                    scat_true_last.append(true_last.detach().cpu())
+                    scat_pred_last.append(pred_last.detach().cpu())
+                    scat_mu_last.append(mu_last.detach().cpu())
+                    scat_sigma_last.append(sigma_last.detach().cpu())
+                    scat_mask_last.append((mask[bi] != 0).detach().cpu())
+
+            # Break when both: (1) collected requested ARs and (2) finished requested val loss batches
+            if (vb_loss_count >= val_batches_limit) and (len(ar_contexts) >= num_ars):
                 break
 
-    val_loss = total / max(1, vb)
+    val_loss = total / max(1, vb_loss_count)
     with open(logs_dir / 'eval_loss.txt', 'a') as f:
-        f.write(f"val {val_loss:.6f} over {vb} batches\n")
+        f.write(f"val {val_loss:.6f} over {vb_loss_count} batches\n")
 
-    # Plot AR if we captured one
+    # Plot AR if we captured at least one
+    step_dir = plots_dir / 'eval_ar'
     if final_ctx is not None and final_truth is not None and final_pred is not None:
-        step_dir = plots_dir / 'eval_ar'
         make_validation_plots(step_dir, final_ctx, final_truth, final_pred, title=f"Eval autoreg 16 neurons")
-        make_mean_rate_plot(step_dir, final_ctx, final_truth, final_pred, title=f"Eval mean rate over time")
-        make_median_rate_plot(step_dir, final_ctx, final_truth, final_pred, title=f"Eval median rate over time")
-        # Spike counts over time (context, true future, predicted future)
-        make_spike_counts_plot(step_dir, ctx_spike_counts, true_spike_counts, pred_spike_counts, title=f"Eval spike counts over time")
+        make_mean_rate_plot(step_dir, final_ctx, final_truth, final_pred, title=f"Eval mean rate over time (first AR)")
+        make_median_rate_plot(step_dir, final_ctx, final_truth, final_pred, title=f"Eval median rate over time (first AR)")
+        if first_ctx_counts is not None and first_true_counts is not None and first_pred_counts is not None:
+            make_spike_counts_plot(step_dir, first_ctx_counts, first_true_counts, first_pred_counts, title=f"Eval spike counts over time (first AR)")
+    # Stacked over-time plots across multiple AR runs
+    if len(ar_contexts) > 0:
+        make_mean_rate_plots_stacked(step_dir, ar_contexts, ar_truths, ar_preds, title=f"Eval mean rate over time (stacked {len(ar_contexts)} ARs)")
+        make_median_rate_plots_stacked(step_dir, ar_contexts, ar_truths, ar_preds, title=f"Eval median rate over time (stacked {len(ar_contexts)} ARs)")
+        make_spike_counts_plots_stacked(step_dir, ar_ctx_counts, ar_true_counts, ar_pred_counts, title=f"Eval spike counts over time (stacked {len(ar_contexts)} ARs)")
 
-    print(f"Eval complete. Val loss: {val_loss:.6f} over {vb} batches. Outputs in: {exp_dir}")
+        # Ensembled scatter/density plots (concatenate across runs)
+        true_all = torch.cat(scat_true_last, dim=0) if len(scat_true_last) else torch.empty(0)
+        pred_all = torch.cat(scat_pred_last, dim=0) if len(scat_pred_last) else torch.empty(0)
+        mu_all = torch.cat(scat_mu_last, dim=0) if len(scat_mu_last) else torch.empty(0)
+        sigma_all = torch.cat(scat_sigma_last, dim=0) if len(scat_sigma_last) else torch.empty(0)
+        mask_all = torch.cat(scat_mask_last, dim=0) if len(scat_mask_last) else torch.empty(0, dtype=torch.bool)
+        if true_all.numel() > 0:
+            make_next_step_scatter(step_dir, true_all, pred_all, mask_all, title=f"Eval next-step scatter (ensembled {len(scat_true_last)} ARs)")
+            make_mu_sigma_scatter(step_dir, mu_all, sigma_all, true_all, mask_all, title=f"Eval mu vs sigma (ensembled {len(scat_true_last)} ARs)")
+            make_log_rate_scatter(step_dir, true_all, pred_all, mask_all, title=f"Eval log-rate scatter (ensembled {len(scat_true_last)} ARs)")
+            make_log_true_vs_log_sigma_scatter(step_dir, true_all, sigma_all, mask_all, title=f"Eval log(true) vs log(sigma) (ensembled {len(scat_true_last)} ARs)")
+            make_log_true_vs_log_mu_scatter(step_dir, true_all, mu_all, mask_all, title=f"Eval log(true) vs mu (log-rate) (ensembled {len(scat_true_last)} ARs)")
+            # PCA population distribution (use per-sample vectors and common valid neurons)
+            try:
+                make_pca_population_plot(step_dir, scat_true_last, scat_pred_last, scat_mask_last, title='Population PCA: true vs pred (next-step)')
+            except Exception:
+                pass
+
+    # Plot mean next-step loss vs sequence index (more context to the right)
+    if per_index_count.sum() > 0:
+        per_idx_mean = (per_index_sum / per_index_count.clamp_min(1.0)).cpu().numpy()
+        make_per_index_loss_plot(step_dir, per_idx_mean, title='Mean next-step NLL vs sequence index')
+
+    print(f"Eval complete. Val loss: {val_loss:.6f} over {vb_loss_count} batches. Outputs in: {exp_dir}")
 
 
 if __name__ == '__main__':
