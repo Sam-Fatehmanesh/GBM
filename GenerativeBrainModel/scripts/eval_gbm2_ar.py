@@ -561,29 +561,39 @@ def make_pca_population_plot(step_dir: Path,
     then project PRED vectors with the same PCA, and plot both distributions.
     Uses only neurons valid across all samples to avoid missing-data handling.
     """
+    def _dbg(msg: str):
+        try:
+            print(f"[eval_pca] {msg}")
+        except Exception:
+            pass
     if len(true_list) == 0 or len(pred_list) == 0:
+        _dbg(f"no samples: len(true_list)={len(true_list)}, len(pred_list)={len(pred_list)}")
         return
     try:
         X_true = torch.stack([t.to(torch.float32) for t in true_list], dim=0)  # (S,N)
         X_pred = torch.stack([p.to(torch.float32) for p in pred_list], dim=0)  # (S,N)
         M = torch.stack([m.to(torch.bool) for m in mask_list], dim=0)          # (S,N)
-    except Exception:
+    except Exception as e:
+        _dbg(f"exception during stack: {e}")
         return
     # Require at least 2 samples and 2 neurons
     S, N = int(X_true.shape[0]), int(X_true.shape[1])
     if S < 2 or N < 2:
+        _dbg(f"insufficient samples/neurons: S={S}, N={N}")
         return
     # Keep neurons observed in at least 20% of samples
     counts = M.sum(dim=0)
     thresh = max(2, int(0.2 * S))
     keep_cols = counts >= thresh
     if not bool(keep_cols.any().item()):
+        _dbg("no columns meet observation threshold")
         return
     Xtrue = X_true[:, keep_cols]
     Xpred = X_pred[:, keep_cols]
     Mkeep = M[:, keep_cols]
     K = int(Xtrue.shape[1])
     if K < 2:
+        _dbg(f"kept cols <2: K={K}")
         return
     # Compute column means over available TRUE entries and impute missing with mean
     denom = Mkeep.sum(dim=0).clamp_min(1).to(Xtrue.dtype)
@@ -594,10 +604,12 @@ def make_pca_population_plot(step_dir: Path,
     mu = col_mean.unsqueeze(0)
     Xtrue_c = (Xtrue_imp - mu).cpu().numpy()
     Xpred_c = (Xpred_imp - mu).cpu().numpy()
+    _dbg(f"PCA input shapes: true={Xtrue_c.shape}, pred={Xpred_c.shape}")
     # PCA via SVD on TRUE
     try:
         U, Svals, VT = np.linalg.svd(Xtrue_c, full_matrices=False)
-    except Exception:
+    except Exception as e:
+        _dbg(f"svd failed: {e}")
         return
     comps = VT[:2].T  # (K,2)
     Zt = Xtrue_c @ comps  # (S,2)
@@ -617,6 +629,155 @@ def make_pca_population_plot(step_dir: Path,
     ax.legend(loc='best', fontsize=8)
     fig.tight_layout()
     fig.savefig(step_dir / 'pca_population_distribution.png')
+    plt.close(fig)
+
+
+@torch.no_grad()
+def make_pca_population_plot_per_subject(step_dir: Path,
+                                         true_list: list[torch.Tensor],
+                                         pred_list: list[torch.Tensor],
+                                         mask_list: list[torch.Tensor],
+                                         subjects: list[str],
+                                         title: str) -> None:
+    def _dbg(msg: str):
+        try:
+            print(f"[eval_pca_by_subj] {msg}")
+        except Exception:
+            pass
+    if len(true_list) == 0:
+        _dbg('no samples')
+        return
+    try:
+        X_true = torch.stack([t.to(torch.float32) for t in true_list], dim=0)  # (S,N)
+        X_pred = torch.stack([p.to(torch.float32) for p in pred_list], dim=0)  # (S,N)
+        M = torch.stack([m.to(torch.bool) for m in mask_list], dim=0)          # (S,N)
+    except Exception as e:
+        _dbg(f'stack error: {e}')
+        return
+    S, N = int(X_true.shape[0]), int(X_true.shape[1])
+    if S < 2 or N < 2:
+        _dbg(f'insufficient S={S} N={N}')
+        return
+    counts = M.sum(dim=0)
+    thresh = max(2, int(0.2 * S))
+    keep_cols = counts >= thresh
+    if not bool(keep_cols.any().item()):
+        _dbg('no kept cols')
+        return
+    Xtrue = X_true[:, keep_cols]
+    Xpred = X_pred[:, keep_cols]
+    Mkeep = M[:, keep_cols]
+    K = int(Xtrue.shape[1])
+    if K < 2:
+        _dbg(f'K<2: {K}')
+        return
+    denom = Mkeep.sum(dim=0).clamp_min(1).to(Xtrue.dtype)
+    col_mean = (Xtrue.masked_fill(~Mkeep, 0.0).sum(dim=0) / denom)
+    Xtrue_imp = torch.where(Mkeep, Xtrue, col_mean.unsqueeze(0))
+    Xpred_imp = torch.where(Mkeep, Xpred, col_mean.unsqueeze(0))
+    mu = col_mean.unsqueeze(0)
+    Xtrue_c = (Xtrue_imp - mu).cpu().numpy()
+    Xpred_c = (Xpred_imp - mu).cpu().numpy()
+    # PCA on true (global)
+    try:
+        U, Svals, VT = np.linalg.svd(Xtrue_c, full_matrices=False)
+    except Exception as e:
+        _dbg(f'svd error: {e}')
+        return
+    comps = VT[:2].T
+    Zt = Xtrue_c @ comps
+    Zp = Xpred_c @ comps
+    lo = np.minimum(Zt.min(axis=0), Zp.min(axis=0))
+    hi = np.maximum(Zt.max(axis=0), Zp.max(axis=0))
+    pad = 0.05 * (hi - lo + 1e-8)
+    lo -= pad; hi += pad
+    # Grid layout
+    import math
+    S_eff = Zt.shape[0]
+    cols = min(5, max(1, int(math.ceil(math.sqrt(S_eff)))))
+    rows = int(math.ceil(S_eff / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(3.2*cols, 3.2*rows), sharex=True, sharey=True)
+    axes = np.array(axes).reshape(rows, cols)
+    for i in range(rows*cols):
+        r = i // cols; c = i % cols
+        ax = axes[r, c]
+        if i < S_eff:
+            ax.scatter(Zt[i, 0], Zt[i, 1], s=14, color='tab:blue', label='true')
+            ax.scatter(Zp[i, 0], Zp[i, 1], s=14, color='tab:orange', label='pred')
+            ax.set_title(subjects[i] if i < len(subjects) else f'subj_{i+1}', fontsize=8)
+        ax.set_xlim(lo[0], hi[0]); ax.set_ylim(lo[1], hi[1])
+        if r == rows-1:
+            ax.set_xlabel('PC1')
+        if c == 0:
+            ax.set_ylabel('PC2')
+        if i == 0:
+            ax.legend(fontsize=7, loc='best')
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(step_dir / 'pca_population_distribution_by_subject.png')
+    plt.close(fig)
+
+
+@torch.no_grad()
+def make_laststep_pca_grid_per_subject(step_dir: Path,
+                                       subj_to_true: dict,
+                                       subj_to_pred: dict,
+                                       subj_to_masks: dict) -> None:
+    names = list(subj_to_true.keys())
+    if len(names) == 0:
+        print('[eval_pca_laststep] no subjects collected')
+        return
+    import math
+    S = len(names)
+    cols = min(5, max(1, int(math.ceil(math.sqrt(S)))))
+    rows = int(math.ceil(S / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(3.6*cols, 3.6*rows), sharex=False, sharey=False)
+    axes = np.array(axes).reshape(rows, cols)
+    for i, subj in enumerate(names):
+        r = i // cols; c = i % cols
+        ax = axes[r, c]
+        tl = subj_to_true.get(subj, [])
+        pl = subj_to_pred.get(subj, [])
+        ml = subj_to_masks.get(subj, [])
+        ax.axis('off')
+        try:
+            if len(tl) < 2:
+                ax.set_title(f'{subj} (n<2)', fontsize=8)
+                continue
+            X_true = torch.stack([t.to(torch.float32) for t in tl], dim=0)
+            X_pred = torch.stack([p.to(torch.float32) for p in pl], dim=0) if len(pl)==len(tl) else None
+            M = torch.stack([m.to(torch.bool) for m in ml], dim=0) if len(ml)==len(tl) else torch.ones_like(X_true, dtype=torch.bool)
+            keep = M.all(dim=0)
+            if not bool(keep.any().item()):
+                ax.set_title(f'{subj} (no common)', fontsize=8)
+                continue
+            Xt = X_true[:, keep]
+            Xp = X_pred[:, keep] if X_pred is not None else None
+            if int(Xt.shape[1]) < 2:
+                ax.set_title(f'{subj} (K<2)', fontsize=8)
+                continue
+            mu = Xt.mean(dim=0, keepdim=True)
+            Xt_c = (Xt - mu).cpu().numpy()
+            Xp_c = (Xp - mu).cpu().numpy() if Xp is not None else None
+            U, Svals, VT = np.linalg.svd(Xt_c, full_matrices=False)
+            comps = VT[:2].T
+            Zt = Xt_c @ comps
+            ax.scatter(Zt[:,0], Zt[:,1], s=10, alpha=0.7, color='tab:blue', label='true')
+            if Xp_c is not None:
+                Zp = Xp_c @ comps
+                ax.scatter(Zp[:,0], Zp[:,1], s=10, alpha=0.7, color='tab:orange', label='pred')
+            ax.set_title(subj, fontsize=8)
+            ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+            if i == 0:
+                ax.legend(fontsize=7, loc='best')
+            ax.axis('on')
+        except Exception as e:
+            ax.set_title(f'{subj} (err)', fontsize=8)
+    for j in range(len(names), rows*cols):
+        axes[j//cols, j%cols].axis('off')
+    fig.suptitle('Last-step PCA per subject (true in blue, pred in orange)')
+    fig.tight_layout()
+    fig.savefig(step_dir / 'pca_laststep_per_subject.png')
     plt.close(fig)
 
 @torch.no_grad()
@@ -770,6 +931,16 @@ def main():
     scat_mu_last: list[torch.Tensor] = []
     scat_sigma_last: list[torch.Tensor] = []
     scat_mask_last: list[torch.Tensor] = []
+    scat_subjects: list[str] = []
+    # Accumulators for per-subject temporal PCA (use full teacher-forced window per subject)
+    subj_true_mats: list[torch.Tensor] = []   # each: (Lm1_use,N)
+    subj_pred_mats: list[torch.Tensor] = []   # each: (Lm1_use,N)
+    subj_masks: list[torch.Tensor] = []       # each: (N,)
+    subj_names: list[str] = []
+    # Accumulators for subject-wise last-step PCA (across all batches)
+    subj_last_true: dict[str, list[torch.Tensor]] = {}
+    subj_last_pred: dict[str, list[torch.Tensor]] = {}
+    subj_last_masks: dict[str, list[torch.Tensor]] = {}
 
     val_batches_limit = args.val_batches if args.val_batches is not None else int(cfg['training'].get('val_sample_batches') or 0)
     if val_batches_limit <= 0:
@@ -852,10 +1023,26 @@ def main():
                 total += float(vloss.detach().cpu().item())
                 vb_loss_count += 1
 
+            # Per-subject LAST-STEP accumulation for PCA (do this for all batches)
+            file_paths = batch.get('file_path', [])
+            B = int(x_in_full.shape[0])
+            for bi in range(B):
+                try:
+                    from pathlib import Path as _P
+                    subj_id = _P(file_paths[bi]).name if file_paths else f"subj"
+                except Exception:
+                    subj_id = f"subj"
+                tl = x_tg[bi, -1, :].detach().cpu()
+                # median prediction for stability (teacher-forced last step)
+                pred_med = lognormal_rate_median(mu[bi:bi+1, -1:, :].detach().cpu(), raw_log_sigma[bi:bi+1, -1:, :].detach().cpu())[0,0,:]
+                mk = (mask[bi] != 0).detach().cpu()
+                subj_last_true.setdefault(subj_id, []).append(tl)
+                subj_last_pred.setdefault(subj_id, []).append(pred_med)
+                subj_last_masks.setdefault(subj_id, []).append(mk)
+
             # Collect up to num_ars unique-subject AR visualizations
             if len(ar_contexts) < num_ars:
                 B, Lm1_full, N = x_in_full.shape
-                file_paths = batch.get('file_path', [])
                 Tf_all = min(horizon, max(1, Lm1_full - Lm1_orig)) if Lm1_full > Lm1_orig else min(horizon, Lm1_full)
                 Tc = Lm1_orig
                 Tf_all = max(1, min(Tf_all, max(1, Lm1_full - Tc)))
@@ -921,6 +1108,22 @@ def main():
                     scat_mu_last.append(mu_last.detach().cpu())
                     scat_sigma_last.append(sigma_last.detach().cpu())
                     scat_mask_last.append((mask[bi] != 0).detach().cpu())
+                    try:
+                        from pathlib import Path as _P
+                        subj = _P(fp).name if fp is not None else f"subj_{len(scat_subjects)+1}"
+                    except Exception:
+                        subj = f"subj_{len(scat_subjects)+1}"
+                    scat_subjects.append(subj)
+
+                    # Per-subject temporal PCA data (use all teacher-forced next steps)
+                    subj_true = x_tg[bi, :Lm1_use, :].detach().cpu()        # (Lm1_use,N)
+                    # Predict next-step rates per time using median for stability
+                    subj_pred = lognormal_rate_median(mu[bi, :Lm1_use, :].detach().cpu(), raw_log_sigma[bi, :Lm1_use, :].detach().cpu())
+                    subj_mask = (mask[bi] != 0).detach().cpu()              # (N,)
+                    subj_true_mats.append(subj_true)
+                    subj_pred_mats.append(subj_pred)
+                    subj_masks.append(subj_mask)
+                    subj_names.append(subj)
 
             # Break when both: (1) collected requested ARs and (2) finished requested val loss batches
             if (vb_loss_count >= val_batches_limit) and (len(ar_contexts) >= num_ars):
@@ -956,11 +1159,16 @@ def main():
             make_log_rate_scatter(step_dir, true_all, pred_all, mask_all, title=f"Eval log-rate scatter (ensembled {len(scat_true_last)} ARs)")
             make_log_true_vs_log_sigma_scatter(step_dir, true_all, sigma_all, mask_all, title=f"Eval log(true) vs log(sigma) (ensembled {len(scat_true_last)} ARs)")
             make_log_true_vs_log_mu_scatter(step_dir, true_all, mu_all, mask_all, title=f"Eval log(true) vs mu (log-rate) (ensembled {len(scat_true_last)} ARs)")
-            # PCA population distribution (use per-sample vectors and common valid neurons)
-            try:
-                make_pca_population_plot(step_dir, scat_true_last, scat_pred_last, scat_mask_last, title='Population PCA: true vs pred (next-step)')
-            except Exception:
-                pass
+            pass
+
+    # New: Subject-wise PCA using last-step vectors across all batches
+    try:
+        make_laststep_pca_grid_per_subject(step_dir, subj_last_true, subj_last_pred, subj_last_masks)
+    except Exception as e:
+        try:
+            print(f"[eval_pca_laststep] exception: {e}")
+        except Exception:
+            pass
 
     # Plot mean next-step loss vs sequence index (more context to the right)
     if per_index_count.sum() > 0:
