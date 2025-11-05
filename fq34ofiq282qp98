@@ -28,7 +28,9 @@ test super long context but only 1 lr aka 1 lr but 192 seqlen
 
 test masking out same neuron to same neuron attention, ways to try, remove spiking neurons from Q [in prog], switch to flexattn which has attn bias support
 
-test using log mse
+test using log mse or regular mse
+
+test removing global vector or just setting to zero or using film layer etc
 
 interneuron dependent loss function:
 
