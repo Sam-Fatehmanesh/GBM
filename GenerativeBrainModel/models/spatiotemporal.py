@@ -49,7 +49,7 @@ class SpatioTemporalNeuralAttention(nn.Module):
         # if neuron_pad_mask is not None and neuron_pad_mask.dtype != d_dtype:
         #     neuron_pad_mask = neuron_pad_mask.to(d_dtype)
 
-        global_mean_pool = self.FFN_global_mean_pool(x) * 0.0 # TODO: remove this
+        global_mean_pool = self.FFN_global_mean_pool(x) # TODO: remove this
         x = torch.cat([x, global_mean_pool], dim=2) # (B, T, n_neurons + 1, d_model)
         neuron_pad_mask = torch.cat([neuron_pad_mask, torch.ones(B, 1, device=neuron_pad_mask.device)], dim=1) # (B, n_neurons + 1)
         point_positions = torch.cat([point_positions, torch.zeros(B, 1, 3, device=point_positions.device, dtype=x.dtype)], dim=1) # (B, n_neurons + 1, 3)
