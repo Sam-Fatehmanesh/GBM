@@ -51,7 +51,8 @@ def sas_nll(
     log_pdf = (
         torch.log(delta)
         - torch.log(sigma)
-        - 0.5 * torch.log(torch.tensor(2 * math.pi, device=rates.device, dtype=rates.dtype))
+        - 0.5
+        * torch.log(torch.tensor(2 * math.pi, device=rates.device, dtype=rates.dtype))
         - 0.5 * t.pow(2)
         - 0.5 * torch.log1p(z.pow(2))
     )
@@ -70,7 +71,12 @@ def sas_nll(
     return nll.mean()
 
 
-def sas_log_median(mu: torch.Tensor, raw_log_sigma: torch.Tensor, eta: torch.Tensor, raw_log_delta: torch.Tensor) -> torch.Tensor:
+def sas_log_median(
+    mu: torch.Tensor,
+    raw_log_sigma: torch.Tensor,
+    eta: torch.Tensor,
+    raw_log_delta: torch.Tensor,
+) -> torch.Tensor:
     """Log-median of the SAS distribution on log-rates."""
 
     sigma = _positive(raw_log_sigma)
@@ -80,9 +86,13 @@ def sas_log_median(mu: torch.Tensor, raw_log_sigma: torch.Tensor, eta: torch.Ten
     return log_median
 
 
-def sas_rate_median(mu: torch.Tensor, raw_log_sigma: torch.Tensor, eta: torch.Tensor, raw_log_delta: torch.Tensor) -> torch.Tensor:
+def sas_rate_median(
+    mu: torch.Tensor,
+    raw_log_sigma: torch.Tensor,
+    eta: torch.Tensor,
+    raw_log_delta: torch.Tensor,
+) -> torch.Tensor:
     """Median in the rate domain."""
 
     log_med = sas_log_median(mu, raw_log_sigma, eta, raw_log_delta)
     return torch.exp(log_med)
-

@@ -57,12 +57,10 @@ def lognormal_nll(
 
     nll = -log_pdf
 
-
     if weight_by_rate:
         y0 = torch.quantile(y.detach(), 0.5)  # median as a reference
-        w = torch.exp(0.7*(y - y0)).clamp(max=20)
+        w = torch.exp(0.7 * (y - y0)).clamp(max=20)
         nll = nll * w
-
 
     if mask is not None:
         mask = mask.to(dtype=nll.dtype, device=nll.device)
@@ -70,7 +68,6 @@ def lognormal_nll(
             mask = mask.expand_as(nll)
         total = mask.sum().clamp_min(1.0)
         return (nll * mask).sum() / total
-
 
     return nll.mean()
 
@@ -80,7 +77,9 @@ def lognormal_log_median(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch
     return mu
 
 
-def lognormal_rate_median(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch.Tensor:
+def lognormal_rate_median(
+    mu: torch.Tensor, raw_log_sigma: torch.Tensor
+) -> torch.Tensor:
     """Median in the rate domain for LogNormal."""
     return torch.exp(mu).clamp(min=0.003)
 
@@ -94,5 +93,5 @@ def lognormal_rate_mean(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch.
 def sample_lognormal(mu: torch.Tensor, raw_log_sigma: torch.Tensor) -> torch.Tensor:
     """Sample from the LogNormal distribution, clamping to 2 stds on either side."""
     sigma = _positive(raw_log_sigma)
-    eps = torch.randn_like(mu) 
+    eps = torch.randn_like(mu)
     return torch.exp(mu + sigma * eps).clamp(min=0.003)

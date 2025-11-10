@@ -51,10 +51,10 @@ def _read_sampling_rate_hz(f: h5py.File) -> float:
       6) f.attrs['matlab_fpsec']
     """
     for key in (
-        'final_sampling_rate',
-        'effective_sampling_rate',
-        'target_sampling_rate',
-        'original_sampling_rate',
+        "final_sampling_rate",
+        "effective_sampling_rate",
+        "target_sampling_rate",
+        "original_sampling_rate",
     ):
         if key in f.attrs:
             try:
@@ -62,14 +62,14 @@ def _read_sampling_rate_hz(f: h5py.File) -> float:
             except Exception:
                 pass
     # Dataset fallback
-    if 'original_sampling_rate_hz' in f:
+    if "original_sampling_rate_hz" in f:
         try:
-            return float(f['original_sampling_rate_hz'][()])
+            return float(f["original_sampling_rate_hz"][()])
         except Exception:
             pass
-    if 'matlab_fpsec' in f.attrs:
+    if "matlab_fpsec" in f.attrs:
         try:
-            return float(f.attrs['matlab_fpsec'])
+            return float(f.attrs["matlab_fpsec"])
         except Exception:
             pass
     raise RuntimeError("Could not determine sampling rate (Hz) from file metadata")
@@ -95,8 +95,12 @@ def _create_rates_pdf(
     T, N = rates_shape
     # Global stats (robust to None)
     try:
-        global_mean = float(np.mean(per_neuron_mean)) if per_neuron_mean is not None else None
-        global_var = float(np.mean(per_neuron_var)) if per_neuron_var is not None else None
+        global_mean = (
+            float(np.mean(per_neuron_mean)) if per_neuron_mean is not None else None
+        )
+        global_var = (
+            float(np.mean(per_neuron_var)) if per_neuron_var is not None else None
+        )
     except Exception:
         global_mean = None
         global_var = None
@@ -109,41 +113,47 @@ def _create_rates_pdf(
 
             # Text panel
             ax0 = axes[0, 0]
-            ax0.axis('off')
+            ax0.axis("off")
             lines = [
                 f"Neurons (N): {N}",
                 f"Timepoints (T): {T}",
-                f"Global mean rate (Hz): {global_mean:.6f}" if global_mean is not None else "Global mean rate (Hz): N/A",
-                f"Global var rate (Hz^2): {global_var:.6f}" if global_var is not None else "Global var rate (Hz^2): N/A",
-                f"Per-neuron mean rate — mean: {np.mean(per_neuron_mean):.6f}" if per_neuron_mean is not None else "Per-neuron mean rate: N/A",
+                f"Global mean rate (Hz): {global_mean:.6f}"
+                if global_mean is not None
+                else "Global mean rate (Hz): N/A",
+                f"Global var rate (Hz^2): {global_var:.6f}"
+                if global_var is not None
+                else "Global var rate (Hz^2): N/A",
+                f"Per-neuron mean rate — mean: {np.mean(per_neuron_mean):.6f}"
+                if per_neuron_mean is not None
+                else "Per-neuron mean rate: N/A",
             ]
-            ax0.text(0.01, 0.98, "\n".join(lines), va='top', ha='left', fontsize=9)
+            ax0.text(0.01, 0.98, "\n".join(lines), va="top", ha="left", fontsize=9)
 
             # Histogram: per-neuron mean rate
             ax1 = axes[0, 1]
             if per_neuron_mean is not None:
-                ax1.hist(per_neuron_mean, bins=50, color='steelblue', alpha=0.8)
-                ax1.set_title('Histogram: per-neuron mean rate (Hz)')
+                ax1.hist(per_neuron_mean, bins=50, color="steelblue", alpha=0.8)
+                ax1.set_title("Histogram: per-neuron mean rate (Hz)")
             else:
-                ax1.axis('off')
+                ax1.axis("off")
 
             # Per-frame mean rate over time
             ax2 = axes[1, 0]
             if per_frame_mean is not None:
-                ax2.plot(per_frame_mean, color='darkmagenta', lw=0.8)
-                ax2.set_title('Per-frame mean rate (Hz) over time')
-                ax2.set_xlabel('Frame')
-                ax2.set_ylabel('Mean rate (Hz)')
+                ax2.plot(per_frame_mean, color="darkmagenta", lw=0.8)
+                ax2.set_title("Per-frame mean rate (Hz) over time")
+                ax2.set_xlabel("Frame")
+                ax2.set_ylabel("Mean rate (Hz)")
             else:
-                ax2.axis('off')
+                ax2.axis("off")
 
             # Placeholder for per-neuron variance histogram
             ax3 = axes[1, 1]
             if per_neuron_var is not None:
-                ax3.hist(per_neuron_var, bins=50, color='orange', alpha=0.8)
-                ax3.set_title('Histogram: per-neuron variance (Hz^2)')
+                ax3.hist(per_neuron_var, bins=50, color="orange", alpha=0.8)
+                ax3.set_title("Histogram: per-neuron variance (Hz^2)")
             else:
-                ax3.axis('off')
+                ax3.axis("off")
 
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
             pdf.savefig(fig)
@@ -157,10 +167,10 @@ def _create_rates_pdf(
             for i in range(K):
                 try:
                     fig, ax = plt.subplots(1, 1, figsize=(10, 3))
-                    ax.plot(sample_traces[:, i], color='tab:purple', lw=0.8)
-                    ax.set_title(f'Spike rate trace (Hz) — neuron {i+1} of {K}')
-                    ax.set_xlabel('Frame')
-                    ax.set_ylabel('Rate (Hz)')
+                    ax.plot(sample_traces[:, i], color="tab:purple", lw=0.8)
+                    ax.set_title(f"Spike rate trace (Hz) — neuron {i + 1} of {K}")
+                    ax.set_xlabel("Frame")
+                    ax.set_ylabel("Rate (Hz)")
                     ax.grid(alpha=0.2)
                     plt.tight_layout()
                     pdf.savefig(fig)
@@ -193,23 +203,23 @@ def _copy_all_datasets_and_attrs(src: h5py.File, dst: h5py.File):
 def convert_file(
     src_path: str,
     dst_path: str,
-    dtype: str = 'float32',
+    dtype: str = "float32",
     num_neurons_viz: int = 10,
     chunk_rows: int = 1000,
     eps: float = 1e-7,
 ):
     """Convert a single subject H5 file from probabilities to rates and write output."""
-    subject_name = os.path.basename(src_path).replace('.h5', '')
+    subject_name = os.path.basename(src_path).replace(".h5", "")
 
-    with h5py.File(src_path, 'r') as fin, h5py.File(dst_path, 'w') as fout:
+    with h5py.File(src_path, "r") as fin, h5py.File(dst_path, "w") as fout:
         # Copy everything first
         _copy_all_datasets_and_attrs(fin, fout)
 
         # Ensure probabilities exist
-        if 'spike_probabilities' not in fin:
+        if "spike_probabilities" not in fin:
             raise RuntimeError(f"'spike_probabilities' dataset missing in {src_path}")
 
-        probs_ds = fin['spike_probabilities']  # (T, N)
+        probs_ds = fin["spike_probabilities"]  # (T, N)
         T, N = int(probs_ds.shape[0]), int(probs_ds.shape[1])
 
         sampling_rate_hz = _read_sampling_rate_hz(fin)
@@ -217,11 +227,11 @@ def convert_file(
         # Prepare output dataset
         np_dtype = getattr(np, dtype)
         rates_ds = fout.create_dataset(
-            'spike_rates_hz',
+            "spike_rates_hz",
             shape=(T, N),
             dtype=np_dtype,
             chunks=(min(chunk_rows, T), min(100, N)),
-            compression='gzip',
+            compression="gzip",
             compression_opts=1,
         )
 
@@ -233,7 +243,11 @@ def convert_file(
         # Select neurons to visualize
         rng = np.random.default_rng(42)
         nsel = max(0, min(num_neurons_viz, N))
-        sel_idx = rng.choice(N, nsel, replace=False) if nsel > 0 else np.array([], dtype=np.int64)
+        sel_idx = (
+            rng.choice(N, nsel, replace=False)
+            if nsel > 0
+            else np.array([], dtype=np.int64)
+        )
         sample_traces = np.zeros((T, nsel), dtype=np.float32) if nsel > 0 else None
 
         # Convert in time-chunks to limit memory
@@ -251,12 +265,16 @@ def convert_file(
 
             # Update stats
             per_neuron_sum += r_chunk.sum(axis=0, dtype=np.float64)
-            per_neuron_sq_sum += np.square(r_chunk, dtype=np.float64).sum(axis=0, dtype=np.float64)
+            per_neuron_sq_sum += np.square(r_chunk, dtype=np.float64).sum(
+                axis=0, dtype=np.float64
+            )
             per_frame_mean[start:end] = r_chunk.mean(axis=1).astype(np.float32)
 
             # Collect selected traces
             if nsel > 0:
-                sample_traces[start:end, :] = r_chunk[:, sel_idx].astype(np.float32, copy=False)
+                sample_traces[start:end, :] = r_chunk[:, sel_idx].astype(
+                    np.float32, copy=False
+                )
 
             # Free memory
             del p_chunk, r_chunk
@@ -264,16 +282,20 @@ def convert_file(
 
         # Finalize stats
         per_neuron_mean = (per_neuron_sum / float(T)).astype(np.float32)
-        per_neuron_var = (per_neuron_sq_sum / float(T) - np.square(per_neuron_mean)).astype(np.float32)
+        per_neuron_var = (
+            per_neuron_sq_sum / float(T) - np.square(per_neuron_mean)
+        ).astype(np.float32)
 
         # File-level metadata
-        fout.attrs['includes_rates'] = True
-        fout.attrs['rate_unit'] = 'Hz'
-        fout.attrs['probability_to_rate_formula'] = 'rate_hz = -sampling_rate_hz * log1p(-probability)'
-        fout.attrs['conversion_source'] = os.path.basename(src_path)
+        fout.attrs["includes_rates"] = True
+        fout.attrs["rate_unit"] = "Hz"
+        fout.attrs["probability_to_rate_formula"] = (
+            "rate_hz = -sampling_rate_hz * log1p(-probability)"
+        )
+        fout.attrs["conversion_source"] = os.path.basename(src_path)
 
     # Create PDF visualization (post-close to ensure data is flushed)
-    out_pdf_path = dst_path.replace('.h5', '_rates_visualization.pdf')
+    out_pdf_path = dst_path.replace(".h5", "_rates_visualization.pdf")
     try:
         _create_rates_pdf(
             rates_shape=(T, N),
@@ -290,17 +312,55 @@ def convert_file(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert spike probabilities to rates (Hz) and replicate subject files',
+        description="Convert spike probabilities to rates (Hz) and replicate subject files",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('--input-dir', type=str, required=True, help='Directory with input subject H5 files (probabilities)')
-    parser.add_argument('--output-dir', type=str, required=True, help='Directory to write converted subject H5 files (with rates)')
-    parser.add_argument('--dtype', type=str, default='float32', choices=['float16', 'float32'], help='Output dtype for rates')
-    parser.add_argument('--num-neurons-viz', type=int, default=10, help='Number of neurons to visualize per subject')
-    parser.add_argument('--chunk-rows', type=int, default=1000, help='Time-chunk rows to process at once')
-    parser.add_argument('--eps', type=float, default=1e-7, help='Epsilon to avoid log(0) at probability=1.0')
-    parser.add_argument('--overwrite', action='store_true', help='Overwrite existing outputs')
-    parser.add_argument('--subjects-glob', type=str, default='subject_*.h5', help='Glob to select subject files within input-dir')
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        required=True,
+        help="Directory with input subject H5 files (probabilities)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        required=True,
+        help="Directory to write converted subject H5 files (with rates)",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        choices=["float16", "float32"],
+        help="Output dtype for rates",
+    )
+    parser.add_argument(
+        "--num-neurons-viz",
+        type=int,
+        default=10,
+        help="Number of neurons to visualize per subject",
+    )
+    parser.add_argument(
+        "--chunk-rows",
+        type=int,
+        default=1000,
+        help="Time-chunk rows to process at once",
+    )
+    parser.add_argument(
+        "--eps",
+        type=float,
+        default=1e-7,
+        help="Epsilon to avoid log(0) at probability=1.0",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing outputs"
+    )
+    parser.add_argument(
+        "--subjects-glob",
+        type=str,
+        default="subject_*.h5",
+        help="Glob to select subject files within input-dir",
+    )
 
     args = parser.parse_args()
 
@@ -310,6 +370,7 @@ def main():
 
     # Enumerate subjects
     import glob
+
     subject_files = sorted(glob.glob(os.path.join(in_dir, args.subjects_glob)))
     if not subject_files:
         print(f"No subject files matching {args.subjects_glob} in {in_dir}")
@@ -319,7 +380,7 @@ def main():
     for src in subject_files:
         base = os.path.basename(src)
         dst = os.path.join(out_dir, base)
-        pdf = dst.replace('.h5', '_rates_visualization.pdf')
+        pdf = dst.replace(".h5", "_rates_visualization.pdf")
         if (not args.overwrite) and os.path.exists(dst) and os.path.exists(pdf):
             print(f"Skipping {base} (already converted)")
             continue
@@ -343,8 +404,5 @@ def main():
     print("\nConversion complete.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
-
-

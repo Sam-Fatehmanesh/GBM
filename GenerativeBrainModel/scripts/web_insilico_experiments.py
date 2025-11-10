@@ -26,56 +26,79 @@ import numpy as np
 import h5py
 import torch
 import torch.nn as nn
-from flask import Flask, request, jsonify, render_template_string, send_file, session, make_response
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    render_template_string,
+    send_file,
+    session,
+    make_response,
+)
 import yaml
 import requests
 import shutil
 
 from GenerativeBrainModel.models.gbm import GBM
-from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders  # for types only; not used directly
-from GenerativeBrainModel.scripts.eval_gbm2_ar import autoregressive_rollout as eval_ar_rollout
+from GenerativeBrainModel.dataloaders.neural_dataloader import (
+    create_dataloaders,
+)  # for types only; not used directly
+from GenerativeBrainModel.scripts.eval_gbm2_ar import (
+    autoregressive_rollout as eval_ar_rollout,
+)
 
 # --------------------------
 # Config and global state
 # --------------------------
 
+
 @dataclass
 class ServerConfig:
-    host: str = '0.0.0.0'
+    host: str = "0.0.0.0"
     port: int = 8054
     debug: bool = False
-    secret_key: str = 'change-me'
-    turnstile_site_key: str = ''  # optional; if set, UI renders Turnstile widget
+    secret_key: str = "change-me"
+    turnstile_site_key: str = ""  # optional; if set, UI renders Turnstile widget
     disable_verification: bool = False  # if True, skip all verification paths
+
 
 @dataclass
 class DataConfig:
-    ar_h5: str = ''            # Path to eval_gbm2_ar per-AR H5 (context, truth, pred, stim, ids, etc.)
-    mask_h5: str = ''          # Optional atlas H5 for region overlays
+    ar_h5: str = (
+        ""  # Path to eval_gbm2_ar per-AR H5 (context, truth, pred, stim, ids, etc.)
+    )
+    mask_h5: str = ""  # Optional atlas H5 for region overlays
     spikes_are_rates: bool = False
     sampling_rate_hz: float = 3.0
     clip_01_before_ar: bool = False
-    baseline_npz: str = ''     # Optional; if empty, will fall back to AR H5 future truth rates
+    baseline_npz: str = (
+        ""  # Optional; if empty, will fall back to AR H5 future truth rates
+    )
+
 
 @dataclass
 class ModelConfig:
-    checkpoint: str = ''       # If empty, derived from AR H5 experiment dir
+    checkpoint: str = ""  # If empty, derived from AR H5 experiment dir
     use_gpu: bool = True
-    dtype: str = 'bfloat16'  # 'float32' | 'bfloat16'
+    dtype: str = "bfloat16"  # 'float32' | 'bfloat16'
+
 
 @dataclass
 class ARConfig:
     sequence_length: int = 12
     default_ar_steps: int = 12
 
+
 @dataclass
 class UIConfig:
     max_neurons_render: int = 100000
     max_batch_size: int = 5
 
+
 @dataclass
 class StorageConfig:
-    output_root: str = 'experiments/insilico_web'
+    output_root: str = "experiments/insilico_web"
+
 
 @dataclass
 class AppConfig:
@@ -88,28 +111,31 @@ class AppConfig:
 
 
 def load_yaml_config(path: str) -> AppConfig:
-    with open(path, 'r') as f:
+    with open(path, "r") as f:
         cfg = yaml.safe_load(f)
-    server = ServerConfig(**cfg.get('server', {}))
-    data = DataConfig(**cfg.get('data', {}))
-    model = ModelConfig(**cfg.get('model', {}))
-    ar = ARConfig(**cfg.get('ar', {}))
-    ui = UIConfig(**cfg.get('ui', {}))
-    storage = StorageConfig(**cfg.get('storage', {}))
-    return AppConfig(server=server, data=data, model=model, ar=ar, ui=ui, storage=storage)
+    server = ServerConfig(**cfg.get("server", {}))
+    data = DataConfig(**cfg.get("data", {}))
+    model = ModelConfig(**cfg.get("model", {}))
+    ar = ARConfig(**cfg.get("ar", {}))
+    ui = UIConfig(**cfg.get("ui", {}))
+    storage = StorageConfig(**cfg.get("storage", {}))
+    return AppConfig(
+        server=server, data=data, model=model, ar=ar, ui=ui, storage=storage
+    )
 
 
 # --------------------------
 # Robust model loading (adapted from eval_gbm)
 # --------------------------
 
+
 def _strip_orig_mod_prefix(state_dict: dict) -> dict:
-    if all(not k.startswith('_orig_mod.') for k in state_dict.keys()):
+    if all(not k.startswith("_orig_mod.") for k in state_dict.keys()):
         return state_dict
     out = {}
     for k, v in state_dict.items():
-        if k.startswith('_orig_mod.'):
-            nk = k[len('_orig_mod.') :]
+        if k.startswith("_orig_mod."):
+            nk = k[len("_orig_mod.") :]
         else:
             nk = k
         out[nk] = v
@@ -119,9 +145,15 @@ def _strip_orig_mod_prefix(state_dict: dict) -> dict:
 def _load_state_dict_robust(model: torch.nn.Module, state: dict) -> None:
     model_sd = model.state_dict()
     state = _strip_orig_mod_prefix(state)
-    filtered = {k: v for k, v in state.items() if (k in model_sd and getattr(v, 'shape', None) == model_sd[k].shape)}
+    filtered = {
+        k: v
+        for k, v in state.items()
+        if (k in model_sd and getattr(v, "shape", None) == model_sd[k].shape)
+    }
     if len(filtered) == 0:
-        raise RuntimeError('No matching parameters between checkpoint and current model.')
+        raise RuntimeError(
+            "No matching parameters between checkpoint and current model."
+        )
     model.load_state_dict(filtered, strict=False)
 
 
@@ -129,7 +161,9 @@ def find_experiment_root_from_ar_h5(ar_h5_path: str) -> str:
     """Ascend from the AR H5 path until a directory containing config.yaml and checkpoints/ is found."""
     cur = os.path.abspath(os.path.dirname(ar_h5_path))
     while True:
-        if os.path.isfile(os.path.join(cur, 'config.yaml')) and os.path.isdir(os.path.join(cur, 'checkpoints')):
+        if os.path.isfile(os.path.join(cur, "config.yaml")) and os.path.isdir(
+            os.path.join(cur, "checkpoints")
+        ):
             return cur
         parent = os.path.dirname(cur)
         if parent == cur:
@@ -138,30 +172,34 @@ def find_experiment_root_from_ar_h5(ar_h5_path: str) -> str:
     raise ValueError(f"Could not find experiment root from AR H5 path: {ar_h5_path}")
 
 
-def load_model_from_experiment(exp_dir: str, device: torch.device, d_stimuli: int) -> GBM:
+def load_model_from_experiment(
+    exp_dir: str, device: torch.device, d_stimuli: int
+) -> GBM:
     """Build GBM using experiment config and checkpoint, ensuring shapes match."""
-    cfg_path = os.path.join(exp_dir, 'config.yaml')
-    with open(cfg_path, 'r') as f:
+    cfg_path = os.path.join(exp_dir, "config.yaml")
+    with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f)
-    ckpt_path = os.path.join(exp_dir, 'checkpoints', 'best_model.pth')
-    state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    sd = state.get('model', state)
+    ckpt_path = os.path.join(exp_dir, "checkpoints", "best_model.pth")
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = state.get("model", state)
     # Determine embedding size and the EXACT global ID mapping used during training
     ne_key = None
     gid_key = None
     stim_w_key = None
     for k in sd.keys():
-        if k.endswith('neuron_embed.weight'):
+        if k.endswith("neuron_embed.weight"):
             ne_key = k
-        if k.endswith('global_neuron_ids_sorted'):
+        if k.endswith("global_neuron_ids_sorted"):
             gid_key = k
-        if k.endswith('stimuli_encoder.0.weight'):
+        if k.endswith("stimuli_encoder.0.weight"):
             stim_w_key = k
     if ne_key is None:
         raise ValueError("Checkpoint is missing neuron_embed.weight")
     # Use the saved mapping; this is critical so searchsorted finds the right indices
     if gid_key is None:
-        raise ValueError("Checkpoint is missing global_neuron_ids_sorted buffer needed for correct neuron ID mapping")
+        raise ValueError(
+            "Checkpoint is missing global_neuron_ids_sorted buffer needed for correct neuron ID mapping"
+        )
     global_ids_tensor = sd[gid_key].to(torch.long)
     if global_ids_tensor.ndim != 1 or global_ids_tensor.numel() < 1:
         raise ValueError("global_neuron_ids_sorted in checkpoint is malformed")
@@ -172,17 +210,19 @@ def load_model_from_experiment(exp_dir: str, device: torch.device, d_stimuli: in
             d_stimuli = d_stimuli_ckpt
         except Exception:
             pass
-    d_model = int(cfg['model']['d_model'])
-    n_heads = int(cfg['model']['n_heads'])
-    n_layers = int(cfg['model']['n_layers'])
-    cov_rank = int(cfg['model'].get('cov_rank', 32))
-    num_neurons_total = int(cfg['model'].get('num_neurons_total', 4_000_000))
+    d_model = int(cfg["model"]["d_model"])
+    n_heads = int(cfg["model"]["n_heads"])
+    n_layers = int(cfg["model"]["n_layers"])
+    cov_rank = int(cfg["model"].get("cov_rank", 32))
+    num_neurons_total = int(cfg["model"].get("num_neurons_total", 4_000_000))
     model = GBM(
-        d_model=d_model, d_stimuli=int(d_stimuli),
-        n_heads=n_heads, n_layers=n_layers,
+        d_model=d_model,
+        d_stimuli=int(d_stimuli),
+        n_heads=n_heads,
+        n_layers=n_layers,
         num_neurons_total=num_neurons_total,
         global_neuron_ids=global_ids_tensor,
-        cov_rank=cov_rank
+        cov_rank=cov_rank,
     ).to(device)
     _load_state_dict_robust(model, sd)
     model.eval()
@@ -192,6 +232,7 @@ def load_model_from_experiment(exp_dir: str, device: torch.device, d_stimuli: in
 # --------------------------
 # Data loading utilities
 # --------------------------
+
 
 @dataclass
 class BestSample:
@@ -205,7 +246,7 @@ class BestSample:
     base_n_steps: int
     neuron_ids: Optional[np.ndarray] = None
     log_activity_mean: Optional[np.ndarray] = None  # (1, N) or (N,)
-    log_activity_std: Optional[np.ndarray] = None   # (1, N) or (N,)
+    log_activity_std: Optional[np.ndarray] = None  # (1, N) or (N,)
     training_lm1: Optional[int] = None
 
 
@@ -213,30 +254,46 @@ class BestSample:
 # Path resolution helpers
 # --------------------------
 
+
 def load_ar_run_h5(path: str) -> BestSample:
     """Load a per-AR run H5 produced by eval_gbm2_ar.py (ar_runs/*.h5)."""
     assert os.path.exists(path), f"AR H5 not found: {path}"
-    with h5py.File(path, 'r') as f:
-        required = ('context_rates', 'positions', 'neuron_mask')
+    with h5py.File(path, "r") as f:
+        required = ("context_rates", "positions", "neuron_mask")
         for r in required:
             if r not in f:
                 raise ValueError(f"AR H5 missing dataset '{r}': {path}")
-        ctx = f['context_rates'][()]           # (Tc, N)
-        pos = f['positions'][()]               # (N, 3)
-        mask = f['neuron_mask'][()]            # (N,)
-        fut_truth = f['future_truth_rates'][()] if 'future_truth_rates' in f else None  # (Tf,N)
-        fut_pred = f['future_pred_rates'][()] if 'future_pred_rates' in f else None     # (Tf,N)
-        stim_ctx = f['stimulus_context'][()] if 'stimulus_context' in f else None       # (Tc,K)
-        stim_fut = f['stimulus_future'][()] if 'stimulus_future' in f else None         # (Tf,K)
-        neuron_ids = f['neuron_ids'][()] if 'neuron_ids' in f else None
-        lam = f['log_activity_mean'][()] if 'log_activity_mean' in f else None
-        las = f['log_activity_std'][()] if 'log_activity_std' in f else None
-        Tc = int(f.attrs.get('Tc', ctx.shape[0]))
-        Tf = int(f.attrs.get('Tf', fut_pred.shape[0] if isinstance(fut_pred, np.ndarray) else (fut_truth.shape[0] if isinstance(fut_truth, np.ndarray) else 0)))
-        training_lm1 = int(f.attrs.get('training_Lm1', Tc))
-    init_ctx = ctx[None, ...].astype(np.float32)             # (1,Tc,N)
-    pos = pos[None, ...].astype(np.float32)                  # (1,N,3)
-    mask = mask[None, ...].astype(bool)                      # (1,N)
+        ctx = f["context_rates"][()]  # (Tc, N)
+        pos = f["positions"][()]  # (N, 3)
+        mask = f["neuron_mask"][()]  # (N,)
+        fut_truth = (
+            f["future_truth_rates"][()] if "future_truth_rates" in f else None
+        )  # (Tf,N)
+        fut_pred = (
+            f["future_pred_rates"][()] if "future_pred_rates" in f else None
+        )  # (Tf,N)
+        stim_ctx = (
+            f["stimulus_context"][()] if "stimulus_context" in f else None
+        )  # (Tc,K)
+        stim_fut = (
+            f["stimulus_future"][()] if "stimulus_future" in f else None
+        )  # (Tf,K)
+        neuron_ids = f["neuron_ids"][()] if "neuron_ids" in f else None
+        lam = f["log_activity_mean"][()] if "log_activity_mean" in f else None
+        las = f["log_activity_std"][()] if "log_activity_std" in f else None
+        Tc = int(f.attrs.get("Tc", ctx.shape[0]))
+        Tf = int(
+            f.attrs.get(
+                "Tf",
+                fut_pred.shape[0]
+                if isinstance(fut_pred, np.ndarray)
+                else (fut_truth.shape[0] if isinstance(fut_truth, np.ndarray) else 0),
+            )
+        )
+        training_lm1 = int(f.attrs.get("training_Lm1", Tc))
+    init_ctx = ctx[None, ...].astype(np.float32)  # (1,Tc,N)
+    pos = pos[None, ...].astype(np.float32)  # (1,N,3)
+    mask = mask[None, ...].astype(bool)  # (1,N)
     stim_ctx = None if stim_ctx is None else stim_ctx[None, ...].astype(np.float32)
     stim_fut = None if stim_fut is None else stim_fut[None, ...].astype(np.float32)
     fut_pred = None if fut_pred is None else fut_pred[None, ...].astype(np.float32)
@@ -250,16 +307,24 @@ def load_ar_run_h5(path: str) -> BestSample:
         context_len=Tc,
         base_n_steps=Tf,
         neuron_ids=None if neuron_ids is None else neuron_ids.astype(np.int64),
-        log_activity_mean=None if lam is None else lam[None, ...].astype(np.float32) if lam.ndim == 1 else lam.astype(np.float32),
-        log_activity_std=None if las is None else las[None, ...].astype(np.float32) if las.ndim == 1 else las.astype(np.float32),
-        training_lm1=training_lm1
+        log_activity_mean=None
+        if lam is None
+        else lam[None, ...].astype(np.float32)
+        if lam.ndim == 1
+        else lam.astype(np.float32),
+        log_activity_std=None
+        if las is None
+        else las[None, ...].astype(np.float32)
+        if las.ndim == 1
+        else las.astype(np.float32),
+        training_lm1=training_lm1,
     )
 
 
 def resolve_experiment_from_ar_h5(path: str) -> Tuple[str, str]:
     """Return (exp_dir, ckpt_path) derived from AR H5 location."""
     exp_dir = find_experiment_root_from_ar_h5(path)
-    ckpt = os.path.join(exp_dir, 'checkpoints', 'best_model.pth')
+    ckpt = os.path.join(exp_dir, "checkpoints", "best_model.pth")
     if not os.path.exists(ckpt):
         raise ValueError(f"Checkpoint not found under experiment: {ckpt}")
     return exp_dir, ckpt
@@ -276,6 +341,7 @@ class MaskData:
 # Experiment queue and worker
 # --------------------------
 
+
 @dataclass
 class ExperimentJob:
     job_id: str
@@ -283,7 +349,7 @@ class ExperimentJob:
     neuron_indices: List[int]
     add_rate_hz: float
     ar_steps: int
-    status: str = 'pending'  # pending | running | complete | error
+    status: str = "pending"  # pending | running | complete | error
     error: Optional[str] = None
     result_npz_path: Optional[str] = None
     result_frames: Optional[np.ndarray] = None  # (Tgen, N)
@@ -298,14 +364,14 @@ class ExperimentQueue:
     def enqueue(self, job: ExperimentJob) -> int:
         with self._lock:
             self._queue.append(job)
-            return len([j for j in self._queue if j.status == 'pending'])
+            return len([j for j in self._queue if j.status == "pending"])
 
     def get_pending_batch(self) -> List[ExperimentJob]:
         with self._lock:
-            pending = [j for j in self._queue if j.status == 'pending']
+            pending = [j for j in self._queue if j.status == "pending"]
             take = pending[: self.max_batch_size]
             for j in take:
-                j.status = 'running'
+                j.status = "running"
             return take
 
     def find(self, job_id: str) -> Optional[ExperimentJob]:
@@ -317,7 +383,7 @@ class ExperimentQueue:
 
     def position_in_queue(self, job_id: str) -> int:
         with self._lock:
-            pending_ids = [j.job_id for j in self._queue if j.status == 'pending']
+            pending_ids = [j.job_id for j in self._queue if j.status == "pending"]
             try:
                 idx = pending_ids.index(job_id)
                 return idx + 1
@@ -334,7 +400,7 @@ app = Flask(__name__)
 app.config.update(
     SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='Lax'
+    SESSION_COOKIE_SAMESITE="Lax",
 )
 
 # Global runtime objects (populated in main)
@@ -381,9 +447,9 @@ def to_torch(x: np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.T
 
 
 def get_model_dtype(cfg_dtype: str) -> torch.dtype:
-    if cfg_dtype == 'float32':
+    if cfg_dtype == "float32":
         return torch.float32
-    if cfg_dtype == 'bfloat16':
+    if cfg_dtype == "bfloat16":
         return torch.bfloat16
     return torch.float32
 
@@ -391,6 +457,7 @@ def get_model_dtype(cfg_dtype: str) -> torch.dtype:
 # --------------------------
 # Background worker
 # --------------------------
+
 
 def worker_loop():
     global MODEL
@@ -408,22 +475,43 @@ def worker_loop():
             B = len(batch)
 
             init_x = np.repeat(BEST.initial_context, repeats=B, axis=0)  # (B,L,N)
-            init_stim = BEST.stim_context if BEST.stim_context is not None else np.zeros((1, L, MODEL.d_stimuli), dtype=np.float32)
+            init_stim = (
+                BEST.stim_context
+                if BEST.stim_context is not None
+                else np.zeros((1, L, MODEL.d_stimuli), dtype=np.float32)
+            )
             init_stim = np.repeat(init_stim, repeats=B, axis=0)
             neuron_mask = BEST.neuron_mask[0].astype(bool)
             # Build future stimulus per job
             future_stim_list: List[np.ndarray] = []
             requested_steps: List[int] = []
             # Prepare shared tensors
-            ids_np = BEST.neuron_ids if BEST.neuron_ids is not None else np.arange(N, dtype=np.int64)[None, :]
-            ids_np = np.repeat(ids_np[None, ...] if ids_np.ndim == 1 else ids_np, repeats=B, axis=0) if ids_np.ndim == 1 else np.repeat(ids_np, repeats=B, axis=0)
-            lam_np = BEST.log_activity_mean if BEST.log_activity_mean is not None else None
-            las_np = BEST.log_activity_std if BEST.log_activity_std is not None else None
+            ids_np = (
+                BEST.neuron_ids
+                if BEST.neuron_ids is not None
+                else np.arange(N, dtype=np.int64)[None, :]
+            )
+            ids_np = (
+                np.repeat(
+                    ids_np[None, ...] if ids_np.ndim == 1 else ids_np, repeats=B, axis=0
+                )
+                if ids_np.ndim == 1
+                else np.repeat(ids_np, repeats=B, axis=0)
+            )
+            lam_np = (
+                BEST.log_activity_mean if BEST.log_activity_mean is not None else None
+            )
+            las_np = (
+                BEST.log_activity_std if BEST.log_activity_std is not None else None
+            )
 
             for b_idx, job in enumerate(batch):
                 # Gather indices from selected regions
                 if job.neuron_indices:
-                    region_indices = np.array([int(i) for i in job.neuron_indices if 0 <= int(i) < N], dtype=np.int64)
+                    region_indices = np.array(
+                        [int(i) for i in job.neuron_indices if 0 <= int(i) < N],
+                        dtype=np.int64,
+                    )
                     if region_indices.size > 0:
                         region_indices = region_indices[neuron_mask[region_indices]]
                 else:
@@ -433,23 +521,34 @@ def worker_loop():
                 delta = float(job.add_rate_hz)
 
                 if region_indices.size > 0 and delta > 0.0:
-                    init_x[b_idx, -1, region_indices] = init_x[b_idx, -1, region_indices] + delta
+                    init_x[b_idx, -1, region_indices] = (
+                        init_x[b_idx, -1, region_indices] + delta
+                    )
 
                 if CFG.data.clip_01_before_ar:
                     init_x[b_idx] = np.clip(init_x[b_idx], 0.0, 1.0)
 
                 n_steps = int(job.ar_steps)
                 requested_steps.append(n_steps)
-                if BEST.stim_future is not None and BEST.stim_future.shape[1] >= n_steps:
-                    future_stim_list.append(BEST.stim_future[:, :n_steps, :][0])  # (n_steps, K)
+                if (
+                    BEST.stim_future is not None
+                    and BEST.stim_future.shape[1] >= n_steps
+                ):
+                    future_stim_list.append(
+                        BEST.stim_future[:, :n_steps, :][0]
+                    )  # (n_steps, K)
                 elif BEST.stim_future is not None and BEST.stim_future.shape[1] > 0:
                     pad_len = n_steps - BEST.stim_future.shape[1]
                     K = BEST.stim_future.shape[2]
                     pad = np.zeros((pad_len, K), dtype=np.float32)
-                    future_stim_list.append(np.concatenate([BEST.stim_future[0], pad], axis=0))
+                    future_stim_list.append(
+                        np.concatenate([BEST.stim_future[0], pad], axis=0)
+                    )
                 else:
                     # No stimulus available; zeros
-                    future_stim_list.append(np.zeros((n_steps, MODEL.d_stimuli), dtype=np.float32))
+                    future_stim_list.append(
+                        np.zeros((n_steps, MODEL.d_stimuli), dtype=np.float32)
+                    )
 
             # Determine the maximum steps to run in one AR call; run per distinct n_steps groups to avoid masking
             steps_to_jobs: Dict[int, List[int]] = {}
@@ -459,32 +558,62 @@ def worker_loop():
             results_per_job: Dict[int, np.ndarray] = {}
             for n_steps, job_indices in steps_to_jobs.items():
                 # Run exactly like eval for each job independently
-                max_context_len = int(BEST.training_lm1) if isinstance(BEST.training_lm1, int) and BEST.training_lm1 > 0 else int(BEST.context_len)
+                max_context_len = (
+                    int(BEST.training_lm1)
+                    if isinstance(BEST.training_lm1, int) and BEST.training_lm1 > 0
+                    else int(BEST.context_len)
+                )
                 for job_index in job_indices:
-                    init_context = torch.from_numpy(init_x[job_index:job_index+1]).to(device=DEVICE, dtype=torch.float32)  # (1,L,N)
-                    stim_ctx_j = torch.from_numpy(init_stim[job_index:job_index+1]).to(device=DEVICE, dtype=torch.float32)  # (1,L,K)
-                    fut_stim_j = torch.from_numpy(future_stim_list[job_index][None, ...]).to(device=DEVICE, dtype=torch.float32)
-                    stim_full_j = torch.cat([stim_ctx_j, fut_stim_j], dim=1)  # (1, L+n_steps, K)
-                    pos_j = to_torch(BEST.positions_norm[0:1], device=DEVICE, dtype=dtype)  # (1,N,3)
+                    init_context = torch.from_numpy(
+                        init_x[job_index : job_index + 1]
+                    ).to(device=DEVICE, dtype=torch.float32)  # (1,L,N)
+                    stim_ctx_j = torch.from_numpy(
+                        init_stim[job_index : job_index + 1]
+                    ).to(device=DEVICE, dtype=torch.float32)  # (1,L,K)
+                    fut_stim_j = torch.from_numpy(
+                        future_stim_list[job_index][None, ...]
+                    ).to(device=DEVICE, dtype=torch.float32)
+                    stim_full_j = torch.cat(
+                        [stim_ctx_j, fut_stim_j], dim=1
+                    )  # (1, L+n_steps, K)
+                    pos_j = to_torch(
+                        BEST.positions_norm[0:1], device=DEVICE, dtype=dtype
+                    )  # (1,N,3)
                     mask_j = torch.from_numpy(BEST.neuron_mask[0:1]).to(device=DEVICE)
-                    ids_j = torch.from_numpy(ids_np[job_index:job_index+1]).to(device=DEVICE, dtype=torch.long)
+                    ids_j = torch.from_numpy(ids_np[job_index : job_index + 1]).to(
+                        device=DEVICE, dtype=torch.long
+                    )
                     if lam_np is None:
                         lam_j = None
                     else:
                         lam_arr = lam_np if lam_np.ndim == 2 else lam_np[None, ...]
-                        lam_j = torch.from_numpy(lam_arr).to(device=DEVICE, dtype=torch.float32)
+                        lam_j = torch.from_numpy(lam_arr).to(
+                            device=DEVICE, dtype=torch.float32
+                        )
                     if las_np is None:
                         las_j = None
                     else:
                         las_arr = las_np if las_np.ndim == 2 else las_np[None, ...]
-                        las_j = torch.from_numpy(las_arr).to(device=DEVICE, dtype=torch.float32)
+                        las_j = torch.from_numpy(las_arr).to(
+                            device=DEVICE, dtype=torch.float32
+                        )
                     pred_rates, _ctx_counts, _pred_counts = eval_ar_rollout(
-                        MODEL, init_context, stim_full_j, pos_j, mask_j, ids_j,
+                        MODEL,
+                        init_context,
+                        stim_full_j,
+                        pos_j,
+                        mask_j,
+                        ids_j,
                         lam_j if lam_j is not None else None,
                         las_j if las_j is not None else None,
-                        DEVICE, n_steps, sampling_rate_hz, max_context_len
+                        DEVICE,
+                        n_steps,
+                        sampling_rate_hz,
+                        max_context_len,
                     )
-                    results_per_job[job_index] = pred_rates.detach().cpu().numpy().astype(np.float32)
+                    results_per_job[job_index] = (
+                        pred_rates.detach().cpu().numpy().astype(np.float32)
+                    )
 
             # Persist outputs per job
             for j_idx, job in enumerate(batch):
@@ -492,24 +621,39 @@ def worker_loop():
                     gen_future = results_per_job[j_idx]  # (n_steps, N)
                     job.result_frames = gen_future
                     # Save NPZ: make directory unique with timestamp + job_id (never inside experiment dir)
-                    out_dir = os.path.join(CFG.storage.output_root, f"{time.strftime('%Y%m%d_%H%M%S')}_{job.job_id}")
+                    out_dir = os.path.join(
+                        CFG.storage.output_root,
+                        f"{time.strftime('%Y%m%d_%H%M%S')}_{job.job_id}",
+                    )
                     os.makedirs(out_dir, exist_ok=True)
-                    npz_path = os.path.join(out_dir, f'{job.job_id}.npz')
+                    npz_path = os.path.join(out_dir, f"{job.job_id}.npz")
                     np.savez_compressed(
                         npz_path,
                         initial_context=BEST.initial_context[0],
                         generated_future=gen_future,
-                        baseline_future=(BASELINE_FUTURE if BASELINE_FUTURE is not None else (BEST.pred_future[0] if BEST.pred_future is not None else np.zeros((0, BEST.initial_context.shape[2]), dtype=np.float32))),
+                        baseline_future=(
+                            BASELINE_FUTURE
+                            if BASELINE_FUTURE is not None
+                            else (
+                                BEST.pred_future[0]
+                                if BEST.pred_future is not None
+                                else np.zeros(
+                                    (0, BEST.initial_context.shape[2]), dtype=np.float32
+                                )
+                            )
+                        ),
                         positions=BEST.positions_norm[0],
                         neuron_mask=BEST.neuron_mask[0],
                         selected_neurons=np.array(job.neuron_indices, dtype=np.int32),
                         add_rate_hz=np.array([job.add_rate_hz], dtype=np.float32),
-                        sampling_rate_hz=np.array([CFG.data.sampling_rate_hz], dtype=np.float32),
+                        sampling_rate_hz=np.array(
+                            [CFG.data.sampling_rate_hz], dtype=np.float32
+                        ),
                     )
                     job.result_npz_path = npz_path
-                    job.status = 'complete'
+                    job.status = "complete"
                 except Exception as e:
-                    job.status = 'error'
+                    job.status = "error"
                     job.error = str(e)
             # Periodic cleanup after processing a batch job
             try:
@@ -519,7 +663,7 @@ def worker_loop():
         except Exception as e:
             # Mark all as error
             for job in batch:
-                job.status = 'error'
+                job.status = "error"
                 job.error = str(e)
 
 
@@ -527,9 +671,11 @@ def worker_loop():
 # Flask routes
 # --------------------------
 
-@app.route('/')
+
+@app.route("/")
 def index():
     import time as _time
+
     ts = int(_time.time())
     html_template = """
 <!DOCTYPE html>
@@ -1289,15 +1435,27 @@ def index():
 </body>
 </html>
 """
-    ts_key_render = None if getattr(CFG.server, 'disable_verification', False) else (getattr(CFG.server, 'turnstile_site_key', '') or None)
-    response = make_response(render_template_string(html_template, ts=ts, ar_default=int(CFG.ar.default_ar_steps), fps=float(CFG.data.sampling_rate_hz), ts_key=ts_key_render))
-    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '0'
+    ts_key_render = (
+        None
+        if getattr(CFG.server, "disable_verification", False)
+        else (getattr(CFG.server, "turnstile_site_key", "") or None)
+    )
+    response = make_response(
+        render_template_string(
+            html_template,
+            ts=ts,
+            ar_default=int(CFG.ar.default_ar_steps),
+            fps=float(CFG.data.sampling_rate_hz),
+            ts_key=ts_key_render,
+        )
+    )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     return response
 
 
-@app.route('/api/init_data')
+@app.route("/api/init_data")
 def api_init_data():
     # Prepare a small subset of initial frames for default playback (loop full context)
     L = int(BEST.initial_context.shape[1])
@@ -1305,84 +1463,94 @@ def api_init_data():
     frames = BEST.initial_context[0].tolist()  # list of L lists of length N
     # Hard-coded anisotropic scaling: X = 2*Y, Z = (2/3)*Y, normalized so X spans ~300
     pos = BEST.positions_norm[0]
-    ratio = np.array([2.0, 1.0, 2.0/3.0], dtype=np.float32)
+    ratio = np.array([2.0, 1.0, 2.0 / 3.0], dtype=np.float32)
     scale = 300.0 / ratio[0]
     pos_scaled = (pos * ratio * scale).astype(np.float32).tolist()
-    return jsonify({
-        'initial_frames': frames,
-        'positions': pos_scaled,
-        'neuron_mask': BEST.neuron_mask[0].astype(bool).tolist(),
-        'context_len': int(BEST.context_len),
-        'num_neurons': N,
-        'fps': float(CFG.data.sampling_rate_hz)
-    })
+    return jsonify(
+        {
+            "initial_frames": frames,
+            "positions": pos_scaled,
+            "neuron_mask": BEST.neuron_mask[0].astype(bool).tolist(),
+            "context_len": int(BEST.context_len),
+            "num_neurons": N,
+            "fps": float(CFG.data.sampling_rate_hz),
+        }
+    )
 
 
-@app.route('/api/submit', methods=['POST'])
+@app.route("/api/submit", methods=["POST"])
 def api_submit():
     body = request.get_json(force=True)
     # Input structure validation
     if not isinstance(body, dict):
-        return jsonify({'error': 'invalid_json'}), 400
-    neuron_indices = body.get('neuron_indices')
-    add_rate_hz_raw = body.get('add_rate_hz')
-    ar_steps_raw = body.get('ar_steps')
+        return jsonify({"error": "invalid_json"}), 400
+    neuron_indices = body.get("neuron_indices")
+    add_rate_hz_raw = body.get("add_rate_hz")
+    ar_steps_raw = body.get("ar_steps")
     if neuron_indices is None:
         neuron_indices = []
     if not isinstance(neuron_indices, list):
-        return jsonify({'error': 'invalid_neuron_indices'}), 400
+        return jsonify({"error": "invalid_neuron_indices"}), 400
     if any((not isinstance(r, (int, float))) for r in neuron_indices):
-        return jsonify({'error': 'invalid_neuron_indices_types'}), 400
+        return jsonify({"error": "invalid_neuron_indices_types"}), 400
     try:
         add_rate_hz = float(add_rate_hz_raw)
     except Exception:
-        return jsonify({'error': 'invalid_add_rate_hz'}), 400
+        return jsonify({"error": "invalid_add_rate_hz"}), 400
     try:
-        ar_steps = int(ar_steps_raw if ar_steps_raw is not None else CFG.ar.default_ar_steps)
+        ar_steps = int(
+            ar_steps_raw if ar_steps_raw is not None else CFG.ar.default_ar_steps
+        )
     except Exception:
-        return jsonify({'error': 'invalid_ar_steps'}), 400
+        return jsonify({"error": "invalid_ar_steps"}), 400
     # Hard caps
     if add_rate_hz < 0.0:
-        return jsonify({'error': 'invalid_add_rate_range'}), 400
+        return jsonify({"error": "invalid_add_rate_range"}), 400
     MAX_AR_STEPS = 128
     if ar_steps < 1 or ar_steps > MAX_AR_STEPS:
-        return jsonify({'error': f'ar_steps_out_of_range_max_{MAX_AR_STEPS}'}), 400
+        return jsonify({"error": f"ar_steps_out_of_range_max_{MAX_AR_STEPS}"}), 400
     if len(neuron_indices) > 200000:
-        return jsonify({'error': 'too_many_neurons'}), 400
+        return jsonify({"error": "too_many_neurons"}), 400
     # Turnstile verification (can be disabled by config/flag)
-    if not getattr(CFG.server, 'disable_verification', False):
-        ts_secret = os.environ.get('TURNSTILE_SECRET', '').strip()
-        ts_site = getattr(CFG.server, 'turnstile_site_key', '')
-        cf_token = body.get('cf_turnstile_token')
+    if not getattr(CFG.server, "disable_verification", False):
+        ts_secret = os.environ.get("TURNSTILE_SECRET", "").strip()
+        ts_site = getattr(CFG.server, "turnstile_site_key", "")
+        cf_token = body.get("cf_turnstile_token")
         if not ts_secret or not ts_site:
-            return jsonify({'error': 'verification_not_configured'}), 503
+            return jsonify({"error": "verification_not_configured"}), 503
         if not cf_token:
-            return jsonify({'error': 'verification_required'}), 403
+            return jsonify({"error": "verification_required"}), 403
         try:
-            v = requests.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', data={
-                'secret': ts_secret,
-                'response': cf_token,
-                'remoteip': request.remote_addr
-            }, timeout=5)
+            v = requests.post(
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                data={
+                    "secret": ts_secret,
+                    "response": cf_token,
+                    "remoteip": request.remote_addr,
+                },
+                timeout=5,
+            )
             v.raise_for_status()
             vj = v.json()
-            if not vj.get('success'):
-                return jsonify({'error': 'verification_failed'}), 403
+            if not vj.get("success"):
+                return jsonify({"error": "verification_failed"}), 403
         except Exception:
-            return jsonify({'error': 'verification_error'}), 403
+            return jsonify({"error": "verification_error"}), 403
 
     # One job at a time per session
-    sid = session.get('sid')
+    sid = session.get("sid")
     if not sid:
         sid = str(uuid.uuid4())
-        session['sid'] = sid
+        session["sid"] = sid
 
     with RUNTIME_LOCK:
         existing_id = SESSION_TO_JOB.get(sid)
         if existing_id:
             job = QUEUE_OBJ.find(existing_id)
-            if job and job.status in ('pending', 'running'):
-                return jsonify({'error': 'You already have a running/pending experiment'}), 400
+            if job and job.status in ("pending", "running"):
+                return jsonify(
+                    {"error": "You already have a running/pending experiment"}
+                ), 400
 
     job_id = str(uuid.uuid4())
     job = ExperimentJob(
@@ -1395,49 +1563,49 @@ def api_submit():
     pos = QUEUE_OBJ.enqueue(job)
     with RUNTIME_LOCK:
         SESSION_TO_JOB[sid] = job_id
-    return jsonify({'job_id': job_id, 'position': pos})
+    return jsonify({"job_id": job_id, "position": pos})
 
 
-@app.route('/api/status')
+@app.route("/api/status")
 def api_status():
-    sid = session.get('sid')
+    sid = session.get("sid")
     if not sid or sid not in SESSION_TO_JOB:
-        return jsonify({'status': 'idle'})
+        return jsonify({"status": "idle"})
     job_id = SESSION_TO_JOB[sid]
     job = QUEUE_OBJ.find(job_id)
     if not job:
-        return jsonify({'status': 'idle'})
-    if job.status == 'pending':
+        return jsonify({"status": "idle"})
+    if job.status == "pending":
         pos = QUEUE_OBJ.position_in_queue(job_id)
-        return jsonify({'job_id': job_id, 'status': job.status, 'position': pos})
-    if job.status == 'running':
-        return jsonify({'job_id': job_id, 'status': job.status})
-    if job.status == 'complete':
-        return jsonify({'job_id': job_id, 'status': job.status})
-    return jsonify({'job_id': job_id, 'status': job.status, 'error': job.error})
+        return jsonify({"job_id": job_id, "status": job.status, "position": pos})
+    if job.status == "running":
+        return jsonify({"job_id": job_id, "status": job.status})
+    if job.status == "complete":
+        return jsonify({"job_id": job_id, "status": job.status})
+    return jsonify({"job_id": job_id, "status": job.status, "error": job.error})
 
-@app.route('/api/result_frames/<job_id>')
+
+@app.route("/api/result_frames/<job_id>")
 def api_result_frames(job_id: str):
     job = QUEUE_OBJ.find(job_id)
-    if not job or job.status != 'complete' or job.result_frames is None:
-        return jsonify({'error': 'Not available'}), 404
-    return jsonify({'generated_frames': job.result_frames.tolist()})
+    if not job or job.status != "complete" or job.result_frames is None:
+        return jsonify({"error": "Not available"}), 404
+    return jsonify({"generated_frames": job.result_frames.tolist()})
 
 
-@app.route('/api/download/<job_id>')
+@app.route("/api/download/<job_id>")
 def api_download_npz(job_id: str):
     job = QUEUE_OBJ.find(job_id)
     if not job or not job.result_npz_path:
-        return jsonify({'error': 'Not available'}), 404
+        return jsonify({"error": "Not available"}), 404
     # Path safety: ensure file exists and is under the configured output root
     full_path = os.path.realpath(job.result_npz_path)
     root_real = os.path.realpath(CFG.storage.output_root)
     if not full_path.startswith(root_real + os.sep) and full_path != root_real:
-        return jsonify({'error': 'invalid_path'}), 400
+        return jsonify({"error": "invalid_path"}), 400
     if not os.path.exists(full_path):
-        return jsonify({'error': 'missing_file'}), 404
+        return jsonify({"error": "missing_file"}), 404
     return send_file(full_path, as_attachment=True)
-
 
     # Heatmap and region-surface endpoints removed
 
@@ -1446,12 +1614,24 @@ def api_download_npz(job_id: str):
 # Main
 # --------------------------
 
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Zebrafish Brain In-Silico Experiment Platform Web UI')
-    parser.add_argument('--config', required=False, help='Path to YAML config')
-    parser.add_argument('--ar_h5', required=False, help='Path to eval_gbm2_ar per-AR H5 (overrides data.ar_h5 in config)')
-    parser.add_argument('--no_verification', action='store_true', help='Disable verification (turnstile) regardless of config')
+
+    parser = argparse.ArgumentParser(
+        description="Zebrafish Brain In-Silico Experiment Platform Web UI"
+    )
+    parser.add_argument("--config", required=False, help="Path to YAML config")
+    parser.add_argument(
+        "--ar_h5",
+        required=False,
+        help="Path to eval_gbm2_ar per-AR H5 (overrides data.ar_h5 in config)",
+    )
+    parser.add_argument(
+        "--no_verification",
+        action="store_true",
+        help="Disable verification (turnstile) regardless of config",
+    )
     args = parser.parse_args()
 
     global CFG, DEVICE, MODEL, BEST, MASK, REGION_TO_NEURON, QUEUE_OBJ, BASELINE_FUTURE
@@ -1463,11 +1643,13 @@ def main():
         assert args.ar_h5, "--ar_h5 is required when no --config is provided"
         CFG = AppConfig(
             server=ServerConfig(),
-            data=DataConfig(ar_h5=args.ar_h5, sampling_rate_hz=3.0, clip_01_before_ar=True),
+            data=DataConfig(
+                ar_h5=args.ar_h5, sampling_rate_hz=3.0, clip_01_before_ar=True
+            ),
             model=ModelConfig(),
             ar=ARConfig(),
             ui=UIConfig(),
-            storage=StorageConfig()
+            storage=StorageConfig(),
         )
     if args.ar_h5:
         CFG.data.ar_h5 = args.ar_h5
@@ -1479,15 +1661,17 @@ def main():
 
     # Device and dtype
     use_gpu = CFG.model.use_gpu and torch.cuda.is_available()
-    DEVICE = torch.device('cuda' if use_gpu else 'cpu')
+    DEVICE = torch.device("cuda" if use_gpu else "cpu")
 
     # Load AR run H5 and experiment config/ckpt derived from it
-    assert CFG.data.ar_h5 and os.path.exists(CFG.data.ar_h5), f"data.ar_h5 not found: {CFG.data.ar_h5}"
+    assert CFG.data.ar_h5 and os.path.exists(CFG.data.ar_h5), (
+        f"data.ar_h5 not found: {CFG.data.ar_h5}"
+    )
     BEST = load_ar_run_h5(CFG.data.ar_h5)
     # Sync sampling rate with AR H5 attribute to match eval behavior exactly
     try:
-        with h5py.File(CFG.data.ar_h5, 'r') as _hf:
-            _sr = _hf.attrs.get('sampling_rate_hz', None)
+        with h5py.File(CFG.data.ar_h5, "r") as _hf:
+            _sr = _hf.attrs.get("sampling_rate_hz", None)
             if _sr is not None:
                 CFG.data.sampling_rate_hz = float(_sr)
     except Exception:
@@ -1507,8 +1691,8 @@ def main():
     assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}"
     # Build model using experiment config and robust state load
     MODEL = load_model_from_experiment(exp_dir, DEVICE, d_stimuli=d_stimuli)
-    if DEVICE.type == 'cuda':
-        if CFG.model.dtype == 'bfloat16':
+    if DEVICE.type == "cuda":
+        if CFG.model.dtype == "bfloat16":
             MODEL = MODEL.to(dtype=torch.bfloat16)
         else:
             MODEL = MODEL.to(dtype=torch.float32)
@@ -1519,7 +1703,11 @@ def main():
         MASK = load_mask_h5(CFG.data.mask_h5)
         REGION_TO_NEURON = map_neurons_to_regions(BEST.positions_norm, MASK)
     else:
-        MASK = MaskData(label_volume=np.zeros((1,1,1), dtype=np.int32), region_names=[], grid_shape=(1,1,1))
+        MASK = MaskData(
+            label_volume=np.zeros((1, 1, 1), dtype=np.int32),
+            region_names=[],
+            grid_shape=(1, 1, 1),
+        )
         REGION_TO_NEURON = {}
 
     # Ensure output root
@@ -1527,19 +1715,23 @@ def main():
 
     # Baseline for heatmap/NPZ outputs (optional). Prefer NPZ if provided; else use AR H5 future truth.
     BASELINE_FUTURE = None
-    base_npz = (getattr(CFG.data, 'baseline_npz', '') or '').strip()
+    base_npz = (getattr(CFG.data, "baseline_npz", "") or "").strip()
     if base_npz and os.path.exists(base_npz):
         data_npz = np.load(base_npz)
-        assert 'baseline_future' in data_npz, f"Baseline NPZ missing key 'baseline_future': {base_npz}"
-        bf = data_npz['baseline_future']
-        assert isinstance(bf, np.ndarray) and bf.ndim == 2, f"Baseline 'baseline_future' must be 2D (T,N). Got shape: {getattr(bf, 'shape', None)}"
+        assert "baseline_future" in data_npz, (
+            f"Baseline NPZ missing key 'baseline_future': {base_npz}"
+        )
+        bf = data_npz["baseline_future"]
+        assert isinstance(bf, np.ndarray) and bf.ndim == 2, (
+            f"Baseline 'baseline_future' must be 2D (T,N). Got shape: {getattr(bf, 'shape', None)}"
+        )
         BASELINE_FUTURE = bf.astype(np.float32)
     else:
         try:
             # Use future truth from AR run as baseline if available
-            with h5py.File(CFG.data.ar_h5, 'r') as f:
-                if 'future_truth_rates' in f:
-                    BASELINE_FUTURE = f['future_truth_rates'][()].astype(np.float32)
+            with h5py.File(CFG.data.ar_h5, "r") as f:
+                if "future_truth_rates" in f:
+                    BASELINE_FUTURE = f["future_truth_rates"][()].astype(np.float32)
         except Exception:
             BASELINE_FUTURE = None
 
@@ -1552,5 +1744,5 @@ def main():
     app.run(host=CFG.server.host, port=int(CFG.server.port), debug=CFG.server.debug)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

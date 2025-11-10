@@ -9,8 +9,8 @@ from .mlp import MLP, FFN
 from .rms import RMSNorm
 
 __all__ = [
-    'GBM',
-    'SparseSpikeFullAttention',
-    'NeuronCausalAttention',
-    'SpatioTemporalNeuralAttention',
+    "GBM",
+    "SparseSpikeFullAttention",
+    "NeuronCausalAttention",
+    "SpatioTemporalNeuralAttention",
 ]

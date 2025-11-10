@@ -4,14 +4,23 @@ import torch
 from GenerativeBrainModel.models.gbm import GBM
 
 
-def _build_model(d_model=32, d_stimuli=4, n_heads=4, n_layers=2, device="cpu", dtype=torch.float32):
-    model = GBM(d_model=d_model, d_stimuli=d_stimuli, n_heads=n_heads, n_layers=n_layers)
+def _build_model(
+    d_model=32, d_stimuli=4, n_heads=4, n_layers=2, device="cpu", dtype=torch.float32
+):
+    model = GBM(
+        d_model=d_model, d_stimuli=d_stimuli, n_heads=n_heads, n_layers=n_layers
+    )
     return model.to(device=device, dtype=dtype)
 
 
-def _fake_batch(batch_size=2, seq_len=5, n_neurons=7, d_stimuli=4, device="cpu", dtype=torch.float32):
+def _fake_batch(
+    batch_size=2, seq_len=5, n_neurons=7, d_stimuli=4, device="cpu", dtype=torch.float32
+):
     torch.manual_seed(42)
-    spikes = torch.rand(batch_size, seq_len, n_neurons, device=device, dtype=torch.float32) + 0.05
+    spikes = (
+        torch.rand(batch_size, seq_len, n_neurons, device=device, dtype=torch.float32)
+        + 0.05
+    )
     positions = torch.randn(batch_size, n_neurons, 3, device=device, dtype=dtype)
     stim = torch.randn(batch_size, seq_len, d_stimuli, device=device, dtype=dtype)
     mask = torch.ones(batch_size, n_neurons, device=device, dtype=dtype)
@@ -21,7 +30,9 @@ def _fake_batch(batch_size=2, seq_len=5, n_neurons=7, d_stimuli=4, device="cpu",
 @pytest.fixture(scope="module")
 def require_cuda():
     if not torch.cuda.is_available():
-        pytest.skip("GBM attention stack relies on FlashAttention; CUDA required for test")
+        pytest.skip(
+            "GBM attention stack relies on FlashAttention; CUDA required for test"
+        )
     return "cuda"
 
 
@@ -32,7 +43,9 @@ def test_forward_returns_log_params(dtype, require_cuda):
     model.eval()
     spikes, stim, positions, mask = _fake_batch(dtype=dtype, device=device)
 
-    mu, log_sigma, eta, log_delta = model(spikes, stim, positions, mask, get_logits=True)
+    mu, log_sigma, eta, log_delta = model(
+        spikes, stim, positions, mask, get_logits=True
+    )
     assert mu.shape == (spikes.shape[0], spikes.shape[1], spikes.shape[2])
     assert log_sigma.shape == mu.shape
     assert eta.shape == mu.shape
@@ -68,9 +81,15 @@ def test_autoregress_extends_sequence(require_cuda):
 
     n_steps = 3
     context_len = 4
-    future = stim[:, context_len:context_len + n_steps, :]
+    future = stim[:, context_len : context_len + n_steps, :]
     if future.shape[1] < n_steps:
-        pad = torch.zeros(future.shape[0], n_steps - future.shape[1], future.shape[2], device=device, dtype=stim.dtype)
+        pad = torch.zeros(
+            future.shape[0],
+            n_steps - future.shape[1],
+            future.shape[2],
+            device=device,
+            dtype=stim.dtype,
+        )
         future = torch.cat([future, pad], dim=1)
 
     generated = model.autoregress(
@@ -94,10 +113,9 @@ def test_position_normalization_unit_rms():
     with torch.no_grad():
         centroid = positions.mean(dim=1, keepdim=True)
         pos_centered = positions - centroid
-        r2 = (pos_centered ** 2).sum(dim=2)
+        r2 = (pos_centered**2).sum(dim=2)
         scale = (r2.mean(dim=1, keepdim=True).clamp_min(1e-6).sqrt()).unsqueeze(-1)
         rel = pos_centered / scale
     assert torch.allclose(rel.mean(dim=1), torch.zeros_like(rel.mean(dim=1)), atol=1e-4)
-    rms = torch.sqrt(((rel ** 2).sum(dim=2).mean(dim=1)))
+    rms = torch.sqrt(((rel**2).sum(dim=2).mean(dim=1)))
     assert torch.allclose(rms, torch.ones_like(rms), atol=1e-4)
-

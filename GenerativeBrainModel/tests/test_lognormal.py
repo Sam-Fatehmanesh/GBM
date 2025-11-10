@@ -43,6 +43,3 @@ def test_sas_nll_backprop():
     assert log_sigma.grad is not None and torch.isfinite(log_sigma.grad).all()
     assert eta.grad is not None and torch.isfinite(eta.grad).all()
     assert log_delta.grad is not None and torch.isfinite(log_delta.grad).all()
-
-
-

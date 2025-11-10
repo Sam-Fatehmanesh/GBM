@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 from GenerativeBrainModel.models.rms import RMSNorm
 
+
 class MLP(nn.Module):
     def __init__(self, layers_num, input_size, hidden_size, output_size):
         super(MLP, self).__init__()
@@ -18,7 +19,7 @@ class MLP(nn.Module):
                 nn.GELU(),
             )
             self.hidden_layers.append(layer)
-    
+
         self.output_layer = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
@@ -27,7 +28,7 @@ class MLP(nn.Module):
         x = self.input_norm(x)
         x = self.input_activation(x)
         residual = x
-        
+
         # Hidden layers with residual connections
         for layer in self.hidden_layers:
             x = layer(x)
@@ -38,15 +39,16 @@ class MLP(nn.Module):
 
         return x
 
+
 class FFN(nn.Module):
     def __init__(self, d_model, d_ff):
         super(FFN, self).__init__()
-        self.linear_1 = nn.Linear(d_model, d_ff, bias=False)        
+        self.linear_1 = nn.Linear(d_model, d_ff, bias=False)
         self.linear_2 = nn.Linear(d_model, d_ff, bias=False)
         self.act = nn.SiLU()
         self.linear_3 = nn.Linear(d_ff, d_model, bias=False)
         self.norm = RMSNorm(d_model)
-    
+
     def forward(self, x):
         res = x
         x = self.norm(x)

@@ -31,12 +31,12 @@ from GenerativeBrainModel.dataloaders.neural_dataloader import _max_neurons_in_f
 
 
 def setup_experiment_dirs(base_dir: Path, name: str) -> Dict[str, Path]:
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     exp_dir = base_dir / f"{name}_{ts}"
-    logs_dir = exp_dir / 'logs'
+    logs_dir = exp_dir / "logs"
     for p in [exp_dir, logs_dir]:
         p.mkdir(parents=True, exist_ok=True)
-    return {'exp': exp_dir, 'logs': logs_dir}
+    return {"exp": exp_dir, "logs": logs_dir}
 
 
 def _trim_nonzero_rows(spikes_ds: np.ndarray) -> Tuple[int, int]:
@@ -44,6 +44,7 @@ def _trim_nonzero_rows(spikes_ds: np.ndarray) -> Tuple[int, int]:
     Mirrors the logic in `NeuralDataset._build_sequence_index` to match behavior.
     """
     T_total = spikes_ds.shape[0]
+
     def _first_nonzero_row(arr: np.ndarray, a: int, b: int, chunk: int = 256) -> int:
         i = a
         eps = 0.0
@@ -55,6 +56,7 @@ def _trim_nonzero_rows(spikes_ds: np.ndarray) -> Tuple[int, int]:
                 return i + int(np.argmax(nz))
             i = j
         return b
+
     def _last_nonzero_row(arr: np.ndarray, a: int, b: int, chunk: int = 256) -> int:
         i = b
         eps = 0.0
@@ -66,6 +68,7 @@ def _trim_nonzero_rows(spikes_ds: np.ndarray) -> Tuple[int, int]:
                 return j + (len(nz) - 1 - int(np.argmax(nz[::-1])))
             i = j
         return a - 1
+
     nz_start = _first_nonzero_row(spikes_ds, 0, T_total)
     nz_last = _last_nonzero_row(spikes_ds, 0, T_total)
     if nz_start >= T_total or nz_last < nz_start:
@@ -73,7 +76,9 @@ def _trim_nonzero_rows(spikes_ds: np.ndarray) -> Tuple[int, int]:
     return nz_start, nz_last + 1
 
 
-def load_all_subject_timepoints(data_dir: Path) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+def load_all_subject_timepoints(
+    data_dir: Path,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """Load all subjects' timepoints into a single matrix (sum_T, max_N).
 
     Returns (X, subject_labels, subjects) where:
@@ -81,7 +86,7 @@ def load_all_subject_timepoints(data_dir: Path) -> Tuple[np.ndarray, np.ndarray,
     - subject_labels: int32 array of length sum_T_kept with subject index
     - subjects: list of subject names in label order
     """
-    files = sorted([str(f) for f in data_dir.glob('*.h5')])
+    files = sorted([str(f) for f in data_dir.glob("*.h5")])
     if not files:
         raise ValueError(f"No H5 files found in {data_dir}")
 
@@ -100,13 +105,13 @@ def load_all_subject_timepoints(data_dir: Path) -> Tuple[np.ndarray, np.ndarray,
     total_rows = 0
     kept_rows_per_file: Dict[str, Tuple[int, int]] = {}
     for fp in files:
-        with h5py.File(fp, 'r') as f:
-            ds = f['spike_probabilities']  # (T, N)
+        with h5py.File(fp, "r") as f:
+            ds = f["spike_probabilities"]  # (T, N)
             # Load into memory for trimming
             arr = ds[()].astype(np.float32)
             start, end = _trim_nonzero_rows(arr)
             if end > start:
-                total_rows += (end - start)
+                total_rows += end - start
                 kept_rows_per_file[fp] = (start, end)
             else:
                 kept_rows_per_file[fp] = (0, 0)
@@ -121,11 +126,11 @@ def load_all_subject_timepoints(data_dir: Path) -> Tuple[np.ndarray, np.ndarray,
         start, end = kept_rows_per_file[fp]
         if end <= start:
             continue
-        with h5py.File(fp, 'r') as f:
-            arr = f['spike_probabilities'][start:end].astype(np.float32)  # (Tk, N)
+        with h5py.File(fp, "r") as f:
+            arr = f["spike_probabilities"][start:end].astype(np.float32)  # (Tk, N)
         Tk, N = arr.shape
-        X[cursor:cursor+Tk, :N] = arr
-        y[cursor:cursor+Tk] = file_to_subject[fp]
+        X[cursor : cursor + Tk, :N] = arr
+        y[cursor : cursor + Tk] = file_to_subject[fp]
         cursor += Tk
 
     return X, y, subjects
@@ -139,14 +144,18 @@ def _resample_1d_series(series: np.ndarray, new_len: int) -> np.ndarray:
     if old_len == new_len:
         return series.astype(np.float32, copy=False)
     if old_len <= 1:
-        return np.full((new_len,), float(series[0] if old_len == 1 else 0.0), dtype=np.float32)
+        return np.full(
+            (new_len,), float(series[0] if old_len == 1 else 0.0), dtype=np.float32
+        )
     x_old = np.linspace(0.0, 1.0, num=old_len, dtype=np.float64)
     x_new = np.linspace(0.0, 1.0, num=new_len, dtype=np.float64)
     out = np.interp(x_new, x_old, series.astype(np.float64))
     return out.astype(np.float32)
 
 
-def load_all_subject_behavior_timepoints(data_dir: Path, subjects: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+def load_all_subject_behavior_timepoints(
+    data_dir: Path, subjects: List[str]
+) -> Tuple[np.ndarray, np.ndarray]:
     """Load all subjects' behavior into a matrix (sum_T_kept, B).
 
     For each file:
@@ -159,7 +168,7 @@ def load_all_subject_behavior_timepoints(data_dir: Path, subjects: List[str]) ->
       - Xb: float32 array of shape (sum_T_kept, B)
       - y:  int32 subject labels aligned to rows
     """
-    files = sorted([str(f) for f in data_dir.glob('*.h5')])
+    files = sorted([str(f) for f in data_dir.glob("*.h5")])
     if not files:
         raise ValueError(f"No H5 files found in {data_dir}")
 
@@ -174,18 +183,18 @@ def load_all_subject_behavior_timepoints(data_dir: Path, subjects: List[str]) ->
         if stem not in subj_to_idx:
             # Skip files not present in provided subjects mapping
             continue
-        with h5py.File(fp, 'r') as f:
-            if 'spike_probabilities' not in f:
+        with h5py.File(fp, "r") as f:
+            if "spike_probabilities" not in f:
                 continue
-            spikes = f['spike_probabilities'][()].astype(np.float32)
+            spikes = f["spike_probabilities"][()].astype(np.float32)
             T, _ = spikes.shape
             start, end = _trim_nonzero_rows(spikes)
             if end <= start:
                 continue
-            if 'behavior_full' not in f:
+            if "behavior_full" not in f:
                 # Skip subjects without behavior
                 continue
-            beh = f['behavior_full'][()]
+            beh = f["behavior_full"][()]
             # Normalize shape to (B, Tb)
             if beh.ndim == 2:
                 if beh.shape[0] <= beh.shape[1]:
@@ -228,12 +237,16 @@ def load_all_subject_behavior_timepoints(data_dir: Path, subjects: List[str]) ->
             for b in range(B):
                 beh_resampled[b] = _resample_1d_series(beh_bt[b], T)
             # Safety: clean any residual NaNs/infs post-resampling
-            beh_resampled = np.nan_to_num(beh_resampled, nan=0.0, posinf=0.0, neginf=0.0)
+            beh_resampled = np.nan_to_num(
+                beh_resampled, nan=0.0, posinf=0.0, neginf=0.0
+            )
 
             # Slice to [start, end)
             beh_slice = beh_resampled[:, start:end].T  # (Tk, B)
             X_rows.append(beh_slice)
-            y_rows.append(np.full((beh_slice.shape[0],), subj_to_idx[stem], dtype=np.int32))
+            y_rows.append(
+                np.full((beh_slice.shape[0],), subj_to_idx[stem], dtype=np.int32)
+            )
 
     if not X_rows:
         raise ValueError("No behavior data found to embed.")
@@ -246,30 +259,68 @@ def load_all_subject_behavior_timepoints(data_dir: Path, subjects: List[str]) ->
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='PCA/UMAP embeddings for entire processed dataset')
-    parser.add_argument('--data_dir', type=str, default='processed_spike_voxels_2018', help='Directory with subject_*.h5 files')
-    parser.add_argument('--output_dir', type=str, default='experiments/dataset_embeddings', help='Where to save outputs')
-    parser.add_argument('--random_state', type=int, default=42)
+    parser = argparse.ArgumentParser(
+        description="PCA/UMAP embeddings for entire processed dataset"
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="processed_spike_voxels_2018",
+        help="Directory with subject_*.h5 files",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="experiments/dataset_embeddings",
+        help="Where to save outputs",
+    )
+    parser.add_argument("--random_state", type=int, default=42)
     # Parametric UMAP controls (torch-based)
-    parser.add_argument('--umap_n_neighbors', type=int, default=30)
-    parser.add_argument('--umap_min_dist', type=float, default=0.1)
-    parser.add_argument('--umap_subsample_frac', type=float, default=0.10, help='Fraction of rows to fit UMAP on')
-    parser.add_argument('--umap_max_train_samples', type=int, default=100000, help='Cap on rows used to fit UMAP')
-    parser.add_argument('--umap_epochs', type=int, default=10)
-    parser.add_argument('--umap_batch_size', type=int, default=2048)
-    parser.add_argument('--umap_lr', type=float, default=1e-3)
-    parser.add_argument('--umap_use_gpu', action='store_true', help='Use GPU for UMAP if available')
-    parser.add_argument('--umap_num_workers', type=int, default=1)
-    parser.add_argument('--behavior_metric', type=str, default='cosine', choices=['euclidean','cosine','manhattan'], help='Distance metric for behavior UMAP')
+    parser.add_argument("--umap_n_neighbors", type=int, default=30)
+    parser.add_argument("--umap_min_dist", type=float, default=0.1)
+    parser.add_argument(
+        "--umap_subsample_frac",
+        type=float,
+        default=0.10,
+        help="Fraction of rows to fit UMAP on",
+    )
+    parser.add_argument(
+        "--umap_max_train_samples",
+        type=int,
+        default=100000,
+        help="Cap on rows used to fit UMAP",
+    )
+    parser.add_argument("--umap_epochs", type=int, default=10)
+    parser.add_argument("--umap_batch_size", type=int, default=2048)
+    parser.add_argument("--umap_lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--umap_use_gpu", action="store_true", help="Use GPU for UMAP if available"
+    )
+    parser.add_argument("--umap_num_workers", type=int, default=1)
+    parser.add_argument(
+        "--behavior_metric",
+        type=str,
+        default="cosine",
+        choices=["euclidean", "cosine", "manhattan"],
+        help="Distance metric for behavior UMAP",
+    )
     # Which embeddings to run
-    parser.add_argument('--skip_neural', action='store_true', help='Skip neural embeddings')
-    parser.add_argument('--do_behavior', action='store_true', help='Also compute behavior embeddings')
+    parser.add_argument(
+        "--skip_neural", action="store_true", help="Skip neural embeddings"
+    )
+    parser.add_argument(
+        "--do_behavior", action="store_true", help="Also compute behavior embeddings"
+    )
     # Coloring option for neural embeddings
-    parser.add_argument('--color_by_behavior_magnitude', action='store_true', help='Color neural PCA/UMAP by per-timepoint magnitude of standardized behavior (L2 across channels) instead of by subject')
+    parser.add_argument(
+        "--color_by_behavior_magnitude",
+        action="store_true",
+        help="Color neural PCA/UMAP by per-timepoint magnitude of standardized behavior (L2 across channels) instead of by subject",
+    )
     args = parser.parse_args()
 
     base_dir = Path(args.output_dir)
-    dirs = setup_experiment_dirs(base_dir, 'full_dataset_embeddings')
+    dirs = setup_experiment_dirs(base_dir, "full_dataset_embeddings")
 
     data_dir = Path(args.data_dir)
     print(f"Loading all timepoints from: {data_dir}")
@@ -282,91 +333,144 @@ def main() -> None:
         print(f"Loaded neural matrix shape: {X.shape}; subjects: {len(subjects)}")
     elif args.do_behavior:
         # Behavior-only path: just enumerate subjects without loading neural matrix
-        files = sorted([str(f) for f in data_dir.glob('*.h5')])
+        files = sorted([str(f) for f in data_dir.glob("*.h5")])
         subjects = [Path(fp).stem for fp in files]
         print(f"Enumerated subjects for behavior-only embeddings: {len(subjects)}")
 
     # Optionally pre-load behavior and compute standardized magnitude aligned to neural rows
     beh_mag = None  # type: ignore[assignment]
-    Xb_std = None   # type: ignore[assignment]
-    yb = None       # type: ignore[assignment]
-    mu_b = None     # type: ignore[assignment]
+    Xb_std = None  # type: ignore[assignment]
+    yb = None  # type: ignore[assignment]
+    mu_b = None  # type: ignore[assignment]
     std_b_safe = None  # type: ignore[assignment]
-    if (not args.skip_neural) and (args.color_by_behavior_magnitude or args.do_behavior):
-        print("Loading and aligning behavior time series across subjects for coloring/embeddings…")
+    if (not args.skip_neural) and (
+        args.color_by_behavior_magnitude or args.do_behavior
+    ):
+        print(
+            "Loading and aligning behavior time series across subjects for coloring/embeddings…"
+        )
         Xb, yb = load_all_subject_behavior_timepoints(data_dir, subjects)
         # Standardize behavior features globally (z-score), guard zero-std
         mu_b = Xb.mean(axis=0, dtype=np.float64)
         std_b = Xb.std(axis=0, dtype=np.float64)
         std_b_safe = np.where(std_b < 1e-8, 1.0, std_b)
-        Xb_std = ((Xb - mu_b.astype(np.float32)) / std_b_safe.astype(np.float32)).astype(np.float32)
+        Xb_std = (
+            (Xb - mu_b.astype(np.float32)) / std_b_safe.astype(np.float32)
+        ).astype(np.float32)
         if args.color_by_behavior_magnitude:
             # L2 norm across standardized behavior channels per timepoint
             beh_mag = np.sqrt((Xb_std.astype(np.float32) ** 2).sum(axis=1))
 
     # PCA 2D (compute, plot, save H5) BEFORE UMAP for NEURAL
     from sklearn.decomposition import PCA
+
     if not args.skip_neural:
         pca = PCA(n_components=2, random_state=args.random_state)
         pca_2d = pca.fit_transform(X)
+
     # Plot helpers
-    def plot_scatter(points: np.ndarray, labels: np.ndarray, title: str, out_path: Path) -> None:
+    def plot_scatter(
+        points: np.ndarray, labels: np.ndarray, title: str, out_path: Path
+    ) -> None:
         plt.figure(figsize=(9, 5))
-        cmap = plt.get_cmap('tab20')
+        cmap = plt.get_cmap("tab20")
         num_classes = len(subjects)
         for idx, subj in enumerate(subjects):
-            sel = (labels == idx)
+            sel = labels == idx
             color = cmap(idx % cmap.N)
-            plt.scatter(points[sel, 0], points[sel, 1], s=1.0, alpha=0.6, marker='.', label=subj, color=color)
+            plt.scatter(
+                points[sel, 0],
+                points[sel, 1],
+                s=1.0,
+                alpha=0.6,
+                marker=".",
+                label=subj,
+                color=color,
+            )
         plt.title(title)
-        plt.legend(markerscale=6, fontsize='small', ncol=2, frameon=False)
+        plt.legend(markerscale=6, fontsize="small", ncol=2, frameon=False)
         plt.tight_layout()
-        plt.savefig(out_path, dpi=120, bbox_inches='tight')
+        plt.savefig(out_path, dpi=120, bbox_inches="tight")
         plt.close()
-    def plot_scatter_continuous(points: np.ndarray, values: np.ndarray, title: str, out_path: Path, cmap_name: str = 'viridis', log_scale: bool = False) -> None:
+
+    def plot_scatter_continuous(
+        points: np.ndarray,
+        values: np.ndarray,
+        title: str,
+        out_path: Path,
+        cmap_name: str = "viridis",
+        log_scale: bool = False,
+    ) -> None:
         plt.figure(figsize=(9, 5))
         norm = None
         if log_scale:
             eps = 1e-6
-            vmin = float(max(eps, np.min(values[values > 0]) if np.any(values > 0) else eps))
+            vmin = float(
+                max(eps, np.min(values[values > 0]) if np.any(values > 0) else eps)
+            )
             vmax = float(max(vmin * (1.0 + 1e-6), np.max(values) + eps))
             norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
         sc = plt.scatter(
-            points[:, 0], points[:, 1], c=values, s=1.0, alpha=0.7, marker='.',
-            cmap=plt.get_cmap(cmap_name), norm=norm
+            points[:, 0],
+            points[:, 1],
+            c=values,
+            s=1.0,
+            alpha=0.7,
+            marker=".",
+            cmap=plt.get_cmap(cmap_name),
+            norm=norm,
         )
         plt.title(title)
         cbar = plt.colorbar(sc, fraction=0.046, pad=0.04)
-        cbar.set_label('Behavior magnitude (L2, standardized' + (', log scale' if log_scale else '') + ')')
+        cbar.set_label(
+            "Behavior magnitude (L2, standardized"
+            + (", log scale" if log_scale else "")
+            + ")"
+        )
         plt.tight_layout()
-        plt.savefig(out_path, dpi=120, bbox_inches='tight')
+        plt.savefig(out_path, dpi=120, bbox_inches="tight")
         plt.close()
 
     if not args.skip_neural:
         if args.color_by_behavior_magnitude and beh_mag is not None:
             plot_scatter_continuous(
-                pca_2d, beh_mag,
-                'PCA (2D) - entire dataset (colored by behavior magnitude, log scale)',
-                dirs['logs'] / 'pca_behavior_magnitude.png',
-                log_scale=True
+                pca_2d,
+                beh_mag,
+                "PCA (2D) - entire dataset (colored by behavior magnitude, log scale)",
+                dirs["logs"] / "pca_behavior_magnitude.png",
+                log_scale=True,
             )
         else:
-            plot_scatter(pca_2d, y, 'PCA (2D) - entire dataset', dirs['logs'] / 'pca_subjects.png')
+            plot_scatter(
+                pca_2d,
+                y,
+                "PCA (2D) - entire dataset",
+                dirs["logs"] / "pca_subjects.png",
+            )
         # Save PCA to H5
-        with h5py.File(dirs['logs'] / 'pca_embeddings.h5', 'w') as f:
-            f.create_dataset('embedding', data=pca_2d, compression='gzip', compression_opts=1)
-            f.create_dataset('subject_labels', data=y.astype(np.int32), compression='gzip', compression_opts=1)
-            str_dt = h5py.string_dtype(encoding='utf-8')
-            f.create_dataset('subjects', data=np.array(subjects, dtype=object), dtype=str_dt)
+        with h5py.File(dirs["logs"] / "pca_embeddings.h5", "w") as f:
+            f.create_dataset(
+                "embedding", data=pca_2d, compression="gzip", compression_opts=1
+            )
+            f.create_dataset(
+                "subject_labels",
+                data=y.astype(np.int32),
+                compression="gzip",
+                compression_opts=1,
+            )
+            str_dt = h5py.string_dtype(encoding="utf-8")
+            f.create_dataset(
+                "subjects", data=np.array(subjects, dtype=object), dtype=str_dt
+            )
             if args.color_by_behavior_magnitude and beh_mag is not None:
-                f.create_dataset('behavior_magnitude', data=beh_mag.astype(np.float32))
+                f.create_dataset("behavior_magnitude", data=beh_mag.astype(np.float32))
 
     # Prepare RNG for any UMAP section
     rng = np.random.default_rng(args.random_state)
     # Import parametric UMAP if needed for neural and/or behavior
     if (not args.skip_neural) or args.do_behavior:
         # Compatibility shim: some versions of umap-pytorch call np.product; alias to np.prod if missing
-        if not hasattr(np, 'product'):
+        if not hasattr(np, "product"):
             try:
                 np.product = np.prod  # type: ignore[attr-defined]
             except Exception:
@@ -376,9 +480,17 @@ def main() -> None:
             from umap_pytorch import PUMAP
         except Exception as e:
             raise RuntimeError(
-                'Parametric UMAP requires the umap-pytorch package. Install with: pip install umap-pytorch'
+                "Parametric UMAP requires the umap-pytorch package. Install with: pip install umap-pytorch"
             ) from e
-        num_gpus = 1 if (args.umap_use_gpu and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 0
+        num_gpus = (
+            1
+            if (
+                args.umap_use_gpu
+                and hasattr(torch, "cuda")
+                and torch.cuda.is_available()
+            )
+            else 0
+        )
 
     # UMAP 2D (Parametric, torch) - fit on 10% uniform subset, then transform full dataset (NEURAL)
     if not args.skip_neural:
@@ -405,7 +517,9 @@ def main() -> None:
     )
 
     if not args.skip_neural:
-        print(f"Fitting parametric UMAP on subset: {n_train}/{n_total} rows (frac={n_train/n_total:.3f})")
+        print(
+            f"Fitting parametric UMAP on subset: {n_train}/{n_total} rows (frac={n_train / n_total:.3f})"
+        )
         pumap.fit(X_subset)
 
         # Transform full dataset in batches to control memory
@@ -417,7 +531,7 @@ def main() -> None:
                 end = min(N, start + bs)
                 chunk = torch.from_numpy(X[start:end])
                 emb = pumap.transform(chunk)
-                if hasattr(emb, 'detach'):
+                if hasattr(emb, "detach"):
                     emb = emb.detach().cpu().numpy()
                 else:
                     emb = np.asarray(emb)
@@ -426,50 +540,90 @@ def main() -> None:
         # Plot and save
         if args.color_by_behavior_magnitude and beh_mag is not None:
             plot_scatter_continuous(
-                umap_full, beh_mag,
-                'UMAP (2D, parametric) - entire dataset (colored by behavior magnitude, log scale)',
-                dirs['logs'] / 'umap_behavior_magnitude.png',
-                log_scale=True
+                umap_full,
+                beh_mag,
+                "UMAP (2D, parametric) - entire dataset (colored by behavior magnitude, log scale)",
+                dirs["logs"] / "umap_behavior_magnitude.png",
+                log_scale=True,
             )
         else:
-            plot_scatter(umap_full, y, 'UMAP (2D, parametric) - entire dataset', dirs['logs'] / 'umap_subjects.png')
-        with h5py.File(dirs['logs'] / 'umap_embeddings.h5', 'w') as f:
-            f.create_dataset('embedding', data=umap_full, compression='gzip', compression_opts=1)
-            f.create_dataset('subject_labels', data=y.astype(np.int32), compression='gzip', compression_opts=1)
-            str_dt = h5py.string_dtype(encoding='utf-8')
-            f.create_dataset('subjects', data=np.array(subjects, dtype=object), dtype=str_dt)
+            plot_scatter(
+                umap_full,
+                y,
+                "UMAP (2D, parametric) - entire dataset",
+                dirs["logs"] / "umap_subjects.png",
+            )
+        with h5py.File(dirs["logs"] / "umap_embeddings.h5", "w") as f:
+            f.create_dataset(
+                "embedding", data=umap_full, compression="gzip", compression_opts=1
+            )
+            f.create_dataset(
+                "subject_labels",
+                data=y.astype(np.int32),
+                compression="gzip",
+                compression_opts=1,
+            )
+            str_dt = h5py.string_dtype(encoding="utf-8")
+            f.create_dataset(
+                "subjects", data=np.array(subjects, dtype=object), dtype=str_dt
+            )
             # Save subset indices used for training for reproducibility
-            f.create_dataset('train_subset_indices', data=subset_idx.astype(np.int64))
+            f.create_dataset("train_subset_indices", data=subset_idx.astype(np.int64))
             if args.color_by_behavior_magnitude and beh_mag is not None:
-                f.create_dataset('behavior_magnitude', data=beh_mag.astype(np.float32))
+                f.create_dataset("behavior_magnitude", data=beh_mag.astype(np.float32))
 
     # Behavior embeddings if requested
     if args.do_behavior:
         if Xb_std is None or yb is None or mu_b is None or std_b_safe is None:
             print("Loading and aligning behavior time series across subjects…")
             Xb, yb = load_all_subject_behavior_timepoints(data_dir, subjects)
-            print(f"Loaded behavior matrix shape: {Xb.shape} (features=behavior channels)")
+            print(
+                f"Loaded behavior matrix shape: {Xb.shape} (features=behavior channels)"
+            )
             # Standardize behavior features globally (z-score), guard zero-std
             mu_b = Xb.mean(axis=0, dtype=np.float64)
             std_b = Xb.std(axis=0, dtype=np.float64)
             std_b_safe = np.where(std_b < 1e-8, 1.0, std_b)
-            Xb_std = ((Xb - mu_b.astype(np.float32)) / std_b_safe.astype(np.float32)).astype(np.float32)
+            Xb_std = (
+                (Xb - mu_b.astype(np.float32)) / std_b_safe.astype(np.float32)
+            ).astype(np.float32)
         else:
-            print(f"Loaded behavior matrix (precomputed) shape: {Xb_std.shape} (features standardized)")
+            print(
+                f"Loaded behavior matrix (precomputed) shape: {Xb_std.shape} (features standardized)"
+            )
         # Add tiny jitter to break ties for highly repetitive rows
-        Xb_std = Xb_std + (1e-6 * np.random.default_rng(args.random_state).standard_normal(Xb_std.shape).astype(np.float32))
+        Xb_std = Xb_std + (
+            1e-6
+            * np.random.default_rng(args.random_state)
+            .standard_normal(Xb_std.shape)
+            .astype(np.float32)
+        )
 
         # PCA on behavior
         pca_b = PCA(n_components=2, random_state=args.random_state)
         pca_b_2d = pca_b.fit_transform(Xb_std)
-        plot_scatter(pca_b_2d, yb, 'PCA (2D) - behavior (entire dataset)', dirs['logs'] / 'pca_behavior_subjects.png')
-        with h5py.File(dirs['logs'] / 'pca_behavior_embeddings.h5', 'w') as f:
-            f.create_dataset('embedding', data=pca_b_2d, compression='gzip', compression_opts=1)
-            f.create_dataset('subject_labels', data=yb.astype(np.int32), compression='gzip', compression_opts=1)
-            str_dt = h5py.string_dtype(encoding='utf-8')
-            f.create_dataset('subjects', data=np.array(subjects, dtype=object), dtype=str_dt)
-            f.create_dataset('feature_mean', data=mu_b.astype(np.float32))
-            f.create_dataset('feature_std', data=std_b_safe.astype(np.float32))
+        plot_scatter(
+            pca_b_2d,
+            yb,
+            "PCA (2D) - behavior (entire dataset)",
+            dirs["logs"] / "pca_behavior_subjects.png",
+        )
+        with h5py.File(dirs["logs"] / "pca_behavior_embeddings.h5", "w") as f:
+            f.create_dataset(
+                "embedding", data=pca_b_2d, compression="gzip", compression_opts=1
+            )
+            f.create_dataset(
+                "subject_labels",
+                data=yb.astype(np.int32),
+                compression="gzip",
+                compression_opts=1,
+            )
+            str_dt = h5py.string_dtype(encoding="utf-8")
+            f.create_dataset(
+                "subjects", data=np.array(subjects, dtype=object), dtype=str_dt
+            )
+            f.create_dataset("feature_mean", data=mu_b.astype(np.float32))
+            f.create_dataset("feature_std", data=std_b_safe.astype(np.float32))
 
         # UMAP on behavior (parametric, fit on subset)
         n_total_b = Xb_std.shape[0]
@@ -493,7 +647,9 @@ def main() -> None:
             random_state=int(args.random_state),
             match_nonparametric_umap=False,
         )
-        print(f"Fitting parametric UMAP (behavior) on subset: {n_train_b}/{n_total_b} rows (frac={n_train_b/n_total_b:.3f})")
+        print(
+            f"Fitting parametric UMAP (behavior) on subset: {n_train_b}/{n_total_b} rows (frac={n_train_b / n_total_b:.3f})"
+        )
         pumap_b.fit(Xb_subset)
 
         Nb = Xb_std.shape[0]
@@ -504,26 +660,38 @@ def main() -> None:
                 end = min(Nb, start + bs_b)
                 chunk = torch.from_numpy(Xb_std[start:end])
                 emb = pumap_b.transform(chunk)
-                if hasattr(emb, 'detach'):
+                if hasattr(emb, "detach"):
                     emb = emb.detach().cpu().numpy()
                 else:
                     emb = np.asarray(emb)
                 umap_b_full[start:end] = emb.astype(np.float32)
 
-        plot_scatter(umap_b_full, yb, 'UMAP (2D, parametric) - behavior (entire dataset)', dirs['logs'] / 'umap_behavior_subjects.png')
-        with h5py.File(dirs['logs'] / 'umap_behavior_embeddings.h5', 'w') as f:
-            f.create_dataset('embedding', data=umap_b_full, compression='gzip', compression_opts=1)
-            f.create_dataset('subject_labels', data=yb.astype(np.int32), compression='gzip', compression_opts=1)
-            str_dt = h5py.string_dtype(encoding='utf-8')
-            f.create_dataset('subjects', data=np.array(subjects, dtype=object), dtype=str_dt)
-            f.create_dataset('train_subset_indices', data=subset_idx_b.astype(np.int64))
-            f.create_dataset('feature_mean', data=mu_b.astype(np.float32))
-            f.create_dataset('feature_std', data=std_b_safe.astype(np.float32))
+        plot_scatter(
+            umap_b_full,
+            yb,
+            "UMAP (2D, parametric) - behavior (entire dataset)",
+            dirs["logs"] / "umap_behavior_subjects.png",
+        )
+        with h5py.File(dirs["logs"] / "umap_behavior_embeddings.h5", "w") as f:
+            f.create_dataset(
+                "embedding", data=umap_b_full, compression="gzip", compression_opts=1
+            )
+            f.create_dataset(
+                "subject_labels",
+                data=yb.astype(np.int32),
+                compression="gzip",
+                compression_opts=1,
+            )
+            str_dt = h5py.string_dtype(encoding="utf-8")
+            f.create_dataset(
+                "subjects", data=np.array(subjects, dtype=object), dtype=str_dt
+            )
+            f.create_dataset("train_subset_indices", data=subset_idx_b.astype(np.int64))
+            f.create_dataset("feature_mean", data=mu_b.astype(np.float32))
+            f.create_dataset("feature_std", data=std_b_safe.astype(np.float32))
 
     print(f"Saved embeddings and plots under: {dirs['logs']}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
-

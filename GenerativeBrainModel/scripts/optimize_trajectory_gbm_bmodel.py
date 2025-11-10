@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # Reduce CUDA fragmentation early (must be set before first CUDA alloc)
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import h5py
 import numpy as np
@@ -61,36 +61,41 @@ from GenerativeBrainModel.models.bmodel import BModel
 
 def _read_sampling_rate_hz(f: h5py.File) -> float:
     for key in (
-        'final_sampling_rate', 'effective_sampling_rate', 'target_sampling_rate', 'original_sampling_rate'
+        "final_sampling_rate",
+        "effective_sampling_rate",
+        "target_sampling_rate",
+        "original_sampling_rate",
     ):
         if key in f.attrs:
             try:
                 return float(f.attrs[key])
             except Exception:
                 pass
-    if 'original_sampling_rate_hz' in f:
+    if "original_sampling_rate_hz" in f:
         try:
-            return float(f['original_sampling_rate_hz'][()])
+            return float(f["original_sampling_rate_hz"][()])
         except Exception:
             pass
-    if 'matlab_fpsec' in f.attrs:
+    if "matlab_fpsec" in f.attrs:
         try:
-            return float(f.attrs['matlab_fpsec'])
+            return float(f.attrs["matlab_fpsec"])
         except Exception:
             pass
-    return float('nan')
+    return float("nan")
 
 
-def load_context_from_subject(h5_path: Path, context_len: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+def load_context_from_subject(
+    h5_path: Path, context_len: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     """Load first context_len frames of spikes and stimulus (or zeros), plus positions/mask.
     Returns (spikes_ctx [1,L,N], stim_ctx [1,L,K], positions [1,N,3], mask [1,N], K)."""
-    with h5py.File(h5_path, 'r') as f:
-        spikes = f['spike_probabilities'][()].astype(np.float32)
+    with h5py.File(h5_path, "r") as f:
+        spikes = f["spike_probabilities"][()].astype(np.float32)
         T, N = spikes.shape
         L = min(context_len, T)
         spikes_ctx = spikes[:L]
-        if 'stimulus_full' in f:
-            stim_full = f['stimulus_full'][()].astype(np.float32)
+        if "stimulus_full" in f:
+            stim_full = f["stimulus_full"][()].astype(np.float32)
             # Normalize to (T, K)
             if stim_full.ndim == 2:
                 if stim_full.shape[0] == T:
@@ -107,7 +112,7 @@ def load_context_from_subject(h5_path: Path, context_len: int) -> Tuple[np.ndarr
             K = 1
             stim_TK = np.zeros((T, K), dtype=np.float32)
         stim_ctx = stim_TK[:L]
-        positions = f['cell_positions'][()].astype(np.float32)
+        positions = f["cell_positions"][()].astype(np.float32)
         if np.isnan(positions).any():
             positions = np.nan_to_num(positions)
         mask = np.ones((positions.shape[0],), dtype=np.float32)
@@ -120,60 +125,92 @@ def load_context_from_subject(h5_path: Path, context_len: int) -> Tuple[np.ndarr
         )
 
 
-def load_gbm_from_checkpoint(ckpt_path: Path, device: torch.device, spikes_are_rates: bool = False) -> GBM:
+def load_gbm_from_checkpoint(
+    ckpt_path: Path, device: torch.device, spikes_are_rates: bool = False
+) -> GBM:
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg_in_ckpt = state.get('config', {}) if isinstance(state, dict) else {}
-    model_cfg = cfg_in_ckpt.get('model', None) if isinstance(cfg_in_ckpt, dict) else None
-    sd_in = state['model'] if (isinstance(state, dict) and 'model' in state) else state
+    cfg_in_ckpt = state.get("config", {}) if isinstance(state, dict) else {}
+    model_cfg = (
+        cfg_in_ckpt.get("model", None) if isinstance(cfg_in_ckpt, dict) else None
+    )
+    sd_in = state["model"] if (isinstance(state, dict) and "model" in state) else state
 
     def _normalize_key(k: str) -> str:
         changed = True
         while changed:
             changed = False
-            if k.startswith('module.'):
-                k = k[len('module.'):]
+            if k.startswith("module."):
+                k = k[len("module.") :]
                 changed = True
-            if k.startswith('_orig_mod.'):
-                k = k[len('_orig_mod.'):]
+            if k.startswith("_orig_mod."):
+                k = k[len("_orig_mod.") :]
                 changed = True
         return k
 
-    sd = {_normalize_key(k): v for k, v in (sd_in.items() if isinstance(sd_in, dict) else sd_in)} if isinstance(sd_in, dict) else sd_in
+    sd = (
+        {
+            _normalize_key(k): v
+            for k, v in (sd_in.items() if isinstance(sd_in, dict) else sd_in)
+        }
+        if isinstance(sd_in, dict)
+        else sd_in
+    )
 
     def infer_config_from_state_dict(sdict: Dict[str, torch.Tensor]) -> Dict[str, int]:
         d_model = None
         for key, tensor in sdict.items():
-            if key.endswith('neuron_scalar_decoder_head.1.weight') and tensor.ndim == 2:
-                d_model = int(tensor.shape[1]); break
+            if key.endswith("neuron_scalar_decoder_head.1.weight") and tensor.ndim == 2:
+                d_model = int(tensor.shape[1])
+                break
         if d_model is None:
             for key, tensor in sdict.items():
-                if 'stimuli_encoder.0.weight' in key and tensor.ndim == 2:
-                    d_model = int(tensor.shape[0]); break
+                if "stimuli_encoder.0.weight" in key and tensor.ndim == 2:
+                    d_model = int(tensor.shape[0])
+                    break
         if d_model is None:
-            raise ValueError('Unable to infer d_model')
+            raise ValueError("Unable to infer d_model")
         d_stimuli = 1
         for key, tensor in sdict.items():
-            if 'stimuli_encoder.0.weight' in key and tensor.ndim == 2:
-                d_stimuli = int(tensor.shape[1]); break
+            if "stimuli_encoder.0.weight" in key and tensor.ndim == 2:
+                d_stimuli = int(tensor.shape[1])
+                break
         layer_indices = set()
         for k in sdict.keys():
-            if k.startswith('layers.'):
+            if k.startswith("layers."):
                 try:
-                    layer_indices.add(int(k.split('.')[1]))
+                    layer_indices.add(int(k.split(".")[1]))
                 except Exception:
                     pass
         n_layers = max(layer_indices) + 1 if layer_indices else 1
         n_heads = 8 if d_model % 8 == 0 else (4 if d_model % 4 == 0 else 2)
-        return {'d_model': d_model, 'd_stimuli': d_stimuli, 'n_layers': n_layers, 'n_heads': n_heads}
+        return {
+            "d_model": d_model,
+            "d_stimuli": d_stimuli,
+            "n_layers": n_layers,
+            "n_heads": n_heads,
+        }
 
-    if not isinstance(model_cfg, dict) or any(k not in model_cfg for k in ('d_model', 'n_heads', 'n_layers')) or model_cfg.get('d_stimuli') in (None, 0):
+    if (
+        not isinstance(model_cfg, dict)
+        or any(k not in model_cfg for k in ("d_model", "n_heads", "n_layers"))
+        or model_cfg.get("d_stimuli") in (None, 0)
+    ):
         cfg_inf = infer_config_from_state_dict(sd)
-        d_model, d_stimuli, n_layers, n_heads = cfg_inf['d_model'], cfg_inf['d_stimuli'], cfg_inf['n_layers'], cfg_inf['n_heads']
+        d_model, d_stimuli, n_layers, n_heads = (
+            cfg_inf["d_model"],
+            cfg_inf["d_stimuli"],
+            cfg_inf["n_layers"],
+            cfg_inf["n_heads"],
+        )
     else:
-        d_model = model_cfg['d_model']; d_stimuli = model_cfg.get('d_stimuli', 1)
-        n_layers = model_cfg['n_layers']; n_heads = model_cfg['n_heads']
+        d_model = model_cfg["d_model"]
+        d_stimuli = model_cfg.get("d_stimuli", 1)
+        n_layers = model_cfg["n_layers"]
+        n_heads = model_cfg["n_heads"]
 
-    model = GBM(d_model=d_model, d_stimuli=d_stimuli, n_heads=n_heads, n_layers=n_layers).to(device)
+    model = GBM(
+        d_model=d_model, d_stimuli=d_stimuli, n_heads=n_heads, n_layers=n_layers
+    ).to(device)
     try:
         model.spikes_are_rates = bool(spikes_are_rates)
     except Exception:
@@ -181,20 +218,25 @@ def load_gbm_from_checkpoint(ckpt_path: Path, device: torch.device, spikes_are_r
     # Pre-shape centroid buffers if present
     try:
         for k, v in list(sd.items()):
-            if not k.endswith('.centroids'):
+            if not k.endswith(".centroids"):
                 continue
-            module_path = k.rsplit('.', 1)[0]
+            module_path = k.rsplit(".", 1)[0]
             cur = model
-            for part in module_path.split('.'):
+            for part in module_path.split("."):
                 if hasattr(cur, part):
                     cur = getattr(cur, part)
                 else:
                     try:
                         cur = cur[int(part)]
                     except Exception:
-                        cur = None; break
-            if cur is not None and hasattr(cur, 'centroids'):
-                setattr(cur, 'centroids', v.detach().clone().to(device=next(model.parameters()).device))
+                        cur = None
+                        break
+            if cur is not None and hasattr(cur, "centroids"):
+                setattr(
+                    cur,
+                    "centroids",
+                    v.detach().clone().to(device=next(model.parameters()).device),
+                )
     except Exception:
         pass
     model.load_state_dict(sd, strict=False)
@@ -207,28 +249,29 @@ def list_dim_dirs(base_path: Path) -> List[int]:
     Accepts either the experiment dir or the checkpoints dir.
     """
     # If user passed the experiment root, look under 'checkpoints'
-    ckpt_root = base_path / 'checkpoints'
+    ckpt_root = base_path / "checkpoints"
     # If they passed the checkpoints directory directly, use it
-    if base_path.name == 'checkpoints' and base_path.is_dir():
+    if base_path.name == "checkpoints" and base_path.is_dir():
         ckpt_root = base_path
     out: List[int] = []
     if ckpt_root.exists():
         for p in ckpt_root.iterdir():
-            if p.is_dir() and p.name.startswith('dim_'):
+            if p.is_dir() and p.name.startswith("dim_"):
                 try:
-                    out.append(int(p.name.split('_', 1)[1]))
+                    out.append(int(p.name.split("_", 1)[1]))
                 except Exception:
                     pass
     return sorted(set(out))
 
 
 def last_epoch_checkpoint(dim_dir: Path) -> Optional[Path]:
-    epoch_files = list(dim_dir.glob('epoch_*.pth'))
-    best = dim_dir / 'best.pth'
+    epoch_files = list(dim_dir.glob("epoch_*.pth"))
+    best = dim_dir / "best.pth"
     last: Optional[Path] = None
     best_ep = -1
     for fp in epoch_files:
         import re
+
         m = re.search(r"epoch_(\d+)\.pth$", fp.name)
         if not m:
             continue
@@ -237,40 +280,62 @@ def last_epoch_checkpoint(dim_dir: Path) -> Optional[Path]:
         except Exception:
             continue
         if ep > best_ep:
-            best_ep = ep; last = fp
+            best_ep = ep
+            last = fp
     if last is None and best.exists():
         last = best
     return last
 
 
-def load_bmodels(train_dir: Path, device: torch.device, dims: List[int]) -> List[Tuple[int, BModel]]:
+def load_bmodels(
+    train_dir: Path, device: torch.device, dims: List[int]
+) -> List[Tuple[int, BModel]]:
     out: List[Tuple[int, BModel]] = []
     # Accept either experiment dir or its checkpoints dir
-    ckpt_root = train_dir / 'checkpoints'
-    if train_dir.name == 'checkpoints' and train_dir.is_dir():
+    ckpt_root = train_dir / "checkpoints"
+    if train_dir.name == "checkpoints" and train_dir.is_dir():
         ckpt_root = train_dir
     for d in dims:
-        ddir = ckpt_root / f'dim_{d}'
+        ddir = ckpt_root / f"dim_{d}"
         ck = last_epoch_checkpoint(ddir)
         if ck is None:
             continue
         state = torch.load(ck, map_location=device, weights_only=False)
-        sd_in = state['model'] if (isinstance(state, dict) and 'model' in state) else state
+        sd_in = (
+            state["model"] if (isinstance(state, dict) and "model" in state) else state
+        )
+
         def _normalize_key(k: str) -> str:
             changed = True
             while changed:
                 changed = False
-                if k.startswith('module.'):
-                    k = k[len('module.'):]; changed = True
-                if k.startswith('_orig_mod.'):
-                    k = k[len('_orig_mod.'):]; changed = True
+                if k.startswith("module."):
+                    k = k[len("module.") :]
+                    changed = True
+                if k.startswith("_orig_mod."):
+                    k = k[len("_orig_mod.") :]
+                    changed = True
             return k
-        sd = {_normalize_key(k): v for k, v in (sd_in.items() if isinstance(sd_in, dict) else sd_in)} if isinstance(sd_in, dict) else sd_in
+
+        sd = (
+            {
+                _normalize_key(k): v
+                for k, v in (sd_in.items() if isinstance(sd_in, dict) else sd_in)
+            }
+            if isinstance(sd_in, dict)
+            else sd_in
+        )
         model = BModel(d_behavior=1, d_max_neurons=0).to(device)
         try:
             model.load_state_dict(sd, strict=False)
         except Exception:
-            model.load_state_dict({k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in sd.items()}, strict=False)
+            model.load_state_dict(
+                {
+                    k: (v.cpu() if isinstance(v, torch.Tensor) else v)
+                    for k, v in sd.items()
+                },
+                strict=False,
+            )
         model.eval()
         # Freeze weights; we only optimize the activation deltas
         for p in model.parameters():
@@ -282,11 +347,19 @@ def load_bmodels(train_dir: Path, device: torch.device, dims: List[int]) -> List
             children = [p.name for p in ckpt_root.iterdir()]
         except Exception:
             children = []
-        raise RuntimeError(f'No BModel checkpoints loaded in {ckpt_root}. Found entries: {children}')
+        raise RuntimeError(
+            f"No BModel checkpoints loaded in {ckpt_root}. Found entries: {children}"
+        )
     return out
 
 
-def sliding_predict_bmodel(seq_BTN: torch.Tensor, positions_BN3: torch.Tensor, mask_BN: torch.Tensor, models: List[Tuple[int, BModel]], window_len: int = 6) -> torch.Tensor:
+def sliding_predict_bmodel(
+    seq_BTN: torch.Tensor,
+    positions_BN3: torch.Tensor,
+    mask_BN: torch.Tensor,
+    models: List[Tuple[int, BModel]],
+    window_len: int = 6,
+) -> torch.Tensor:
     """Predict behaviors per time step using rolling windows (reflect padding).
     Returns (T, K_use) on the same device as inputs and preserves autograd so
     gradients can flow to seq_BTN (for delta optimization).
@@ -300,13 +373,15 @@ def sliding_predict_bmodel(seq_BTN: torch.Tensor, positions_BN3: torch.Tensor, m
     msk = mask_BN[0:1]
     step_preds: List[torch.Tensor] = []
     for t in range(T):
-        win = x_pad[t:t + window_len]
+        win = x_pad[t : t + window_len]
         win_b = win.unsqueeze(0)  # (1, L, N)
         dim_out: List[torch.Tensor] = []
         for _, mdl in models:
             dtype_m = next(mdl.parameters()).dtype
             dim_out.append(
-                mdl(win_b.to(dtype=dtype_m), pos.to(dtype=dtype_m), msk, get_logits=True)
+                mdl(
+                    win_b.to(dtype=dtype_m), pos.to(dtype=dtype_m), msk, get_logits=True
+                )
                 .squeeze(1)
                 .squeeze(-1)
             )
@@ -315,7 +390,9 @@ def sliding_predict_bmodel(seq_BTN: torch.Tensor, positions_BN3: torch.Tensor, m
     return preds
 
 
-def build_swirl(T: int, base_radius: float = 0.2, turns: float = 1.5, growth: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
+def build_swirl(
+    T: int, base_radius: float = 0.2, turns: float = 1.5, growth: float = 0.5
+) -> Tuple[np.ndarray, np.ndarray]:
     """Construct a small 2D swirl (spiral) path of T steps.
     - base_radius: initial radius (small)
     - turns: number of rotations over T
@@ -332,10 +409,12 @@ def build_swirl(T: int, base_radius: float = 0.2, turns: float = 1.5, growth: fl
     return x, y
 
 
-def path_to_behaviors(x: np.ndarray, y: np.ndarray, speed_scale: float, turn_scale: float) -> np.ndarray:
+def path_to_behaviors(
+    x: np.ndarray, y: np.ndarray, speed_scale: float, turn_scale: float
+) -> np.ndarray:
     """Convert (x,y) path to 5-dim behavior targets per step; dims order:
-       [L, R, B, LU, RU] = [0,4,3,1,2].
-       Bilateral: forward speed (normed by speed_scale). Heading rate -> RU-LU via turn_scale.
+    [L, R, B, LU, RU] = [0,4,3,1,2].
+    Bilateral: forward speed (normed by speed_scale). Heading rate -> RU-LU via turn_scale.
     """
     T = x.shape[0]
     dx = np.diff(x, prepend=x[0]).astype(np.float32)
@@ -361,12 +440,20 @@ def path_to_behaviors(x: np.ndarray, y: np.ndarray, speed_scale: float, turn_sca
     out[:, 0] = L
     out[:, 4] = R
     out[:, 3] = B
-    out[:, 1] = np.clip(B + LU, 0.0, 1.0) - B  # LU contribution around B retained via difference
+    out[:, 1] = (
+        np.clip(B + LU, 0.0, 1.0) - B
+    )  # LU contribution around B retained via difference
     out[:, 2] = np.clip(B + RU, 0.0, 1.0) - B
     return out
 
 
-def integrate_trajectory(B: np.ndarray, LU: np.ndarray, RU: np.ndarray, dt: float, turn_scale_angle: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+def integrate_trajectory(
+    B: np.ndarray,
+    LU: np.ndarray,
+    RU: np.ndarray,
+    dt: float,
+    turn_scale_angle: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray]:
     T = B.shape[0]
     x = np.zeros((T,), dtype=np.float32)
     y = np.zeros((T,), dtype=np.float32)
@@ -380,32 +467,60 @@ def integrate_trajectory(B: np.ndarray, LU: np.ndarray, RU: np.ndarray, dt: floa
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Optimize GBM neural sequence to match a target 2D trajectory via BModel behaviors')
-    ap.add_argument('--data-dir', type=str, default='processed_spike_voxels_2018')
-    ap.add_argument('--subject', type=str, default='subject_14')
-    ap.add_argument('--gbm-checkpoint', type=str, required=True)
-    ap.add_argument('--bmodel-train-dir', type=str, required=True, help='Directory containing per-dim checkpoints in checkpoints/dim_*/')
-    ap.add_argument('--context-len', type=int, default=12)
-    ap.add_argument('--horizon', type=int, default=128)
-    ap.add_argument('--speed-scale', type=float, default=0.1, help='Divisor scaling for forward speed normalization')
-    ap.add_argument('--turn-scale', type=float, default=0.2, help='Divisor scaling for heading-rate normalization')
-    ap.add_argument('--l1-delta', type=float, default=0.0, help='L1 penalty weight on positive delta')
-    ap.add_argument('--steps', type=int, default=400, help='Optimization steps')
-    ap.add_argument('--lr', type=float, default=1e-1, help='Learning rate for delta optimizer')
+    ap = argparse.ArgumentParser(
+        description="Optimize GBM neural sequence to match a target 2D trajectory via BModel behaviors"
+    )
+    ap.add_argument("--data-dir", type=str, default="processed_spike_voxels_2018")
+    ap.add_argument("--subject", type=str, default="subject_14")
+    ap.add_argument("--gbm-checkpoint", type=str, required=True)
+    ap.add_argument(
+        "--bmodel-train-dir",
+        type=str,
+        required=True,
+        help="Directory containing per-dim checkpoints in checkpoints/dim_*/",
+    )
+    ap.add_argument("--context-len", type=int, default=12)
+    ap.add_argument("--horizon", type=int, default=128)
+    ap.add_argument(
+        "--speed-scale",
+        type=float,
+        default=0.1,
+        help="Divisor scaling for forward speed normalization",
+    )
+    ap.add_argument(
+        "--turn-scale",
+        type=float,
+        default=0.2,
+        help="Divisor scaling for heading-rate normalization",
+    )
+    ap.add_argument(
+        "--l1-delta",
+        type=float,
+        default=0.0,
+        help="L1 penalty weight on positive delta",
+    )
+    ap.add_argument("--steps", type=int, default=400, help="Optimization steps")
+    ap.add_argument(
+        "--lr", type=float, default=1e-1, help="Learning rate for delta optimizer"
+    )
     # Always use GPU + bf16 per request; will error if CUDA unavailable
-    ap.add_argument('--out-dir', type=str, default=None)
+    ap.add_argument("--out-dir", type=str, default=None)
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
-        raise RuntimeError('CUDA GPU is required for this script. Please run on a GPU machine.')
-    device = torch.device('cuda')
+        raise RuntimeError(
+            "CUDA GPU is required for this script. Please run on a GPU machine."
+        )
+    device = torch.device("cuda")
 
     # Allow Muon optimizer to run in single-process mode without initializing DDP
     try:
         import torch.distributed as dist
+
         if dist.is_available() and not dist.is_initialized():
             dist.get_world_size = lambda group=None: 1
             dist.get_rank = lambda group=None: 0
+
             def _fake_all_gather(tensor_list, tensor, group=None):
                 if tensor_list is None or len(tensor_list) == 0:
                     return
@@ -413,29 +528,40 @@ def main():
                     tensor_list[0].copy_(tensor)
                 else:
                     tensor_list[0].resize_(tensor.shape).copy_(tensor)
+
             dist.all_gather = _fake_all_gather
     except Exception:
         pass
 
     # Output dirs
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    base_out = Path(args.out_dir) if args.out_dir else Path('experiments/trajectory_optimization') / ts
-    logs_dir = base_out / 'logs'; data_dir_out = base_out / 'data'
-    for p in (base_out, logs_dir, data_dir_out): p.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_out = (
+        Path(args.out_dir)
+        if args.out_dir
+        else Path("experiments/trajectory_optimization") / ts
+    )
+    logs_dir = base_out / "logs"
+    data_dir_out = base_out / "data"
+    for p in (base_out, logs_dir, data_dir_out):
+        p.mkdir(parents=True, exist_ok=True)
 
     # Load context and metadata
     subj_h5 = Path(args.data_dir) / f"{args.subject}.h5"
-    spikes_ctx_np, stim_ctx_np, pos_np, mask_np, K_stim = load_context_from_subject(subj_h5, args.context_len)
-    dt_hz = float('nan')
+    spikes_ctx_np, stim_ctx_np, pos_np, mask_np, K_stim = load_context_from_subject(
+        subj_h5, args.context_len
+    )
+    dt_hz = float("nan")
     try:
-        with h5py.File(subj_h5, 'r') as f:
+        with h5py.File(subj_h5, "r") as f:
             sr = _read_sampling_rate_hz(f)
             dt_hz = (1.0 / sr) if (np.isfinite(sr) and sr > 0) else 1.0
     except Exception:
         dt_hz = 1.0
 
     # Load GBM
-    gbm = load_gbm_from_checkpoint(Path(args.gbm_checkpoint), device, spikes_are_rates=False)
+    gbm = load_gbm_from_checkpoint(
+        Path(args.gbm_checkpoint), device, spikes_are_rates=False
+    )
     gbm = gbm.to(dtype=torch.bfloat16)
     # Freeze GBM parameters; we only optimize delta on inputs
     for p in gbm.parameters():
@@ -446,29 +572,38 @@ def main():
     mask = torch.from_numpy(mask_np).to(device)  # keep as float/bool mask; used as !=0
 
     # Ensure stimulus feature width matches model.d_stimuli (pad/truncate)
-    dS = int(getattr(gbm, 'd_stimuli', K_stim or 1))
+    dS = int(getattr(gbm, "d_stimuli", K_stim or 1))
     # Pad/truncate context stimulus to dS
     L_ctx = stim_ctx.shape[1]
     stim_ctx_fixed = torch.zeros((1, L_ctx, dS), device=device, dtype=torch.bfloat16)
     copy_w = min(int(stim_ctx.shape[2]), dS)
     if copy_w > 0:
-        stim_ctx_fixed[:, :, :copy_w] = stim_ctx.to(dtype=stim_ctx_fixed.dtype)[:, :, :copy_w]
+        stim_ctx_fixed[:, :, :copy_w] = stim_ctx.to(dtype=stim_ctx_fixed.dtype)[
+            :, :, :copy_w
+        ]
     stim_ctx = stim_ctx_fixed
 
     # Future stimulus zeros with correct width
-    fut_stim = torch.zeros((1, int(args.horizon), dS), device=device, dtype=torch.bfloat16)
+    fut_stim = torch.zeros(
+        (1, int(args.horizon), dS), device=device, dtype=torch.bfloat16
+    )
 
     with torch.no_grad():
         full_seq = gbm.autoregress(
-            init_x=spikes_ctx, init_stimuli=stim_ctx, point_positions=pos, neuron_pad_mask=mask,
-            future_stimuli=fut_stim, n_steps=int(args.horizon), context_len=int(args.context_len)
+            init_x=spikes_ctx,
+            init_stimuli=stim_ctx,
+            point_positions=pos,
+            neuron_pad_mask=mask,
+            future_stimuli=fut_stim,
+            n_steps=int(args.horizon),
+            context_len=int(args.context_len),
         )  # (1, L+T, N)
-    gen_only = full_seq[:, -int(args.horizon):, :]  # (1,T,N), stays bf16 on CUDA
+    gen_only = full_seq[:, -int(args.horizon) :, :]  # (1,T,N), stays bf16 on CUDA
 
     # Load BModels per behavior dimension
     dims_all = list_dim_dirs(Path(args.bmodel_train_dir))
     if not dims_all:
-        raise RuntimeError('No BModel dim_* directories found')
+        raise RuntimeError("No BModel dim_* directories found")
     # Use first 5 dims if available
     dims_use = dims_all[:5]
     bmodels = load_bmodels(Path(args.bmodel_train_dir), device, dims_use)
@@ -476,62 +611,87 @@ def main():
     bmodels = [(d, m.to(dtype=torch.bfloat16)) for d, m in bmodels]
 
     # Build target behaviors from a small swirl path
-    x_tgt, y_tgt = build_swirl(int(args.horizon), base_radius=0.2, turns=1.5, growth=0.3)
-    beh_tgt = path_to_behaviors(x_tgt, y_tgt, speed_scale=float(args.speed_scale), turn_scale=float(args.turn_scale))  # (T,5)
+    x_tgt, y_tgt = build_swirl(
+        int(args.horizon), base_radius=0.2, turns=1.5, growth=0.3
+    )
+    beh_tgt = path_to_behaviors(
+        x_tgt,
+        y_tgt,
+        speed_scale=float(args.speed_scale),
+        turn_scale=float(args.turn_scale),
+    )  # (T,5)
 
     # Initial predictions from BModel on GBM output
     with torch.no_grad():
-        preds_init = sliding_predict_bmodel(gen_only, pos, mask, bmodels, window_len=6)  # (T, K_use)
+        preds_init = sliding_predict_bmodel(
+            gen_only, pos, mask, bmodels, window_len=6
+        )  # (T, K_use)
 
     # Optimize positive-only per-neuron, per-time delta
     B, T, N = gen_only.shape
     L = int(spikes_ctx.shape[1])
     # Keep optimization master param in fp32 for numerical stability; cast to bf16 only for model calls
     # Apply delta over the L-step pre-AR context (not the generated horizon)
-    delta_param = torch.zeros((L, N), device=device, dtype=torch.float32, requires_grad=True)
+    delta_param = torch.zeros(
+        (L, N), device=device, dtype=torch.float32, requires_grad=True
+    )
     # Use Muon optimizer (as in train_gbm.py). Requires `muon` to be installed.
     try:
         from muon import MuonWithAuxAdam
     except ImportError as e:
-        raise ImportError("Muon optimizer not found. Install: pip install git+https://github.com/KellerJordan/Muon") from e
+        raise ImportError(
+            "Muon optimizer not found. Install: pip install git+https://github.com/KellerJordan/Muon"
+        ) from e
     # Single param group using Muon (no AdamW fallback as requested)
-    opt = MuonWithAuxAdam([
-        dict(params=[delta_param], use_muon=True, lr=float(args.lr), weight_decay=0.0)
-    ])
+    opt = MuonWithAuxAdam(
+        [dict(params=[delta_param], use_muon=True, lr=float(args.lr), weight_decay=0.0)]
+    )
     l1_w = float(args.l1_delta)
     beh_tgt_t = torch.from_numpy(beh_tgt).to(device=device, dtype=torch.float32)
 
     def predict_with_delta(delta_LN: torch.Tensor) -> torch.Tensor:
         # Modify only the context spikes, then autoregress to produce horizon with stop-grad through time
-        delta_pos = F.softplus(delta_LN.to(dtype=torch.float32)) * mask[0].to(dtype=torch.float32)  # (L,N)
-        spikes_ctx_mod = torch.clamp(spikes_ctx[0].to(dtype=torch.float32) + delta_pos, 0.0, 1.0).to(dtype=torch.bfloat16).unsqueeze(0)
+        delta_pos = F.softplus(delta_LN.to(dtype=torch.float32)) * mask[0].to(
+            dtype=torch.float32
+        )  # (L,N)
+        spikes_ctx_mod = (
+            torch.clamp(spikes_ctx[0].to(dtype=torch.float32) + delta_pos, 0.0, 1.0)
+            .to(dtype=torch.bfloat16)
+            .unsqueeze(0)
+        )
         cur_x = spikes_ctx_mod  # (1, L, N)
         cur_stim = stim_ctx
         steps: List[torch.Tensor] = []
         T_h = int(args.horizon)
         L_ctx = int(args.context_len)
         # For small horizons, allow full BPTT (no detach) to improve learning signal
-        allow_full_bptt = (T_h <= max(24, L_ctx))
+        allow_full_bptt = T_h <= max(24, L_ctx)
         for i in range(T_h):
             ctx_x = cur_x[:, -L_ctx:, :]
             ctx_s = cur_stim[:, -L_ctx:, :]
+
             # Single-step forward with gradients w.r.t. ctx_x using checkpointing to save memory
             def _step(x_ctx, s_ctx):
                 return gbm.forward(x_ctx, s_ctx, pos, mask, get_logits=False)[:, -1:, :]
+
             try:
                 nxt = checkpoint(_step, ctx_x, ctx_s, use_reentrant=False)
             except TypeError:
                 nxt = checkpoint(_step, ctx_x, ctx_s)
             steps.append(nxt.squeeze(1))  # (1,N)
             # Detach only when horizon is large; for small horizons keep graph for stronger signal
-            cur_x = torch.cat([cur_x, (nxt if allow_full_bptt else nxt.detach())], dim=1)
-            cur_stim = torch.cat([cur_stim, fut_stim[:, i:i+1, :]], dim=1)
+            cur_x = torch.cat(
+                [cur_x, (nxt if allow_full_bptt else nxt.detach())], dim=1
+            )
+            cur_stim = torch.cat([cur_stim, fut_stim[:, i : i + 1, :]], dim=1)
         gen_only_mod = torch.stack(steps, dim=1)  # (1, T, N)
-        preds = sliding_predict_bmodel(gen_only_mod, pos, mask, bmodels, window_len=6)  # (T,K)
+        preds = sliding_predict_bmodel(
+            gen_only_mod, pos, mask, bmodels, window_len=6
+        )  # (T,K)
         return preds
 
-    pbar = tqdm(range(int(args.steps)), desc='Optimize deltas')
-    best_loss = float('inf')
+    pbar = tqdm(range(int(args.steps)), desc="Optimize deltas")
+    best_loss = float("inf")
     best_delta: Optional[torch.Tensor] = None
     # Loss histories for plotting
     loss_hist_total: list[float] = []
@@ -556,7 +716,7 @@ def main():
         loss_hist_total.append(cur)
         loss_hist_pred.append(float(loss_pred.detach().cpu().item()))
         loss_hist_l1.append(float(l1_term.detach().cpu().item()))
-        pbar.set_postfix({'loss': f"{cur:.6f}"})
+        pbar.set_postfix({"loss": f"{cur:.6f}"})
         if cur < best_loss:
             best_loss = cur
             best_delta = delta_param.detach().cpu().clone()
@@ -565,16 +725,38 @@ def main():
         best_delta = delta_param.detach().cpu().clone()
 
     # Compose modified context spikes and save
-    best_delta_pos = F.softplus(best_delta.to(device=device, dtype=torch.float32)) * mask[0].to(device=device, dtype=torch.float32)
-    spikes_ctx_mod = torch.clamp(spikes_ctx[0].to(dtype=torch.float32) + best_delta_pos, 0.0, 1.0).detach().cpu().numpy()  # (L,N)
+    best_delta_pos = F.softplus(
+        best_delta.to(device=device, dtype=torch.float32)
+    ) * mask[0].to(device=device, dtype=torch.float32)
+    spikes_ctx_mod = (
+        torch.clamp(spikes_ctx[0].to(dtype=torch.float32) + best_delta_pos, 0.0, 1.0)
+        .detach()
+        .cpu()
+        .numpy()
+    )  # (L,N)
     # Also generate horizon spikes from modified context for reference
     with torch.no_grad():
-        spikes_ctx_mod_bf16 = torch.from_numpy(spikes_ctx_mod).to(device=device, dtype=torch.bfloat16).unsqueeze(0)
-        full_seq_best = gbm.autoregress(
-            init_x=spikes_ctx_mod_bf16, init_stimuli=stim_ctx, point_positions=pos, neuron_pad_mask=mask,
-            future_stimuli=fut_stim, n_steps=int(args.horizon), context_len=int(args.context_len)
+        spikes_ctx_mod_bf16 = (
+            torch.from_numpy(spikes_ctx_mod)
+            .to(device=device, dtype=torch.bfloat16)
+            .unsqueeze(0)
         )
-        gen_only_best = full_seq_best[:, -int(args.horizon):, :].detach().to(torch.float32).cpu().numpy()
+        full_seq_best = gbm.autoregress(
+            init_x=spikes_ctx_mod_bf16,
+            init_stimuli=stim_ctx,
+            point_positions=pos,
+            neuron_pad_mask=mask,
+            future_stimuli=fut_stim,
+            n_steps=int(args.horizon),
+            context_len=int(args.context_len),
+        )
+        gen_only_best = (
+            full_seq_best[:, -int(args.horizon) :, :]
+            .detach()
+            .to(torch.float32)
+            .cpu()
+            .numpy()
+        )
     preds_final = (
         predict_with_delta(best_delta.to(device=device, dtype=torch.float32))
         .detach()
@@ -585,7 +767,7 @@ def main():
 
     # Save arrays
     np.savez_compressed(
-        data_dir_out / 'results.npz',
+        data_dir_out / "results.npz",
         target_behaviors=beh_tgt,
         preds_init=preds_init.detach().to(torch.float32).cpu().numpy(),
         preds_final=preds_final,
@@ -595,54 +777,74 @@ def main():
         gen_spikes_mod=gen_only_best[0],
         positions=pos[0].detach().to(torch.float32).cpu().numpy(),
         neuron_mask=mask[0].detach().cpu().numpy(),
-        swirl_x=x_tgt, swirl_y=y_tgt,
+        swirl_x=x_tgt,
+        swirl_y=y_tgt,
     )
 
     # Plot trajectories: target vs achieved (from preds_final behaviors)
     try:
         import matplotlib.pyplot as plt
+
         # Integrate predicted final behaviors into positions
         B_idx, LU_idx, RU_idx = 3, 1, 2
-        x_pred, y_pred = integrate_trajectory(preds_final[:, B_idx], preds_final[:, LU_idx], preds_final[:, RU_idx], dt=dt_hz, turn_scale_angle=1.0)
+        x_pred, y_pred = integrate_trajectory(
+            preds_final[:, B_idx],
+            preds_final[:, LU_idx],
+            preds_final[:, RU_idx],
+            dt=dt_hz,
+            turn_scale_angle=1.0,
+        )
         plt.figure(figsize=(7, 7), dpi=220)
-        plt.plot(x_tgt, y_tgt, label='target', color='tab:green', linewidth=2)
-        plt.plot(x_pred, y_pred, label='achieved', color='tab:orange', linewidth=2)
-        plt.axis('equal'); plt.grid(alpha=0.3)
-        plt.title('2D trajectory (swirl): target vs achieved')
+        plt.plot(x_tgt, y_tgt, label="target", color="tab:green", linewidth=2)
+        plt.plot(x_pred, y_pred, label="achieved", color="tab:orange", linewidth=2)
+        plt.axis("equal")
+        plt.grid(alpha=0.3)
+        plt.title("2D trajectory (swirl): target vs achieved")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(logs_dir / 'trajectory_compare.png', dpi=300)
+        plt.savefig(logs_dir / "trajectory_compare.png", dpi=300)
         plt.close()
         # Behavior traces
         fig, axs = plt.subplots(3, 1, figsize=(10, 6), sharex=True, dpi=220)
         t = np.arange(int(args.horizon))
-        axs[0].plot(t, beh_tgt[:, 3], label='B target'); axs[0].plot(t, preds_final[:, 3], label='B pred', alpha=0.8)
-        axs[0].set_ylabel('Bilateral'); axs[0].legend()
-        axs[1].plot(t, beh_tgt[:, 1], label='LU target'); axs[1].plot(t, preds_final[:, 1], label='LU pred', alpha=0.8)
-        axs[1].set_ylabel('Left-unilateral'); axs[1].legend()
-        axs[2].plot(t, beh_tgt[:, 2], label='RU target'); axs[2].plot(t, preds_final[:, 2], label='RU pred', alpha=0.8)
-        axs[2].set_ylabel('Right-unilateral'); axs[2].legend(); axs[2].set_xlabel('time step')
-        fig.tight_layout(); fig.savefig(logs_dir / 'behaviors_compare.png', dpi=300); plt.close(fig)
+        axs[0].plot(t, beh_tgt[:, 3], label="B target")
+        axs[0].plot(t, preds_final[:, 3], label="B pred", alpha=0.8)
+        axs[0].set_ylabel("Bilateral")
+        axs[0].legend()
+        axs[1].plot(t, beh_tgt[:, 1], label="LU target")
+        axs[1].plot(t, preds_final[:, 1], label="LU pred", alpha=0.8)
+        axs[1].set_ylabel("Left-unilateral")
+        axs[1].legend()
+        axs[2].plot(t, beh_tgt[:, 2], label="RU target")
+        axs[2].plot(t, preds_final[:, 2], label="RU pred", alpha=0.8)
+        axs[2].set_ylabel("Right-unilateral")
+        axs[2].legend()
+        axs[2].set_xlabel("time step")
+        fig.tight_layout()
+        fig.savefig(logs_dir / "behaviors_compare.png", dpi=300)
+        plt.close(fig)
         # Optimization loss curve (total, pred, l1 components)
         try:
             steps = np.arange(len(loss_hist_total))
             plt.figure(figsize=(8, 4), dpi=200)
-            plt.plot(steps, loss_hist_total, label='total', linewidth=1.5)
-            plt.plot(steps, loss_hist_pred, label='pred_l1', linewidth=1.0)
-            plt.plot(steps, loss_hist_l1, label='l1_term', linewidth=1.0)
-            plt.xlabel('optimization step')
-            plt.ylabel('loss')
-            plt.title('Optimization loss over steps')
+            plt.plot(steps, loss_hist_total, label="total", linewidth=1.5)
+            plt.plot(steps, loss_hist_pred, label="pred_l1", linewidth=1.0)
+            plt.plot(steps, loss_hist_l1, label="l1_term", linewidth=1.0)
+            plt.xlabel("optimization step")
+            plt.ylabel("loss")
+            plt.title("Optimization loss over steps")
             plt.legend()
             plt.tight_layout()
-            plt.savefig(logs_dir / 'optimization_loss.png', dpi=300)
+            plt.savefig(logs_dir / "optimization_loss.png", dpi=300)
             plt.close()
             # Also save CSV
             try:
-                with open(logs_dir / 'optimization_loss.csv', 'w') as fcsv:
-                    fcsv.write('step,total,pred_l1,l1_term\n')
+                with open(logs_dir / "optimization_loss.csv", "w") as fcsv:
+                    fcsv.write("step,total,pred_l1,l1_term\n")
                     for i in range(len(loss_hist_total)):
-                        fcsv.write(f"{i},{loss_hist_total[i]:.8f},{loss_hist_pred[i]:.8f},{loss_hist_l1[i]:.8f}\n")
+                        fcsv.write(
+                            f"{i},{loss_hist_total[i]:.8f},{loss_hist_pred[i]:.8f},{loss_hist_l1[i]:.8f}\n"
+                        )
             except Exception:
                 pass
         except Exception:
@@ -651,14 +853,16 @@ def main():
         pass
 
     # Write a simple summary
-    with open(base_out / 'summary.txt', 'w') as f:
+    with open(base_out / "summary.txt", "w") as f:
         f.write(f"Best loss: {best_loss:.6f}\n")
         f.write(f"Context len: {args.context_len}, Horizon: {args.horizon}\n")
-        f.write(f"Speed scale: {args.speed_scale}, Turn scale: {args.turn_scale}, L1 delta: {args.l1_delta}\n")
-        f.write(f"GBM: {args.gbm_checkpoint}\nBModel train dir: {args.bmodel_train_dir}\n")
+        f.write(
+            f"Speed scale: {args.speed_scale}, Turn scale: {args.turn_scale}, L1 delta: {args.l1_delta}\n"
+        )
+        f.write(
+            f"GBM: {args.gbm_checkpoint}\nBModel train dir: {args.bmodel_train_dir}\n"
+        )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
-

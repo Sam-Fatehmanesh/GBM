@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from GenerativeBrainModel.models.rms import RMSNorm
 from GenerativeBrainModel.models.mlp import FFN
 
+
 class CausalConv1d(nn.Module):
     def __init__(self, dim, kernel_size=5, dilation=1):
         super().__init__()
@@ -13,7 +14,7 @@ class CausalConv1d(nn.Module):
 
         # Calculate the required padding for causality
         self.padding = (kernel_size - 1) * dilation
-        
+
         # Use depthwise convolution: in_channels=out_channels=dim, groups=dim
         self.conv = nn.Conv1d(
             in_channels=dim,
@@ -22,16 +23,13 @@ class CausalConv1d(nn.Module):
             padding=self.padding,
             dilation=dilation,
             groups=dim,
-            bias=True
+            bias=True,
         )
         # Norm before channel mixing
         self.mid_norm = RMSNorm(dim)
         # Add a linear channel mixer (1x1 convolution)
         self.channel_mixer = nn.Conv1d(
-            in_channels=dim,
-            out_channels=dim,
-            kernel_size=1,
-            bias=True
+            in_channels=dim, out_channels=dim, kernel_size=1, bias=True
         )
         self.reset_parameters()
 
@@ -48,7 +46,7 @@ class CausalConv1d(nn.Module):
         # nn.Conv1d expects (batch, channels, length)
         out = self.conv(x)
         # Remove extra padding on the right for causality
-        out = out[..., :x.shape[-1]]
+        out = out[..., : x.shape[-1]]
         out = F.silu(out)
         # Norm before mixing; reshape (B,C,T) to (B,T,C) for RMSNorm, then back
         out = out.permute(0, 2, 1).contiguous()
@@ -58,6 +56,7 @@ class CausalConv1d(nn.Module):
         out = self.channel_mixer(out)
         out = F.silu(out)
         return out
+
 
 class CausalResidualNeuralConv1d(nn.Module):
     def __init__(self, dim, kernel_size=5, dilation=1):
@@ -83,4 +82,3 @@ class CausalResidualNeuralConv1d(nn.Module):
         x = x + res
 
         return x
-

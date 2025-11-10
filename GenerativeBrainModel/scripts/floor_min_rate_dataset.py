@@ -42,10 +42,15 @@ def copy_non_values(src: h5py.File, dst: h5py.File, exclude: set[str]) -> None:
                     grp.attrs[k] = v
 
 
-def clamp_and_rewrite(src_path: Path, dst_path: Path, floor: float, log_eps: float = 1e-7,
-                      time_chunk: int = 4096) -> None:
+def clamp_and_rewrite(
+    src_path: Path,
+    dst_path: Path,
+    floor: float,
+    log_eps: float = 1e-7,
+    time_chunk: int = 4096,
+) -> None:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
-    with h5py.File(src_path, 'r') as src, h5py.File(dst_path, 'w') as dst:
+    with h5py.File(src_path, "r") as src, h5py.File(dst_path, "w") as dst:
         # Copy attributes first
         for k, v in src.attrs.items():
             try:
@@ -54,22 +59,30 @@ def clamp_and_rewrite(src_path: Path, dst_path: Path, floor: float, log_eps: flo
                 pass
 
         # Copy everything except the datasets we will regenerate
-        exclude = {'neuron_values', 'log_activity_mean', 'log_activity_std'}
+        exclude = {"neuron_values", "log_activity_mean", "log_activity_std"}
         copy_non_values(src, dst, exclude)
 
-        if 'neuron_values' not in src:
+        if "neuron_values" not in src:
             raise RuntimeError(f"Missing 'neuron_values' in {src_path}")
 
-        d_in = src['neuron_values']
+        d_in = src["neuron_values"]
         T, N = int(d_in.shape[0]), int(d_in.shape[1])
         out_dtype = d_in.dtype
 
         # Create destination dataset with similar chunking/compression when available
         chunks = d_in.chunks if d_in.chunks is not None else (min(1024, T), min(256, N))
-        compression = d_in.compression or 'gzip'
-        compression_opts = d_in.compression_opts if d_in.compression_opts is not None else 1
-        d_out = dst.create_dataset('neuron_values', shape=(T, N), dtype=out_dtype,
-                                   chunks=chunks, compression=compression, compression_opts=compression_opts)
+        compression = d_in.compression or "gzip"
+        compression_opts = (
+            d_in.compression_opts if d_in.compression_opts is not None else 1
+        )
+        d_out = dst.create_dataset(
+            "neuron_values",
+            shape=(T, N),
+            dtype=out_dtype,
+            chunks=chunks,
+            compression=compression,
+            compression_opts=compression_opts,
+        )
 
         # Streaming stats for log(activity)
         sum_logs = np.zeros((N,), dtype=np.float64)
@@ -87,8 +100,10 @@ def clamp_and_rewrite(src_path: Path, dst_path: Path, floor: float, log_eps: flo
             # Accumulate log stats
             logs = np.log(np.maximum(slab, log_eps, dtype=np.float32))
             sum_logs += logs.sum(axis=0, dtype=np.float64)
-            sumsq_logs += np.square(logs, dtype=np.float32).sum(axis=0, dtype=np.float64)
-            total += (t1 - t0)
+            sumsq_logs += np.square(logs, dtype=np.float32).sum(
+                axis=0, dtype=np.float64
+            )
+            total += t1 - t0
 
         # Compute mean/std
         if total <= 0:
@@ -100,25 +115,60 @@ def clamp_and_rewrite(src_path: Path, dst_path: Path, floor: float, log_eps: flo
             lam = mean.astype(np.float32)
             las = np.sqrt(var, dtype=np.float64).astype(np.float32)
 
-        dst.create_dataset('log_activity_mean', data=lam, compression='gzip', compression_opts=1)
-        dst.create_dataset('log_activity_std', data=las, compression='gzip', compression_opts=1)
+        dst.create_dataset(
+            "log_activity_mean", data=lam, compression="gzip", compression_opts=1
+        )
+        dst.create_dataset(
+            "log_activity_std", data=las, compression="gzip", compression_opts=1
+        )
 
         # Update attributes
-        dst.attrs['includes_log_activity_stats'] = True
-        dst.attrs['log_activity_eps'] = float(log_eps)
-        dst.attrs['min_rate_floor'] = float(floor)
+        dst.attrs["includes_log_activity_stats"] = True
+        dst.attrs["log_activity_eps"] = float(log_eps)
+        dst.attrs["min_rate_floor"] = float(floor)
         # Also store as a scalar dataset for ease of loading
-        dst.create_dataset('min_rate_floor', data=np.array([float(floor)], dtype=np.float32))
+        dst.create_dataset(
+            "min_rate_floor", data=np.array([float(floor)], dtype=np.float32)
+        )
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Clamp min rates in processed H5s and recompute log stats')
-    ap.add_argument('--input_dir', type=str, required=True, help='Directory containing source H5 files')
-    ap.add_argument('--output_dir', type=str, required=True, help='Directory to write clamped H5 files')
-    ap.add_argument('--min_rate', type=float, default=1e-5, help='Minimum rate/probability floor (default: 1e-5)')
-    ap.add_argument('--log_eps', type=float, default=1e-7, help='Epsilon used when taking logs for stats')
-    ap.add_argument('--pattern', type=str, default='*.h5', help='Glob pattern for H5 files (default: *.h5)')
-    ap.add_argument('--overwrite', action='store_true', help='Overwrite output files if they exist')
+    ap = argparse.ArgumentParser(
+        description="Clamp min rates in processed H5s and recompute log stats"
+    )
+    ap.add_argument(
+        "--input_dir",
+        type=str,
+        required=True,
+        help="Directory containing source H5 files",
+    )
+    ap.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Directory to write clamped H5 files",
+    )
+    ap.add_argument(
+        "--min_rate",
+        type=float,
+        default=1e-5,
+        help="Minimum rate/probability floor (default: 1e-5)",
+    )
+    ap.add_argument(
+        "--log_eps",
+        type=float,
+        default=1e-7,
+        help="Epsilon used when taking logs for stats",
+    )
+    ap.add_argument(
+        "--pattern",
+        type=str,
+        default="*.h5",
+        help="Glob pattern for H5 files (default: *.h5)",
+    )
+    ap.add_argument(
+        "--overwrite", action="store_true", help="Overwrite output files if they exist"
+    )
     args = ap.parse_args()
 
     src_dir = Path(args.input_dir)
@@ -130,7 +180,9 @@ def main():
         print(f"No files matched in {src_dir} with pattern {args.pattern}")
         return
 
-    print(f"Clamping min rate to {args.min_rate} and recomputing log stats for {len(files)} files…")
+    print(
+        f"Clamping min rate to {args.min_rate} and recomputing log stats for {len(files)} files…"
+    )
     for fp in files:
         if not fp.is_file():
             continue
@@ -145,8 +197,5 @@ def main():
             print(f"[error] {fp.name}: {e}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
-
-

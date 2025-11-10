@@ -15,19 +15,23 @@ import h5py
 
 def add_ids_to_file(h5_path: Path) -> bool:
     try:
-        with h5py.File(str(h5_path), 'a') as f:
-            if 'neuron_global_ids' in f:
+        with h5py.File(str(h5_path), "a") as f:
+            if "neuron_global_ids" in f:
                 return False
-            if 'num_neurons' in f:
-                N = int(f['num_neurons'][()])
+            if "num_neurons" in f:
+                N = int(f["num_neurons"][()])
             else:
-                if 'cell_positions' in f:
-                    N = int(f['cell_positions'].shape[0])
+                if "cell_positions" in f:
+                    N = int(f["cell_positions"].shape[0])
                 else:
-                    raise ValueError("Cannot infer N; 'num_neurons' or 'cell_positions' missing")
+                    raise ValueError(
+                        "Cannot infer N; 'num_neurons' or 'cell_positions' missing"
+                    )
             rng = np.random.default_rng(seed=None)
-            ids = rng.integers(low=1, high=np.iinfo(np.int64).max, size=(N,), dtype=np.int64)
-            f.create_dataset('neuron_global_ids', data=ids)
+            ids = rng.integers(
+                low=1, high=np.iinfo(np.int64).max, size=(N,), dtype=np.int64
+            )
+            f.create_dataset("neuron_global_ids", data=ids)
         return True
     except Exception as e:
         print(f"Failed to add neuron_global_ids to {h5_path}: {e}")
@@ -36,11 +40,16 @@ def add_ids_to_file(h5_path: Path) -> bool:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data_dir', type=str, required=True, help='Directory containing processed H5 files')
+    ap.add_argument(
+        "--data_dir",
+        type=str,
+        required=True,
+        help="Directory containing processed H5 files",
+    )
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
-    files = sorted([p for p in data_dir.glob('*.h5')])
+    files = sorted([p for p in data_dir.glob("*.h5")])
     print(f"Found {len(files)} files in {data_dir}")
     added = 0
     for fp in files:
@@ -49,7 +58,5 @@ def main():
     print(f"Added neuron_global_ids to {added} files")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
-
