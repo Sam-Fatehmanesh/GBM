@@ -125,3 +125,14 @@ __MACOSX
 old_scripts
 .env
 *.avi
+*.json
+
+works.md
+#*.yaml
+create_volume_video.py
+*.ckpt
+lightning_logs/
+*.npz
+*.svg
+experiments/
+zapdata/

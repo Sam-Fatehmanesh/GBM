@@ -1,0 +1,39 @@
+things to check:
+
+
+FIX THE position encoding stuff - done
+
+Use proper AR lognormal sampling - done
+
+Make sure the old context spike mask/probs remain same, only new/change is the new AR sample - done
+
+AR should use most of context, not half - done
+
+
+more heads/layers - in prog
+more seq length aka to 256 - in prog
+
+investigate nan stuff
+
+use loss censoring using cdf - in prog
+
+figure out if rope in spike attention could be done better?
+
+replace the neuron causal attn with flash attn
+
+Upweight higher rate neurons in the loss, high weight for high predicted rate not nessarily for high true rate
+
+test short context but large layers aka 4 layres but 48 seqlen - done
+test super long context but only 1 lr aka 1 lr but 192 seqlen
+
+test masking out same neuron to same neuron attention, ways to try, remove spiking neurons from Q [in prog], switch to flexattn which has attn bias support - done
+
+test using log mse or regular mse - done
+
+test removing global vector or just setting to zero or using film layer etc - done
+
+interneuron dependent loss function - done
+
+switch to bce on spike prob
+
+try remove the z norm from loss

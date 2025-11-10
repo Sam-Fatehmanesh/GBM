@@ -1,0 +1,31 @@
+sweep:
+  blur_levels: [0.0, 0.1]
+  seeds: [42, 123, 999]
+  subject_file: subject_14.h5
+  output_dir: experiments/gbm2_blur_sweep
+  predict_unblurred_targets: true
+
+base_train_config: configs/config_gbm.yaml
+
+train_overrides:
+  experiment:
+    name: gbm2_blur_sweep_subject14
+  data:
+    data_dir: processed_spike_rates_2018_floor0,003
+    use_cache: true
+    include_files: [subject_14.h5]
+  training:
+    # enforce training windowing and step count
+    num_epochs: 1
+    batch_size: 1
+    sequence_length: 12
+    stride: 4
+    max_timepoints_per_subject: 1000
+    test_split_fraction: 0.1
+    use_gpu: true
+    # validation controls
+    validation_frequency: 16
+    val_sample_batches: 4
+    # keep defaults for copula and other settings
+
+

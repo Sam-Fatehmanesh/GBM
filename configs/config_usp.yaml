@@ -1,0 +1,38 @@
+cascade:
+  model_type: Global_EXC_3Hz_smoothing400ms_causalkernel
+data:
+  apply_baseline_subtraction: true
+  baseline_percentile: 8
+  calcium_dataset: CellResp
+  input_dir: raw_calcium_data_2018
+  is_raw: false
+  output_dir: processed_spike_rates_2018_original_rate
+  test_run_neurons: null
+  window_length: 30.0
+  skip_subjects: []
+  # zap:
+  #   segmentation_xy_store: /home/user/gbm3/GBM3/zapdata/segmentation_xy
+  #   split_by_stimuli: false
+  #   stimuli_features_store: /home/user/gbm3/GBM3/zapdata/stimuli_features
+  #   stimuli_store: /home/user/gbm3/GBM3/zapdata/stimuli_raw/stimuli_and_ephys.10chFlt
+  #   subject_name: zapbench
+  #   traces_store: /home/user/gbm3/GBM3/zapdata/traces
+  # zapdata: false
+output:
+  dtype: float16
+  include_additional_data: true
+  compute_log_activity_stats: true
+processing:
+  batch_size: 5000
+  num_neurons_viz: 10
+  original_sampling_rate: 2
+  return_to_original_rate: true
+  seed: 42
+  skip_cascade: false
+  target_sampling_rate: 3
+  workers: 1
+  convert_rates_to_probabilities: false
+  
+  # Optional: explicitly specify CASCADE import path if auto-detect fails
+  # cascade_import: neuralib.imaging.spikes.cascade:cascade_predict
+  # cascade_function: cascade_predict

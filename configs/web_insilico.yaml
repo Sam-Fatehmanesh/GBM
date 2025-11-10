@@ -1,0 +1,4 @@
+server:
+  disable_verification: true
+data:
+  ar_h5: /root/GBM/experiments/gbm2/20251103_104250_added_embed_to_lasthbeforehead/plots/eval_ar/ar_runs/ar_011_subject_4.h5
