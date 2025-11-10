@@ -25,6 +25,7 @@ import yaml
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+import h5py
 
 from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
@@ -791,7 +792,8 @@ def autoregressive_rollout(model: GBM,
                            las: torch.Tensor | None,     # (1, N)
                            device: torch.device,
                            Tf: int,
-                           sampling_rate_hz: float = 3.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                           sampling_rate_hz: float = 3.0,
+                           max_context_len: int | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns:
     - pred rates: (Tf, N)
     - spike counts for context window: (Tc,)
@@ -799,7 +801,6 @@ def autoregressive_rollout(model: GBM,
     """
     model.eval()
     context = init_context.clone()  # (1, Tc, N)
-    Lc = int(init_context.shape[1])
     # Pre-sample spike masks for the initial context as 0/1 floats (deterministic under Bernoulli when re-used)
     sr_f = float(sampling_rate_hz)
     spike_prob_init = 1.0 - torch.exp(-context.to(torch.float32) / sr_f)
@@ -807,24 +808,27 @@ def autoregressive_rollout(model: GBM,
     spike_mask_ctx = torch.bernoulli(spike_prob_init).to(torch.float32)  # (1, Tc, N) 0/1 floats
     preds = []
     # Precompute context spike counts per timestep (sum over neurons)
-    ctx_counts = spike_mask_ctx[:, :Lc, :].sum(dim=2).to(torch.float32)[0]  # (Tc,)
+    ctx_counts = spike_mask_ctx[:, : int(init_context.shape[1]), :].sum(dim=2).to(torch.float32)[0]  # (Tc,)
     pred_counts: list[torch.Tensor] = []
     eps = 1e-7
     for t in range(Tf):
-        # Use sliding window of last Lc steps
-        x_in = context[:, -Lc:, :]  # (1,Lc,N)
+        # Use an expanding window up to max_context_len (training sequence length - 1), then cap
+        win_len = int(context.shape[1])
+        if max_context_len is not None:
+            win_len = min(win_len, int(max_context_len))
+        x_in = context[:, -win_len:, :]  # (1,win_len,N)
         x_log = torch.log(x_in.clamp_min(eps))
         lam_e = lam[:, None, :].to(dtype=x_log.dtype)
         las_e = las[:, None, :].to(dtype=x_log.dtype).clamp_min(1e-6)
         x_in_z = (x_log - lam_e) / las_e
 
-        # Align stimuli for the sliding window
-        stim_step = stim_full[:, (context.shape[1]-Lc):(context.shape[1]), :]
+        # Align stimuli for the current window
+        stim_step = stim_full[:, (context.shape[1]-win_len):(context.shape[1]), :]
         if device.type == 'cuda':
             x_in_z = x_in_z.to(torch.bfloat16)
             stim_step = stim_step.to(torch.bfloat16)
         # Use pre-sampled spike mask as probabilities (0/1) so internal Bernoulli is deterministic
-        spike_probs_window = spike_mask_ctx[:, -Lc:, :]  # (1, Lc, N) float32 0/1
+        spike_probs_window = spike_mask_ctx[:, -win_len:, :]  # (1, win_len, N) float32 0/1
         mu, raw_log_sigma, _, _ = model(x_in_z, stim_step, positions, neuron_mask, neuron_ids, spike_probs_window, get_logits=True, input_log_rates=True)
         # Take last-time params and sample from LogNormal
         mu_last = mu[:, -1:, :]
@@ -858,6 +862,9 @@ def main():
     logs_dir = exp_dir / 'logs'
     plots_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
+    # Directory to store per-AR HDF5 dumps
+    ar_runs_dir = plots_dir / 'eval_ar' / 'ar_runs'
+    ar_runs_dir.mkdir(parents=True, exist_ok=True)
 
     with open(cfg_path, 'r') as f:
         cfg = yaml.safe_load(f)
@@ -869,13 +876,9 @@ def main():
     except Exception:
         pass
 
-    # Build an eval config with longer sequence length to include future truth beyond original window
+    # Build an eval config (do not change sequence_length automatically)
     horizon = int(args.horizon)
     cfg_eval = copy.deepcopy(cfg)
-    try:
-        cfg_eval['training']['sequence_length'] = int(cfg_eval['training']['sequence_length']) + horizon
-    except Exception:
-        pass
 
     # Dataloaders (use extended window for eval so we have future ground truth)
     # Also receive global unique neuron IDs for collision-free embeddings
@@ -957,6 +960,7 @@ def main():
     with torch.no_grad():
         # Track one AR per subject/file
         seen_subjects: set[str] = set()
+        ar_saved = 0
         for batch in val_loader:
             spikes = batch['spikes'].to(device)
             positions = batch['positions'].to(device)
@@ -965,6 +969,7 @@ def main():
             neuron_ids = batch['neuron_ids'].to(device)
             lam = batch.get('log_activity_mean', torch.empty(0)).to(device)
             las = batch.get('log_activity_std', torch.empty(0)).to(device)
+            start_idx_vec = batch.get('start_idx', None)
 
             # Full windows from extended sequence
             x_in_full = spikes[:, :-1, :]
@@ -1043,9 +1048,16 @@ def main():
             # Collect up to num_ars unique-subject AR visualizations
             if len(ar_contexts) < num_ars:
                 B, Lm1_full, N = x_in_full.shape
-                Tf_all = min(horizon, max(1, Lm1_full - Lm1_orig)) if Lm1_full > Lm1_orig else min(horizon, Lm1_full)
-                Tc = Lm1_orig
-                Tf_all = max(1, min(Tf_all, max(1, Lm1_full - Tc)))
+                # Choose a shorter context so that the remaining portion within (L-1) equals horizon
+                # Max allowable context is training L-1 and sample L-1
+                Tc_max = min(Lm1_orig, Lm1_full)
+                if horizon >= Lm1_full:
+                    raise RuntimeError(
+                        f"AR horizon ({horizon}) must be < (L-1) for the sample. "
+                        f"Got horizon={horizon}, sample L-1={Lm1_full}."
+                    )
+                Tc = max(1, Tc_max - horizon)
+                Tf_all = min(horizon, max(1, Lm1_full - Tc))
 
                 # Iterate within batch to find first sample from a new subject
                 for bi in range(B):
@@ -1070,7 +1082,75 @@ def main():
                         positions[bi:bi+1], mask[bi:bi+1], neuron_ids[bi:bi+1],
                         lam[bi:bi+1] if lam.numel()>0 else None,
                         las[bi:bi+1] if las.numel()>0 else None,
-                        device, Tf_all, sampling_rate_hz=sr)
+                        device, Tf_all, sampling_rate_hz=sr, max_context_len=Lm1_orig)
+
+                    # Save this AR run to a dedicated HDF5
+                    try:
+                        from pathlib import Path as _P
+                        subj_for_file = _P(fp).stem if fp is not None else f"subj"
+                    except Exception:
+                        subj_for_file = f"subj"
+                    ar_saved += 1
+                    out_path = ar_runs_dir / f"ar_{ar_saved:03d}_{subj_for_file}.h5"
+                    try:
+                        # Prepare arrays on CPU
+                        ctx_rates = init_context[0].to(torch.float32).cpu().numpy()                    # (Tc,N)
+                        fut_truth = x_in_full[bi, Tc:Tc+Tf_all, :].to(torch.float32).cpu().numpy()     # (Tf,N)
+                        fut_pred  = pred_future.to(torch.float32).cpu().numpy()                        # (Tf,N)
+                        stim_ctx  = stim[bi, :Tc, :].to(torch.float32).cpu().numpy()                   # (Tc,K)
+                        stim_fut  = stim[bi, Tc:Tc+Tf_all, :].to(torch.float32).cpu().numpy()         # (Tf,K)
+                        stim_all  = stim[bi, :Tc+Tf_all, :].to(torch.float32).cpu().numpy()           # (Tc+Tf,K)
+                        pos_np    = positions[bi].to(torch.float32).cpu().numpy()                     # (N,3)
+                        mask_np   = (mask[bi] != 0).to(torch.uint8).cpu().numpy()                     # (N,)
+                        ids_np    = neuron_ids[bi].to(torch.int64).cpu().numpy()                      # (N,)
+                        lam_np    = (lam[bi].to(torch.float32).cpu().numpy() if lam.numel()>0 else None)
+                        las_np    = (las[bi].to(torch.float32).cpu().numpy() if las.numel()>0 else None)
+                        ctx_counts_np = ctx_spike_counts.to(torch.float32).cpu().numpy()              # (Tc,)
+                        # compute true-future spike counts for this AR window
+                        prob_true_local = 1.0 - torch.exp(-x_in_full[bi, Tc:Tc+Tf_all, :].to(torch.float32) / sr)
+                        prob_true_local = torch.nan_to_num(prob_true_local, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+                        true_mask_local = torch.bernoulli(prob_true_local).to(torch.float32)
+                        true_counts_np  = true_mask_local.sum(dim=1).to(torch.float32).cpu().numpy()  # (Tf,)
+                        pred_counts_np  = pred_spike_counts.to(torch.float32).cpu().numpy()           # (Tf,)
+
+                        with h5py.File(str(out_path), 'w') as hf:
+                            # Core series
+                            hf.create_dataset('context_rates', data=ctx_rates, compression='gzip', compression_opts=4)
+                            hf.create_dataset('future_truth_rates', data=fut_truth, compression='gzip', compression_opts=4)
+                            hf.create_dataset('future_pred_rates', data=fut_pred, compression='gzip', compression_opts=4)
+                            # Stimulus and metadata tensors
+                            hf.create_dataset('stimulus_context', data=stim_ctx, compression='gzip', compression_opts=2)
+                            hf.create_dataset('stimulus_future', data=stim_fut, compression='gzip', compression_opts=2)
+                            hf.create_dataset('stimulus_context_plus_future', data=stim_all, compression='gzip', compression_opts=2)
+                            hf.create_dataset('positions', data=pos_np, compression='gzip', compression_opts=2)
+                            hf.create_dataset('neuron_mask', data=mask_np, compression='gzip', compression_opts=2)
+                            hf.create_dataset('neuron_ids', data=ids_np, compression='gzip', compression_opts=2)
+                            if lam_np is not None:
+                                hf.create_dataset('log_activity_mean', data=lam_np, compression='gzip', compression_opts=2)
+                            if las_np is not None:
+                                hf.create_dataset('log_activity_std', data=las_np, compression='gzip', compression_opts=2)
+                            # Counts
+                            hf.create_dataset('context_spike_counts', data=ctx_counts_np, compression='gzip', compression_opts=2)
+                            hf.create_dataset('future_truth_spike_counts', data=true_counts_np, compression='gzip', compression_opts=2)
+                            hf.create_dataset('future_pred_spike_counts', data=pred_counts_np, compression='gzip', compression_opts=2)
+                            # Scalar attrs
+                            hf.attrs['subject'] = str(subj_for_file)
+                            hf.attrs['file_path'] = str(fp) if fp is not None else ''
+                            if start_idx_vec is not None:
+                                try:
+                                    hf.attrs['start_idx'] = int(start_idx_vec[bi].item())
+                                except Exception:
+                                    pass
+                            hf.attrs['Tc'] = int(Tc)
+                            hf.attrs['Tf'] = int(Tf_all)
+                            hf.attrs['training_Lm1'] = int(Lm1_orig)
+                            hf.attrs['sample_Lm1'] = int(Lm1_full)
+                            hf.attrs['sampling_rate_hz'] = float(sr)
+                    except Exception as _e:
+                        try:
+                            print(f"[eval_ar] Warning: failed to save AR run to {out_path}: {_e}")
+                        except Exception:
+                            pass
 
                     # Save the first AR for legacy single-run plots
                     if final_ctx is None:

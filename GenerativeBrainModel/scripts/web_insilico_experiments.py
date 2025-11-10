@@ -32,6 +32,8 @@ import requests
 import shutil
 
 from GenerativeBrainModel.models.gbm import GBM
+from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders  # for types only; not used directly
+from GenerativeBrainModel.scripts.eval_gbm2_ar import autoregressive_rollout as eval_ar_rollout
 
 # --------------------------
 # Config and global state
@@ -44,20 +46,20 @@ class ServerConfig:
     debug: bool = False
     secret_key: str = 'change-me'
     turnstile_site_key: str = ''  # optional; if set, UI renders Turnstile widget
+    disable_verification: bool = False  # if True, skip all verification paths
 
 @dataclass
 class DataConfig:
-    good_sample_h5: str = ''  # preferred name
-    best_sample_h5: str = ''   # backward-compat alias
-    mask_h5: str = ''
+    ar_h5: str = ''            # Path to eval_gbm2_ar per-AR H5 (context, truth, pred, stim, ids, etc.)
+    mask_h5: str = ''          # Optional atlas H5 for region overlays
     spikes_are_rates: bool = False
     sampling_rate_hz: float = 3.0
-    clip_01_before_ar: bool = True
-    baseline_npz: str = ''  # optional path to precomputed baseline NPZ with key 'baseline_future'
+    clip_01_before_ar: bool = False
+    baseline_npz: str = ''     # Optional; if empty, will fall back to AR H5 future truth rates
 
 @dataclass
 class ModelConfig:
-    checkpoint: str = ''
+    checkpoint: str = ''       # If empty, derived from AR H5 experiment dir
     use_gpu: bool = True
     dtype: str = 'bfloat16'  # 'float32' | 'bfloat16'
 
@@ -101,104 +103,88 @@ def load_yaml_config(path: str) -> AppConfig:
 # Robust model loading (adapted from eval_gbm)
 # --------------------------
 
-def load_model_from_checkpoint(ckpt_path: str, device: torch.device, spikes_are_rates: bool) -> GBM:
-    state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg_in_ckpt = state.get('config', {}) if isinstance(state, dict) else {}
-    model_cfg = cfg_in_ckpt.get('model', None) if isinstance(cfg_in_ckpt, dict) else None
-    sd_in = state['model'] if (isinstance(state, dict) and 'model' in state) else state
+def _strip_orig_mod_prefix(state_dict: dict) -> dict:
+    if all(not k.startswith('_orig_mod.') for k in state_dict.keys()):
+        return state_dict
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith('_orig_mod.'):
+            nk = k[len('_orig_mod.') :]
+        else:
+            nk = k
+        out[nk] = v
+    return out
 
-    def _normalize_key(k: str) -> str:
-        changed = True
-        while changed:
-            changed = False
-            if k.startswith('module.'):
-                k = k[len('module.'):]
-                changed = True
-            if k.startswith('_orig_mod.'):
-                k = k[len('_orig_mod.'):]
-                changed = True
-        return k
 
-    if isinstance(sd_in, dict):
-        sd = {_normalize_key(k): v for k, v in sd_in.items()}
-    else:
-        sd = sd_in
+def _load_state_dict_robust(model: torch.nn.Module, state: dict) -> None:
+    model_sd = model.state_dict()
+    state = _strip_orig_mod_prefix(state)
+    filtered = {k: v for k, v in state.items() if (k in model_sd and getattr(v, 'shape', None) == model_sd[k].shape)}
+    if len(filtered) == 0:
+        raise RuntimeError('No matching parameters between checkpoint and current model.')
+    model.load_state_dict(filtered, strict=False)
 
-    def infer_config_from_state_dict(sdict: Dict[str, torch.Tensor]) -> Dict[str, int]:
-        d_model = None
-        for key, tensor in sdict.items():
-            if key.endswith('head.1.weight') or key.endswith('neuron_scalar_decoder_head.1.weight'):
-                if tensor.ndim == 2:
-                    d_model = int(tensor.shape[1])
-                    break
-        if d_model is None:
-            for key, tensor in sdict.items():
-                if 'stimuli_encoder.0.weight' in key and tensor.ndim == 2:
-                    d_model = int(tensor.shape[0])
-                    break
-        if d_model is None:
-            raise ValueError('Unable to infer d_model from checkpoint state_dict')
-        d_stimuli = 1
-        for key, tensor in sdict.items():
-            if 'stimuli_encoder.0.weight' in key and tensor.ndim == 2:
-                d_stimuli = int(tensor.shape[1])
-                break
-        layer_indices = set()
-        for k in sdict.keys():
-            if k.startswith('layers.'):
-                try:
-                    idx = int(k.split('.')[1])
-                    layer_indices.add(idx)
-                except Exception:
-                    pass
-        n_layers = max(layer_indices) + 1 if layer_indices else 1
-        n_heads = 8 if d_model % 8 == 0 else (4 if d_model % 4 == 0 else 2)
-        return {'d_model': d_model, 'd_stimuli': d_stimuli, 'n_layers': n_layers, 'n_heads': n_heads}
 
-    if not isinstance(model_cfg, dict) or any(k not in model_cfg for k in ('d_model', 'n_heads', 'n_layers')) or model_cfg.get('d_stimuli') in (None, 0):
-        inferred = infer_config_from_state_dict(sd)
-        d_model = inferred['d_model'] if not (isinstance(model_cfg, dict) and model_cfg.get('d_model')) else model_cfg['d_model']
-        d_stimuli = inferred['d_stimuli'] if not (isinstance(model_cfg, dict) and model_cfg.get('d_stimuli')) else model_cfg['d_stimuli']
-        n_layers = inferred['n_layers'] if not (isinstance(model_cfg, dict) and model_cfg.get('n_layers') is not None) else model_cfg['n_layers']
-        n_heads = inferred['n_heads'] if not (isinstance(model_cfg, dict) and model_cfg.get('n_heads') is not None) else model_cfg['n_heads']
-    else:
-        d_model = model_cfg['d_model']
-        d_stimuli = model_cfg.get('d_stimuli', 1)
-        n_layers = model_cfg['n_layers']
-        n_heads = model_cfg['n_heads']
+def find_experiment_root_from_ar_h5(ar_h5_path: str) -> str:
+    """Ascend from the AR H5 path until a directory containing config.yaml and checkpoints/ is found."""
+    cur = os.path.abspath(os.path.dirname(ar_h5_path))
+    while True:
+        if os.path.isfile(os.path.join(cur, 'config.yaml')) and os.path.isdir(os.path.join(cur, 'checkpoints')):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    raise ValueError(f"Could not find experiment root from AR H5 path: {ar_h5_path}")
 
-    model = GBM(d_model=d_model, d_stimuli=d_stimuli, n_heads=n_heads, n_layers=n_layers).to(device)
-    try:
-        model.spikes_are_rates = bool(spikes_are_rates)
-    except Exception:
-        model.spikes_are_rates = False
 
-    # Pre-shape routing centroid buffers to match checkpoint (avoid size-mismatch errors)
-    try:
-        for k, v in list(sd.items()):
-            if not k.endswith('.centroids'):
-                continue
-            module_path = k.rsplit('.', 1)[0]
-            cur = model
-            for part in module_path.split('.'):
-                if hasattr(cur, part):
-                    cur = getattr(cur, part)
-                else:
-                    try:
-                        idx = int(part)
-                        cur = cur[idx]
-                    except Exception:
-                        cur = None
-                        break
-            if cur is not None and hasattr(cur, 'centroids'):
-                try:
-                    setattr(cur, 'centroids', v.detach().clone().to(device=next(model.parameters()).device))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    model.load_state_dict(sd, strict=False)
+def load_model_from_experiment(exp_dir: str, device: torch.device, d_stimuli: int) -> GBM:
+    """Build GBM using experiment config and checkpoint, ensuring shapes match."""
+    cfg_path = os.path.join(exp_dir, 'config.yaml')
+    with open(cfg_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+    ckpt_path = os.path.join(exp_dir, 'checkpoints', 'best_model.pth')
+    state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    sd = state.get('model', state)
+    # Determine embedding size and the EXACT global ID mapping used during training
+    ne_key = None
+    gid_key = None
+    stim_w_key = None
+    for k in sd.keys():
+        if k.endswith('neuron_embed.weight'):
+            ne_key = k
+        if k.endswith('global_neuron_ids_sorted'):
+            gid_key = k
+        if k.endswith('stimuli_encoder.0.weight'):
+            stim_w_key = k
+    if ne_key is None:
+        raise ValueError("Checkpoint is missing neuron_embed.weight")
+    # Use the saved mapping; this is critical so searchsorted finds the right indices
+    if gid_key is None:
+        raise ValueError("Checkpoint is missing global_neuron_ids_sorted buffer needed for correct neuron ID mapping")
+    global_ids_tensor = sd[gid_key].to(torch.long)
+    if global_ids_tensor.ndim != 1 or global_ids_tensor.numel() < 1:
+        raise ValueError("global_neuron_ids_sorted in checkpoint is malformed")
+    # Enforce d_stimuli to EXACTLY match checkpoint to avoid random init due to shape mismatch
+    if stim_w_key is not None:
+        try:
+            d_stimuli_ckpt = int(sd[stim_w_key].shape[1])
+            d_stimuli = d_stimuli_ckpt
+        except Exception:
+            pass
+    d_model = int(cfg['model']['d_model'])
+    n_heads = int(cfg['model']['n_heads'])
+    n_layers = int(cfg['model']['n_layers'])
+    cov_rank = int(cfg['model'].get('cov_rank', 32))
+    num_neurons_total = int(cfg['model'].get('num_neurons_total', 4_000_000))
+    model = GBM(
+        d_model=d_model, d_stimuli=int(d_stimuli),
+        n_heads=n_heads, n_layers=n_layers,
+        num_neurons_total=num_neurons_total,
+        global_neuron_ids=global_ids_tensor,
+        cov_rank=cov_rank
+    ).to(device)
+    _load_state_dict_robust(model, sd)
     model.eval()
     return model
 
@@ -217,120 +203,73 @@ class BestSample:
     stim_future: Optional[np.ndarray]  # (1, Tgen, K) or None
     context_len: int
     base_n_steps: int
+    neuron_ids: Optional[np.ndarray] = None
+    log_activity_mean: Optional[np.ndarray] = None  # (1, N) or (N,)
+    log_activity_std: Optional[np.ndarray] = None   # (1, N) or (N,)
+    training_lm1: Optional[int] = None
 
 
 # --------------------------
 # Path resolution helpers
 # --------------------------
 
-def resolve_good_sample_h5_path(path: str) -> str:
-    """Resolve a usable good-sample H5 path.
-    Accepts:
-      - Direct path to *_data.h5 (best_ar_sample_* or good_ar_sample_*)
-      - Direct path to any H5: if it lacks required datasets, try sibling matches
-      - Directory path to an eval run: search videos/ for good_ar_sample_*_data.h5 then best_ar_sample_*_data.h5
-    Returns a valid file path or raises a ValueError with guidance.
-    """
-    if os.path.isdir(path):
-        # prefer good sample, fallback to best sample
-        patterns = ('good_ar_sample_', 'best_ar_sample_')
-        candidates: List[Tuple[float, str]] = []
-        for root, _dirs, files in os.walk(path):
-            if os.path.basename(root) != 'videos':
-                continue
-            for prefix in patterns:
-                for fn in files:
-                    if fn.startswith(prefix) and fn.endswith('_data.h5'):
-                        full = os.path.join(root, fn)
-                        candidates.append((os.path.getmtime(full), full))
-        if not candidates:
-            raise ValueError(f"No good/best *_data.h5 found under directory: {path}. Run eval_gbm.py to produce sample outputs.")
-        candidates.sort(reverse=True)
-        return candidates[0][1]
-
-    if os.path.isfile(path):
-        try:
-            with h5py.File(path, 'r') as f:
-                if 'initial_context' in f:
-                    return path
-        except Exception:
-            pass
-        parent = os.path.dirname(path)
-        sibs = [fn for fn in os.listdir(parent) if (fn.startswith('good_ar_sample_') or fn.startswith('best_ar_sample_')) and fn.endswith('_data.h5')]
-        if sibs:
-            sibs_full = [os.path.join(parent, fn) for fn in sibs]
-            sibs_full.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return sibs_full[0]
-        raise ValueError(
-            f"H5 at {path} does not contain 'initial_context'. Expected a file like 'good_ar_sample_*_data.h5' (or 'best_ar_sample_*_data.h5') produced by eval_gbm.py."
-        )
-
-    raise ValueError(f"Path not found: {path}")
-
-
-def load_good_sample_h5(path: str) -> BestSample:
-    resolved = resolve_good_sample_h5_path(path)
-    with h5py.File(resolved, 'r') as f:
-        if 'initial_context' not in f or 'positions' not in f or 'neuron_mask' not in f:
-            available = list(f.keys())
-            raise ValueError(
-                "Good-sample H5 missing required datasets. Required: 'initial_context', 'positions', 'neuron_mask'. "
-                f"Available: {available}. File: {resolved}"
-            )
-        init_ctx = f['initial_context'][()]  # (1, L, N)
-        pred_fut = f['pred_future'][()] if 'pred_future' in f else None
-        pos = f['positions'][()]
-        if pos.ndim == 2:
-            pos = pos[None, ...]
-        neuron_mask = f['neuron_mask'][()] if 'neuron_mask' in f else np.ones((pos.shape[0], pos.shape[1]), dtype=bool)
-        stim_ctx = f['stimulus_context'][()] if 'stimulus_context' in f else None
-        stim_fut = f['stimulus_future'][()] if 'stimulus_future' in f else None
-        context_len = int(f.attrs.get('context_len', init_ctx.shape[1]))
-        base_n_steps = int(f.attrs.get('n_steps', pred_fut.shape[1] if pred_fut is not None else context_len))
+def load_ar_run_h5(path: str) -> BestSample:
+    """Load a per-AR run H5 produced by eval_gbm2_ar.py (ar_runs/*.h5)."""
+    assert os.path.exists(path), f"AR H5 not found: {path}"
+    with h5py.File(path, 'r') as f:
+        required = ('context_rates', 'positions', 'neuron_mask')
+        for r in required:
+            if r not in f:
+                raise ValueError(f"AR H5 missing dataset '{r}': {path}")
+        ctx = f['context_rates'][()]           # (Tc, N)
+        pos = f['positions'][()]               # (N, 3)
+        mask = f['neuron_mask'][()]            # (N,)
+        fut_truth = f['future_truth_rates'][()] if 'future_truth_rates' in f else None  # (Tf,N)
+        fut_pred = f['future_pred_rates'][()] if 'future_pred_rates' in f else None     # (Tf,N)
+        stim_ctx = f['stimulus_context'][()] if 'stimulus_context' in f else None       # (Tc,K)
+        stim_fut = f['stimulus_future'][()] if 'stimulus_future' in f else None         # (Tf,K)
+        neuron_ids = f['neuron_ids'][()] if 'neuron_ids' in f else None
+        lam = f['log_activity_mean'][()] if 'log_activity_mean' in f else None
+        las = f['log_activity_std'][()] if 'log_activity_std' in f else None
+        Tc = int(f.attrs.get('Tc', ctx.shape[0]))
+        Tf = int(f.attrs.get('Tf', fut_pred.shape[0] if isinstance(fut_pred, np.ndarray) else (fut_truth.shape[0] if isinstance(fut_truth, np.ndarray) else 0)))
+        training_lm1 = int(f.attrs.get('training_Lm1', Tc))
+    init_ctx = ctx[None, ...].astype(np.float32)             # (1,Tc,N)
+    pos = pos[None, ...].astype(np.float32)                  # (1,N,3)
+    mask = mask[None, ...].astype(bool)                      # (1,N)
+    stim_ctx = None if stim_ctx is None else stim_ctx[None, ...].astype(np.float32)
+    stim_fut = None if stim_fut is None else stim_fut[None, ...].astype(np.float32)
+    fut_pred = None if fut_pred is None else fut_pred[None, ...].astype(np.float32)
     return BestSample(
-        initial_context=init_ctx.astype(np.float32),
-        pred_future=None if pred_fut is None else pred_fut.astype(np.float32),
-        positions_norm=pos.astype(np.float32),
-        neuron_mask=neuron_mask.astype(bool),
-        stim_context=None if stim_ctx is None else stim_ctx.astype(np.float32),
-        stim_future=None if stim_fut is None else stim_fut.astype(np.float32),
-        context_len=context_len,
-        base_n_steps=base_n_steps,
+        initial_context=init_ctx,
+        pred_future=fut_pred,
+        positions_norm=pos,
+        neuron_mask=mask,
+        stim_context=stim_ctx,
+        stim_future=stim_fut,
+        context_len=Tc,
+        base_n_steps=Tf,
+        neuron_ids=None if neuron_ids is None else neuron_ids.astype(np.int64),
+        log_activity_mean=None if lam is None else lam[None, ...].astype(np.float32) if lam.ndim == 1 else lam.astype(np.float32),
+        log_activity_std=None if las is None else las[None, ...].astype(np.float32) if las.ndim == 1 else las.astype(np.float32),
+        training_lm1=training_lm1
     )
+
+
+def resolve_experiment_from_ar_h5(path: str) -> Tuple[str, str]:
+    """Return (exp_dir, ckpt_path) derived from AR H5 location."""
+    exp_dir = find_experiment_root_from_ar_h5(path)
+    ckpt = os.path.join(exp_dir, 'checkpoints', 'best_model.pth')
+    if not os.path.exists(ckpt):
+        raise ValueError(f"Checkpoint not found under experiment: {ckpt}")
+    return exp_dir, ckpt
 
 
 @dataclass
 class MaskData:
-    label_volume: np.ndarray  # (X,Y,Z) int
+    label_volume: np.ndarray  # kept for compatibility, unused
     region_names: List[str]
     grid_shape: Tuple[int, int, int]
-
-
-def load_mask_h5(path: str) -> MaskData:
-    with h5py.File(path, 'r') as f:
-        label_volume = f['label_volume'][()].astype(np.int32)
-        region_names = [name.decode() if isinstance(name, bytes) else str(name) for name in f['region_names'][()]]
-        grid_shape = tuple(label_volume.shape)
-    return MaskData(label_volume=label_volume, region_names=region_names, grid_shape=grid_shape)
-
-
-def map_neurons_to_regions(positions_norm: np.ndarray, mask: MaskData) -> Dict[int, np.ndarray]:
-    # positions_norm: (1, N, 3) in [0,1] range
-    pos = positions_norm[0]
-    X, Y, Z = mask.grid_shape
-    # Clamp to valid voxel indices
-    ix = np.clip(np.round(pos[:, 0] * (X - 1)).astype(int), 0, X - 1)
-    iy = np.clip(np.round(pos[:, 1] * (Y - 1)).astype(int), 0, Y - 1)
-    iz = np.clip(np.round(pos[:, 2] * (Z - 1)).astype(int), 0, Z - 1)
-    labels = mask.label_volume[ix, iy, iz]
-    region_to_indices: Dict[int, List[int]] = {}
-    for idx, rid in enumerate(labels.tolist()):
-        if rid <= 0:
-            continue
-        if rid not in region_to_indices:
-            region_to_indices[rid] = []
-        region_to_indices[rid].append(idx)
-    return {rid: np.array(indices, dtype=np.int64) for rid, indices in region_to_indices.items()}
 
 
 # --------------------------
@@ -341,14 +280,12 @@ def map_neurons_to_regions(positions_norm: np.ndarray, mask: MaskData) -> Dict[i
 class ExperimentJob:
     job_id: str
     session_id: str
-    selected_region_ids: List[int]
+    neuron_indices: List[int]
     add_rate_hz: float
     ar_steps: int
     status: str = 'pending'  # pending | running | complete | error
     error: Optional[str] = None
     result_npz_path: Optional[str] = None
-    heatmap_path: Optional[str] = None
-    heatmap_info: Optional[Dict[str, Any]] = None
     result_frames: Optional[np.ndarray] = None  # (Tgen, N)
 
 
@@ -477,27 +414,25 @@ def worker_loop():
             # Build future stimulus per job
             future_stim_list: List[np.ndarray] = []
             requested_steps: List[int] = []
+            # Prepare shared tensors
+            ids_np = BEST.neuron_ids if BEST.neuron_ids is not None else np.arange(N, dtype=np.int64)[None, :]
+            ids_np = np.repeat(ids_np[None, ...] if ids_np.ndim == 1 else ids_np, repeats=B, axis=0) if ids_np.ndim == 1 else np.repeat(ids_np, repeats=B, axis=0)
+            lam_np = BEST.log_activity_mean if BEST.log_activity_mean is not None else None
+            las_np = BEST.log_activity_std if BEST.log_activity_std is not None else None
 
             for b_idx, job in enumerate(batch):
                 # Gather indices from selected regions
-                if job.selected_region_ids:
-                    indices_sets = [REGION_TO_NEURON.get(rid, np.array([], dtype=np.int64)) for rid in job.selected_region_ids]
-                    if indices_sets:
-                        region_indices = np.unique(np.concatenate(indices_sets))
-                        region_indices = region_indices[neuron_mask[region_indices]]  # respect mask
-                    else:
-                        region_indices = np.array([], dtype=np.int64)
+                if job.neuron_indices:
+                    region_indices = np.array([int(i) for i in job.neuron_indices if 0 <= int(i) < N], dtype=np.int64)
+                    if region_indices.size > 0:
+                        region_indices = region_indices[neuron_mask[region_indices]]
                 else:
                     region_indices = np.array([], dtype=np.int64)
 
-                # Compute delta in the correct domain
-                if CFG.data.spikes_are_rates:
-                    delta = float(job.add_rate_hz)
-                else:
-                    # Convert delta rate to probability increment
-                    delta = 1.0 - math.exp(-float(job.add_rate_hz) / max(1e-6, sampling_rate_hz))
+                # Compute delta in rate (Hz) domain (clamped 0..10 from UI)
+                delta = float(job.add_rate_hz)
 
-                if region_indices.size > 0:
+                if region_indices.size > 0 and delta > 0.0:
                     init_x[b_idx, -1, region_indices] = init_x[b_idx, -1, region_indices] + delta
 
                 if CFG.data.clip_01_before_ar:
@@ -523,45 +458,40 @@ def worker_loop():
 
             results_per_job: Dict[int, np.ndarray] = {}
             for n_steps, job_indices in steps_to_jobs.items():
-                bsize = len(job_indices)
-                # Build tensors
-                x_t = to_torch(init_x[job_indices], device=DEVICE, dtype=dtype)
-                stim_t = to_torch(init_stim[job_indices], device=DEVICE, dtype=dtype)
-                pos_t = to_torch(BEST.positions_norm[0][None, ...].repeat(bsize, axis=0), device=DEVICE, dtype=dtype)
-                mask_t = torch.from_numpy(BEST.neuron_mask[0][None, :].repeat(bsize, axis=0)).to(device=DEVICE)
-                fut_stim_np = np.stack([future_stim_list[j] for j in job_indices], axis=0)  # (B, n_steps, K)
-                fut_stim_t = to_torch(fut_stim_np, device=DEVICE, dtype=dtype)
-
-                with torch.no_grad():
-                    gen_seq = MODEL.autoregress(
-                        init_x=x_t,
-                        init_stimuli=stim_t,
-                        point_positions=pos_t,
-                        neuron_pad_mask=mask_t,
-                        future_stimuli=fut_stim_t,
-                        n_steps=n_steps,
-                        context_len=BEST.context_len,
-                    )  # (B, L + n_steps, N) in model's native domain
-                gen_only = gen_seq[:, -n_steps:, :]  # (B, n_steps, N)
-                results = gen_only.detach().float().cpu().numpy()
-                for loc_idx, job_index in enumerate(job_indices):
-                    results_per_job[job_index] = results[loc_idx]
+                # Run exactly like eval for each job independently
+                max_context_len = int(BEST.training_lm1) if isinstance(BEST.training_lm1, int) and BEST.training_lm1 > 0 else int(BEST.context_len)
+                for job_index in job_indices:
+                    init_context = torch.from_numpy(init_x[job_index:job_index+1]).to(device=DEVICE, dtype=torch.float32)  # (1,L,N)
+                    stim_ctx_j = torch.from_numpy(init_stim[job_index:job_index+1]).to(device=DEVICE, dtype=torch.float32)  # (1,L,K)
+                    fut_stim_j = torch.from_numpy(future_stim_list[job_index][None, ...]).to(device=DEVICE, dtype=torch.float32)
+                    stim_full_j = torch.cat([stim_ctx_j, fut_stim_j], dim=1)  # (1, L+n_steps, K)
+                    pos_j = to_torch(BEST.positions_norm[0:1], device=DEVICE, dtype=dtype)  # (1,N,3)
+                    mask_j = torch.from_numpy(BEST.neuron_mask[0:1]).to(device=DEVICE)
+                    ids_j = torch.from_numpy(ids_np[job_index:job_index+1]).to(device=DEVICE, dtype=torch.long)
+                    if lam_np is None:
+                        lam_j = None
+                    else:
+                        lam_arr = lam_np if lam_np.ndim == 2 else lam_np[None, ...]
+                        lam_j = torch.from_numpy(lam_arr).to(device=DEVICE, dtype=torch.float32)
+                    if las_np is None:
+                        las_j = None
+                    else:
+                        las_arr = las_np if las_np.ndim == 2 else las_np[None, ...]
+                        las_j = torch.from_numpy(las_arr).to(device=DEVICE, dtype=torch.float32)
+                    pred_rates, _ctx_counts, _pred_counts = eval_ar_rollout(
+                        MODEL, init_context, stim_full_j, pos_j, mask_j, ids_j,
+                        lam_j if lam_j is not None else None,
+                        las_j if las_j is not None else None,
+                        DEVICE, n_steps, sampling_rate_hz, max_context_len
+                    )
+                    results_per_job[job_index] = pred_rates.detach().cpu().numpy().astype(np.float32)
 
             # Persist outputs per job
             for j_idx, job in enumerate(batch):
                 try:
                     gen_future = results_per_job[j_idx]  # (n_steps, N)
-                    # If no regions selected, use the external baseline for exact equality (regardless of rate delta)
-                    try:
-                        no_regions = (not job.selected_region_ids) or (np.size(job.selected_region_ids) == 0)
-                        if no_regions and BASELINE_FUTURE is not None and isinstance(BASELINE_FUTURE, np.ndarray):
-                            n_steps = int(job.ar_steps)
-                            if BASELINE_FUTURE.ndim == 2 and BASELINE_FUTURE.shape[0] >= n_steps:
-                                gen_future = BASELINE_FUTURE[:n_steps].astype(np.float32)
-                    except Exception:
-                        pass
                     job.result_frames = gen_future
-                    # Save NPZ: make directory unique with timestamp + job_id
+                    # Save NPZ: make directory unique with timestamp + job_id (never inside experiment dir)
                     out_dir = os.path.join(CFG.storage.output_root, f"{time.strftime('%Y%m%d_%H%M%S')}_{job.job_id}")
                     os.makedirs(out_dir, exist_ok=True)
                     npz_path = os.path.join(out_dir, f'{job.job_id}.npz')
@@ -572,74 +502,11 @@ def worker_loop():
                         baseline_future=(BASELINE_FUTURE if BASELINE_FUTURE is not None else (BEST.pred_future[0] if BEST.pred_future is not None else np.zeros((0, BEST.initial_context.shape[2]), dtype=np.float32))),
                         positions=BEST.positions_norm[0],
                         neuron_mask=BEST.neuron_mask[0],
-                        selected_regions=np.array(job.selected_region_ids, dtype=np.int32),
+                        selected_neurons=np.array(job.neuron_indices, dtype=np.int32),
                         add_rate_hz=np.array([job.add_rate_hz], dtype=np.float32),
                         sampling_rate_hz=np.array([CFG.data.sampling_rate_hz], dtype=np.float32),
                     )
                     job.result_npz_path = npz_path
-
-                    # Heatmap
-                    heatmap_path = os.path.join(out_dir, f'{job.job_id}_heatmap.png')
-                    try:
-                        import matplotlib
-                        matplotlib.use('Agg')
-                        import matplotlib.pyplot as plt
-                        # Compute baseline vs generated sums for selected regions
-                        # Always use external baseline
-                        base = BASELINE_FUTURE
-                        Texp = gen_future.shape[0]
-                        Tbase = base.shape[0]
-                        T = min(Texp, Tbase)
-                        base = base[:T]
-                        exp = gen_future[:T]
-                        # Build heatmap matrix (R x T)
-                        rows = []
-                        row_labels = []
-                        eps = 1e-6
-                        # Whole brain (all valid neurons by mask)
-                        try:
-                            valid_idx = np.where(BEST.neuron_mask[0].astype(bool))[0]
-                        except Exception:
-                            valid_idx = np.arange(base.shape[1], dtype=np.int64)
-                        if valid_idx.size > 0:
-                            base_sum_wb = base[:, valid_idx].sum(axis=1)
-                            exp_sum_wb = exp[:, valid_idx].sum(axis=1)
-                            rel_wb = (exp_sum_wb - base_sum_wb) / np.maximum(base_sum_wb, eps)
-                            rows.append(rel_wb.astype(np.float32))
-                        else:
-                            rows.append(np.zeros((T,), dtype=np.float32))
-                        row_labels.append('Whole brain')
-
-                        # All regions
-                        for rid in range(1, len(MASK.region_names) + 1):
-                            idxs = REGION_TO_NEURON.get(rid, np.array([], dtype=np.int64))
-                            if idxs.size == 0:
-                                rows.append(np.zeros((T,), dtype=np.float32))
-                                row_labels.append(f'{MASK.region_names[rid - 1]} (empty)')
-                                continue
-                            base_sum = base[:, idxs].sum(axis=1)
-                            exp_sum = exp[:, idxs].sum(axis=1)
-                            rel = (exp_sum - base_sum) / np.maximum(base_sum, eps)
-                            rows.append(rel.astype(np.float32))
-                            row_labels.append(MASK.region_names[rid - 1])
-                        mat = np.stack(rows, axis=0) if rows else np.zeros((1, 1), dtype=np.float32)
-                        fig, ax = plt.subplots(figsize=(max(6, T * 0.25), max(4, len(row_labels) * 0.22)))
-                        im = ax.imshow(mat, aspect='auto', cmap='bwr', vmin=-1.0, vmax=1.0, interpolation='nearest')
-                        ax.set_xlabel('AR timestep')
-                        ax.set_ylabel('Region')
-                        ax.set_yticks(np.arange(len(row_labels)))
-                        ax.set_yticklabels(row_labels)
-                        fig.colorbar(im, ax=ax, shrink=0.8, label='(exp - base)/base')
-                        fig.tight_layout()
-                        fig.savefig(heatmap_path, dpi=130, bbox_inches='tight')
-                        plt.close(fig)
-                        job.heatmap_path = heatmap_path
-                        try:
-                            job.heatmap_info = {'requested_steps': int(Texp), 'baseline_steps': int(Tbase), 'used_steps': int(T)}
-                        except Exception:
-                            job.heatmap_info = None
-                    except Exception as e:
-                        job.heatmap_path = None
                     job.status = 'complete'
                 except Exception as e:
                     job.status = 'error'
@@ -751,7 +618,7 @@ def index():
       <div class="control-group">
         <h3>Model</h3>
         <div>
-          <button id="open-preprint">Open Model Preprint</button>
+          <button id="open-preprint">Open Model Paper</button>
         </div>
       </div>
 
@@ -771,23 +638,18 @@ def index():
        </div>
 
       <div class="control-group">
-        <h3>Regions</h3>
-        <div style="margin: 6px 0;">
-          <button id="select-all">Select All</button>
-          <button id="clear-all">Clear All</button>
-        </div>
-        <div class="region-list" id="region-list"></div>
-      </div>
-
-      <div class="control-group">
-        <h3>Experiment</h3>
+        <h3>Stimulation</h3>
         <div>
-          <label>Spike-probability delta:</label>
-          <input type="number" id="rate-delta" value="0.2" step="0.05" min="0" />
+          <label>Spike rate delta (Hz):</label>
+          <input type="number" id="rate-delta" value="0" step="0.1" min="0" max="10" />
         </div>
-        <div>
-          <label>AR Steps:</label>
-          <input type="number" id="ar-steps" value="{{ ar_default }}" step="1" min="1" />
+        <div class="slider-container" style="margin-top:6px;">
+          <label for="stim-size">Cube size</label>
+          <input type="range" id="stim-size" min="2" max="60" value="18" step="1" />
+        </div>
+        <div class="slider-container" style="margin-top:6px;">
+          <label for="ar-steps">AR Steps: <span id="ar-steps-val">{{ ar_default }}</span></label>
+          <input type="range" id="ar-steps" min="1" max="10" value="{{ ar_default }}" step="1" />
         </div>
         {% if ts_key %}
         <div style="margin:6px 0;">
@@ -800,28 +662,24 @@ def index():
         <div id="queue-status" style="margin-top:8px;font-size:12px;color:#ccc;">Queue: idle</div>
         <div id="result-links" style="display:none;margin-top:8px;">
           <button id="download-npz">Download initial and predicted activity data (NPZ)</button>
-          <button id="open-heatmap">Open Region Activity Heatmap</button>
         </div>
       </div>
+
     </div>
 
     <div id="viewport" style="position:relative; z-index: 1;">
       <div id="loading">Loading...</div>
       <canvas id="canvas"></canvas>
-      <div id="heatmap-overlay" style="position:absolute; top:10%; left:10%; width:80%; height:80%; background:rgba(0,0,0,0.85); border:1px solid #444; border-radius:6px; display:none; z-index: 1002; padding:8px; box-sizing:border-box;">
-        <div style="display:flex; justify-content:space-between; align-items:center; color:#dddddd; margin-bottom:6px;">
-          <span>Autoregression Heatmap (scroll to zoom, drag to pan)</span>
-          <button id="close-heatmap">Close</button>
-        </div>
-        <div id="heatmap-note" style="color:#cccccc; font-size:12px; margin: 2px 0 6px 0; display:none;"></div>
-        <div id="heatmap-viewport" style="position:relative; width:100%; height:calc(100% - 32px); overflow:hidden; background:#111; cursor:grab;">
-          <div id="heatmap-content" style="position:absolute; top:0; left:0; transform-origin: 0 0;">
-            <img id="heatmap-img" alt="Heatmap" style="display:none; user-select:none; pointer-events:none;" />
-          </div>
-          <div id="heatmap-error" style="position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); display:none; color:#ff8888; font-size:14px;">Heatmap not available.</div>
-        </div>
-      </div>
         <div id="status-text" style="position:absolute; bottom:56px; left:50%; transform:translateX(-50%); color:#aaaaaa; font-size:24px; background:rgba(0,0,0,0.4); padding:4px 8px; border-radius:4px;">Viewing initial brain activity</div>
+        <div id="instructions" style="position:absolute; bottom:8px; left:8px; max-width:320px; background:rgba(0,0,0,0.60); color:#ddd; font-size:11px; line-height:1.25; padding:6px 8px; border-radius:4px; box-shadow: 0 0 6px rgba(0,0,0,0.35); z-index: 1002;">
+          <div style="font-weight:600; color:#f0f0f0; margin-bottom:4px;">Quick guide</div>
+          <div style="margin:0;">
+            • Right‑click to place/lock the cube. Use “Cube size” to adjust.<br/>
+            • “Spike Δ” sets stimulation strength. “AR Steps” sets rollout length.<br/>
+            • Run Experiment → generates future frames; Space toggles play/pause.<br/>
+            • Reset to Initial → clears cube and returns to the context.
+          </div>
+        </div>
         <div id="video-controls" style="position:absolute; bottom:0; left:0; right:0; background:linear-gradient(0deg, rgba(10,10,14,0.92), rgba(10,10,14,0.68)); padding:6px 8px; display:flex; align-items:center; gap:8px; z-index: 1001;">
           <button id="play-pause">Pause</button>
           <div id="progress-wrap" style="position:relative; flex:1; display:flex; align-items:center;">
@@ -855,6 +713,15 @@ def index():
     let playbackTimeSec = 0.0;
     let totalDurationSec = 0.0;
     const fps = {{ fps }};
+    const verificationEnabled = {{ 1 if ts_key else 0 }};
+    let stimCube = null;
+    let stimCenter = null;
+    let stimSize = 18.0; // cube edge length (same units as positions after scaling)
+    let stimLocked = false;
+    let selectedNeuronIndices = [];
+    const raycaster = new THREE.Raycaster();
+    raycaster.params.Points = { threshold: 3.0 };
+    const mouse = new THREE.Vector2(-2, -2); // offscreen initially
 
     async function fetchJSON(url) { const r = await fetch(url); return await r.json(); }
 
@@ -871,11 +738,47 @@ def index():
       controls.target.set(50,50,50);
       controls.update();
       const light = new THREE.AmbientLight(0x404040, 0.8); scene.add(light);
+      // Stimulation cube
+      const boxGeom = new THREE.BoxGeometry(1.0, 1.0, 1.0);
+      const boxMat = new THREE.MeshBasicMaterial({ color: 0xff8800, transparent: true, opacity: 0.18, depthWrite: false });
+      stimCube = new THREE.Mesh(boxGeom, boxMat);
+      stimCube.visible = false;
+      scene.add(stimCube);
       window.addEventListener('resize', () => {
         camera.aspect = window.innerWidth / window.innerHeight;
         camera.updateProjectionMatrix();
         renderer.setSize(window.innerWidth, window.innerHeight);
       });
+      // Mouse events
+      renderer.domElement.addEventListener('mousemove', (e) => {
+        const rect = renderer.domElement.getBoundingClientRect();
+        mouse.x = ((e.clientX - rect.left) / rect.width) * 1.0 * 2 - 1;
+        mouse.y = -(((e.clientY - rect.top) / rect.height) * 1.0) * 2 + 1;
+      });
+      renderer.domElement.addEventListener('contextmenu', (e) => {
+        // Right-click: fix current cube center and compute neuron indices inside cube
+        e.preventDefault();
+        if (!positionsAttr) return;
+        // If there is a raycast hit, snap cube to that point
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObject(points);
+        if (intersects && intersects.length > 0) {
+          const p = intersects[0].point;
+          stimCube.position.copy(p);
+          stimCube.visible = true;
+        }
+        // Lock and gather indices
+        stimLocked = true;
+        const n = positionsAttr.count;
+        selectedNeuronIndices = [];
+        const cx = stimCube.position.x, cy = stimCube.position.y, cz = stimCube.position.z;
+        const half = stimSize * 0.5;
+        for (let i=0;i<n;i++) {
+          const x = positionsAttr.getX(i), y = positionsAttr.getY(i), z = positionsAttr.getZ(i);
+          const dx = Math.abs(x - cx), dy = Math.abs(y - cy), dz = Math.abs(z - cz);
+          if (dx <= half && dy <= half && dz <= half) selectedNeuronIndices.push(i);
+        }
+      }, false);
       animate();
     }
 
@@ -977,6 +880,25 @@ def index():
       scene.add(points);
     }
 
+    function updateStimCube() {
+      if (!points) return;
+      if (stimLocked) {
+        // Keep cube where it was clicked; only ensure scale matches current slider
+        if (stimCube) stimCube.scale.set(stimSize, stimSize, stimSize);
+        return;
+      }
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObject(points);
+      if (intersects && intersects.length > 0) {
+        const p = intersects[0].point;
+        stimCube.position.copy(p);
+        stimCube.visible = true;
+        stimCube.scale.set(stimSize, stimSize, stimSize);
+      } else {
+        stimCube.visible = false;
+      }
+    }
+
     function updateColorsForFrame(values) {
       const n = Math.min(values.length, colorsAttr.count);
       const alphaAttr = geometry.getAttribute('aAlpha');
@@ -1066,6 +988,7 @@ def index():
           td.textContent = `${formatTime(playbackTimeSec)} / ${formatTime(totalDurationSec)}`;
         }
       }
+      updateStimCube();
       renderer.render(scene, camera);
     }
 
@@ -1112,40 +1035,9 @@ def index():
       }
     }
 
-    function populateRegionList() {
-      const rl = document.getElementById('region-list');
-      rl.innerHTML = '';
-      for (let i=0;i<regionNames.length;i++) {
-        const wrap = document.createElement('div');
-        wrap.className = 'region-item';
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.value = String(i+1);
-        cb.id = `region-${i+1}`;
-        const label = document.createElement('label');
-        label.setAttribute('for', cb.id);
-        label.textContent = String(regionNames[i] ?? `Region ${i+1}`);
-        wrap.appendChild(cb);
-        wrap.appendChild(label);
-        rl.appendChild(wrap);
-      }
-      document.getElementById('select-all').onclick = async () => {
-        document.querySelectorAll('#region-list input[type=checkbox]').forEach(cb => cb.checked = true);
-        // Fetch and show all
-        const boxes = document.querySelectorAll('#region-list input[type=checkbox]');
-        for (const cb of boxes) { await onRegionCheckboxChange({ target: cb }); }
-      };
-      document.getElementById('clear-all').onclick = () => {
-        document.querySelectorAll('#region-list input[type=checkbox]').forEach(cb => cb.checked = false);
-        Object.values(regionMeshes).forEach(m => m.visible = false);
-      };
-      rl.addEventListener('change', onRegionCheckboxChange);
-    }
-
     async function loadInit() {
       const meta = await fetchJSON('/api/init_data');
-      positions = meta.positions; neuronMask = meta.neuron_mask; regionNames = meta.region_names; initialFrames = meta.initial_frames;
-      populateRegionList();
+      positions = meta.positions; neuronMask = meta.neuron_mask; initialFrames = meta.initial_frames;
       createPoints();
       playbackFrames = initialFrames; isPlaying = true; playbackTimeSec = 0.0; preparePlayback();
       renderFrameAtTime(playbackTimeSec);
@@ -1173,25 +1065,25 @@ def index():
     }
 
     async function submitExperiment() {
-      const selected = Array.from(document.querySelectorAll('#region-list input[type=checkbox]:checked')).map(cb => parseInt(cb.value));
       const rateDelta = parseFloat(document.getElementById('rate-delta').value);
       const arSteps = parseInt(document.getElementById('ar-steps').value);
-      const cfToken = getTurnstileToken();
-      if (!cfToken) { alert('Please complete the verification.'); return; }
+      const cfToken = verificationEnabled ? getTurnstileToken() : null;
+      if (verificationEnabled && !cfToken) { alert('Please complete the verification.'); return; }
+      // No automatic hover selection: only use indices from explicit right-click lock
       let resp, data;
       try {
-        resp = await fetch('/api/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ regions: selected, add_rate_hz: rateDelta, ar_steps: arSteps, cf_turnstile_token: cfToken }) });
+        resp = await fetch('/api/submit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ neuron_indices: selectedNeuronIndices, add_rate_hz: rateDelta, ar_steps: arSteps, cf_turnstile_token: cfToken }) });
         data = await resp.json();
       } catch (e) {
-        resetTurnstile();
+        if (verificationEnabled) resetTurnstile();
         alert('Network error submitting experiment');
         return;
       } finally {
         // Always refresh token after an attempt (tokens are single-use)
-        resetTurnstile();
+        if (verificationEnabled) resetTurnstile();
       }
       if (!resp.ok) {
-        if (resp.status === 403 && (data && (data.error === 'verification_failed' || data.error === 'verification_error' || data.error === 'verification_required'))) {
+        if (verificationEnabled && resp.status === 403 && (data && (data.error === 'verification_failed' || data.error === 'verification_error' || data.error === 'verification_required'))) {
           alert('Verification failed or expired. Please complete the verification again.');
         } else {
           alert((data && data.error) || 'Submit failed');
@@ -1297,6 +1189,24 @@ def index():
     document.addEventListener('DOMContentLoaded', () => {
       initThree();
       loadInit();
+      // Bind radius slider
+      const sr = document.getElementById('stim-size');
+      if (sr) {
+        stimSize = parseFloat(sr.value);
+        sr.oninput = (e) => {
+          stimSize = parseFloat(e.target.value);
+          if (stimCube) stimCube.scale.set(stimSize, stimSize, stimSize);
+        };
+      }
+      // Bind AR steps value display
+      const arSlider = document.getElementById('ar-steps');
+      const arLabelVal = document.getElementById('ar-steps-val');
+      if (arSlider && arLabelVal) {
+        const syncAr = () => { arLabelVal.textContent = String(parseInt(arSlider.value)); };
+        syncAr();
+        arSlider.oninput = syncAr;
+        arSlider.onchange = syncAr;
+      }
       // Mobile controls toggle
       const toggleBtn = document.getElementById('toggle-controls');
       const controlsPanel = document.getElementById('controls');
@@ -1336,7 +1246,7 @@ def index():
       }
       const preprintBtn = document.getElementById('open-preprint');
       if (preprintBtn) {
-        preprintBtn.onclick = () => { window.open('https://samfv.systems/Preprint0.pdf', '_blank', 'noopener'); };
+        preprintBtn.onclick = () => { window.open('https://arxiv.org/abs/2510.27366', '_blank', 'noopener'); };
       }
       document.getElementById('run-experiment').onclick = () => { submitExperiment(); };
       document.getElementById('reset-view').onclick = () => {
@@ -1346,6 +1256,10 @@ def index():
         renderFrameAtTime(playbackTimeSec);
         const statusText = document.getElementById('status-text');
         statusText.textContent = 'Viewing initial brain activity';
+        // Clear stimulation cube and selection
+        selectedNeuronIndices = [];
+        stimLocked = false;
+        if (stimCube) { stimCube.visible = false; }
       };
       // Spacebar toggles play/pause unless typing in text/number inputs, textarea, or contenteditable
       window.addEventListener('keydown', (e) => {
@@ -1375,7 +1289,8 @@ def index():
 </body>
 </html>
 """
-    response = make_response(render_template_string(html_template, ts=ts, ar_default=int(CFG.ar.default_ar_steps), fps=float(CFG.data.sampling_rate_hz), ts_key=getattr(CFG.server, 'turnstile_site_key', '') or None))
+    ts_key_render = None if getattr(CFG.server, 'disable_verification', False) else (getattr(CFG.server, 'turnstile_site_key', '') or None)
+    response = make_response(render_template_string(html_template, ts=ts, ar_default=int(CFG.ar.default_ar_steps), fps=float(CFG.data.sampling_rate_hz), ts_key=ts_key_render))
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
@@ -1394,7 +1309,6 @@ def api_init_data():
     scale = 300.0 / ratio[0]
     pos_scaled = (pos * ratio * scale).astype(np.float32).tolist()
     return jsonify({
-        'region_names': MASK.region_names,
         'initial_frames': frames,
         'positions': pos_scaled,
         'neuron_mask': BEST.neuron_mask[0].astype(bool).tolist(),
@@ -1410,13 +1324,15 @@ def api_submit():
     # Input structure validation
     if not isinstance(body, dict):
         return jsonify({'error': 'invalid_json'}), 400
-    selected_regions = body.get('regions')
+    neuron_indices = body.get('neuron_indices')
     add_rate_hz_raw = body.get('add_rate_hz')
     ar_steps_raw = body.get('ar_steps')
-    if not isinstance(selected_regions, list):
-        return jsonify({'error': 'invalid_regions'}), 400
-    if any((not isinstance(r, (int, float))) for r in selected_regions):
-        return jsonify({'error': 'invalid_region_ids'}), 400
+    if neuron_indices is None:
+        neuron_indices = []
+    if not isinstance(neuron_indices, list):
+        return jsonify({'error': 'invalid_neuron_indices'}), 400
+    if any((not isinstance(r, (int, float))) for r in neuron_indices):
+        return jsonify({'error': 'invalid_neuron_indices_types'}), 400
     try:
         add_rate_hz = float(add_rate_hz_raw)
     except Exception:
@@ -1431,28 +1347,29 @@ def api_submit():
     MAX_AR_STEPS = 128
     if ar_steps < 1 or ar_steps > MAX_AR_STEPS:
         return jsonify({'error': f'ar_steps_out_of_range_max_{MAX_AR_STEPS}'}), 400
-    if len(selected_regions) > 1024:
-        return jsonify({'error': 'too_many_regions'}), 400
-    # Unconditional Turnstile verification
-    ts_secret = os.environ.get('TURNSTILE_SECRET', '').strip()
-    ts_site = getattr(CFG.server, 'turnstile_site_key', '')
-    cf_token = body.get('cf_turnstile_token')
-    if not ts_secret or not ts_site:
-        return jsonify({'error': 'verification_not_configured'}), 503
-    if not cf_token:
-        return jsonify({'error': 'verification_required'}), 403
-    try:
-        v = requests.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', data={
-            'secret': ts_secret,
-            'response': cf_token,
-            'remoteip': request.remote_addr
-        }, timeout=5)
-        v.raise_for_status()
-        vj = v.json()
-        if not vj.get('success'):
-            return jsonify({'error': 'verification_failed'}), 403
-    except Exception:
-        return jsonify({'error': 'verification_error'}), 403
+    if len(neuron_indices) > 200000:
+        return jsonify({'error': 'too_many_neurons'}), 400
+    # Turnstile verification (can be disabled by config/flag)
+    if not getattr(CFG.server, 'disable_verification', False):
+        ts_secret = os.environ.get('TURNSTILE_SECRET', '').strip()
+        ts_site = getattr(CFG.server, 'turnstile_site_key', '')
+        cf_token = body.get('cf_turnstile_token')
+        if not ts_secret or not ts_site:
+            return jsonify({'error': 'verification_not_configured'}), 503
+        if not cf_token:
+            return jsonify({'error': 'verification_required'}), 403
+        try:
+            v = requests.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', data={
+                'secret': ts_secret,
+                'response': cf_token,
+                'remoteip': request.remote_addr
+            }, timeout=5)
+            v.raise_for_status()
+            vj = v.json()
+            if not vj.get('success'):
+                return jsonify({'error': 'verification_failed'}), 403
+        except Exception:
+            return jsonify({'error': 'verification_error'}), 403
 
     # One job at a time per session
     sid = session.get('sid')
@@ -1471,7 +1388,7 @@ def api_submit():
     job = ExperimentJob(
         job_id=job_id,
         session_id=sid,
-        selected_region_ids=[int(r) for r in selected_regions],
+        neuron_indices=[int(r) for r in neuron_indices],
         add_rate_hz=add_rate_hz,
         ar_steps=ar_steps,
     )
@@ -1496,9 +1413,8 @@ def api_status():
     if job.status == 'running':
         return jsonify({'job_id': job_id, 'status': job.status})
     if job.status == 'complete':
-        return jsonify({'job_id': job_id, 'status': job.status, 'heatmap': os.path.basename(job.heatmap_path) if job.heatmap_path else None, 'heatmap_info': job.heatmap_info})
+        return jsonify({'job_id': job_id, 'status': job.status})
     return jsonify({'job_id': job_id, 'status': job.status, 'error': job.error})
-
 
 @app.route('/api/result_frames/<job_id>')
 def api_result_frames(job_id: str):
@@ -1523,57 +1439,7 @@ def api_download_npz(job_id: str):
     return send_file(full_path, as_attachment=True)
 
 
-@app.route('/api/heatmap/<path:filename>')
-def api_heatmap(filename: str):
-    full_path = os.path.join(CFG.storage.output_root, filename)
-    if not os.path.exists(full_path):
-        for root, _dirs, files in os.walk(CFG.storage.output_root):
-            if filename in files:
-                full_path = os.path.join(root, filename)
-                break
-    if not os.path.exists(full_path):
-        return jsonify({'error': 'File not found'}), 404
-    return send_file(full_path, mimetype='image/png')
-
-
-def _extract_region_surface_vertices_scaled(mask: MaskData, region_id: int, subsample: int = 4) -> np.ndarray:
-    try:
-        from scipy import ndimage
-    except Exception:
-        return np.empty((0, 3), dtype=np.float32)
-    region_mask = (mask.label_volume == region_id)
-    if not np.any(region_mask):
-        return np.empty((0, 3), dtype=np.float32)
-    if subsample > 1:
-        region_mask = region_mask[::subsample, ::subsample, ::subsample]
-    interior = ndimage.binary_erosion(region_mask)
-    surface = region_mask & (~interior)
-    coords = np.array(np.where(surface)).T.astype(np.float32)
-    if coords.size == 0:
-        return np.empty((0, 3), dtype=np.float32)
-    if subsample > 1:
-        coords *= subsample
-    X, Y, Z = mask.grid_shape
-    # normalize to [0,1]
-    coords[:, 0] /= float(X)
-    coords[:, 1] /= float(Y)
-    coords[:, 2] /= float(Z)
-    # apply the same anisotropic scaling as neurons: X=2*Y, Z=2/3*Y then normalize so X spans ~300
-    ratio = np.array([2.0, 1.0, 2.0/3.0], dtype=np.float32)
-    scale = 300.0 / ratio[0]
-    coords = coords * ratio * scale
-    return coords.astype(np.float32)
-
-
-@app.route('/api/region_surface/<int:region_id>')
-def api_region_surface(region_id: int):
-    try:
-        if region_id < 1 or region_id > len(MASK.region_names):
-            return jsonify({'error': f'invalid region id {region_id}'}), 400
-        verts = _extract_region_surface_vertices_scaled(MASK, region_id, subsample=4)
-        return jsonify({'region_id': int(region_id), 'vertices': verts.tolist()})
-    except Exception as e:
-        return jsonify({'region_id': int(region_id), 'vertices': []})
+    # Heatmap and region-surface endpoints removed
 
 
 # --------------------------
@@ -1583,12 +1449,30 @@ def api_region_surface(region_id: int):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Zebrafish Brain In-Silico Experiment Platform Web UI')
-    parser.add_argument('--config', required=True, help='Path to YAML config')
+    parser.add_argument('--config', required=False, help='Path to YAML config')
+    parser.add_argument('--ar_h5', required=False, help='Path to eval_gbm2_ar per-AR H5 (overrides data.ar_h5 in config)')
+    parser.add_argument('--no_verification', action='store_true', help='Disable verification (turnstile) regardless of config')
     args = parser.parse_args()
 
     global CFG, DEVICE, MODEL, BEST, MASK, REGION_TO_NEURON, QUEUE_OBJ, BASELINE_FUTURE
 
-    CFG = load_yaml_config(args.config)
+    if args.config:
+        CFG = load_yaml_config(args.config)
+    else:
+        # Minimal default config; must provide --ar_h5
+        assert args.ar_h5, "--ar_h5 is required when no --config is provided"
+        CFG = AppConfig(
+            server=ServerConfig(),
+            data=DataConfig(ar_h5=args.ar_h5, sampling_rate_hz=3.0, clip_01_before_ar=True),
+            model=ModelConfig(),
+            ar=ARConfig(),
+            ui=UIConfig(),
+            storage=StorageConfig()
+        )
+    if args.ar_h5:
+        CFG.data.ar_h5 = args.ar_h5
+    if args.no_verification:
+        CFG.server.disable_verification = True
 
     # App secret key for per-session control
     app.secret_key = CFG.server.secret_key
@@ -1597,45 +1481,67 @@ def main():
     use_gpu = CFG.model.use_gpu and torch.cuda.is_available()
     DEVICE = torch.device('cuda' if use_gpu else 'cpu')
 
-    # Load model
-    assert os.path.exists(CFG.model.checkpoint), f"Checkpoint not found: {CFG.model.checkpoint}"
-    MODEL = load_model_from_checkpoint(CFG.model.checkpoint, DEVICE, spikes_are_rates=CFG.data.spikes_are_rates)
+    # Load AR run H5 and experiment config/ckpt derived from it
+    assert CFG.data.ar_h5 and os.path.exists(CFG.data.ar_h5), f"data.ar_h5 not found: {CFG.data.ar_h5}"
+    BEST = load_ar_run_h5(CFG.data.ar_h5)
+    # Sync sampling rate with AR H5 attribute to match eval behavior exactly
+    try:
+        with h5py.File(CFG.data.ar_h5, 'r') as _hf:
+            _sr = _hf.attrs.get('sampling_rate_hz', None)
+            if _sr is not None:
+                CFG.data.sampling_rate_hz = float(_sr)
+    except Exception:
+        pass
+    exp_dir, ckpt_guess = resolve_experiment_from_ar_h5(CFG.data.ar_h5)
+    # Determine d_stimuli from AR H5 stimuli (context or future)
+    d_stimuli = 1
+    try:
+        if BEST.stim_context is not None and BEST.stim_context.shape[-1] > 0:
+            d_stimuli = int(BEST.stim_context.shape[-1])
+        elif BEST.stim_future is not None and BEST.stim_future.shape[-1] > 0:
+            d_stimuli = int(BEST.stim_future.shape[-1])
+    except Exception:
+        d_stimuli = 1
+    # Model checkpoint: use config-provided if present, else from experiment dir
+    ckpt_path = CFG.model.checkpoint if CFG.model.checkpoint else ckpt_guess
+    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}"
+    # Build model using experiment config and robust state load
+    MODEL = load_model_from_experiment(exp_dir, DEVICE, d_stimuli=d_stimuli)
     if DEVICE.type == 'cuda':
         if CFG.model.dtype == 'bfloat16':
             MODEL = MODEL.to(dtype=torch.bfloat16)
         else:
             MODEL = MODEL.to(dtype=torch.float32)
+    # Keep trained global ID mapping (searchsorted) from checkpoint to ensure correct neuron embeddings
 
-    # Load good sample and mask
-    sample_path = None
-    for cand in [CFG.data.good_sample_h5, CFG.data.best_sample_h5]:
-        if not cand:
-            continue
-        try:
-            sample_path = resolve_good_sample_h5_path(cand)
-            break
-        except Exception:
-            continue
-    if not sample_path:
-        raise ValueError("Please set data.good_sample_h5 (preferred) or data.best_sample_h5 in the config to a good/best *_data.h5 file or to an eval run directory containing videos/.")
-    BEST = load_good_sample_h5(sample_path)
-    assert os.path.exists(CFG.data.mask_h5), f"Mask H5 not found: {CFG.data.mask_h5}"
-    MASK = load_mask_h5(CFG.data.mask_h5)
-    REGION_TO_NEURON = map_neurons_to_regions(BEST.positions_norm, MASK)
+    # Optional mask for region overlays
+    if CFG.data.mask_h5 and os.path.exists(CFG.data.mask_h5):
+        MASK = load_mask_h5(CFG.data.mask_h5)
+        REGION_TO_NEURON = map_neurons_to_regions(BEST.positions_norm, MASK)
+    else:
+        MASK = MaskData(label_volume=np.zeros((1,1,1), dtype=np.int32), region_names=[], grid_shape=(1,1,1))
+        REGION_TO_NEURON = {}
 
     # Ensure output root
     os.makedirs(CFG.storage.output_root, exist_ok=True)
 
-    # Require external baseline NPZ for heatmap/NPZ outputs
+    # Baseline for heatmap/NPZ outputs (optional). Prefer NPZ if provided; else use AR H5 future truth.
     BASELINE_FUTURE = None
     base_npz = (getattr(CFG.data, 'baseline_npz', '') or '').strip()
-    assert base_npz, "data.baseline_npz must be set to a baseline NPZ containing 'baseline_future'"
-    assert os.path.exists(base_npz), f"Baseline NPZ not found: {base_npz}"
-    data_npz = np.load(base_npz)
-    assert 'baseline_future' in data_npz, f"Baseline NPZ missing key 'baseline_future': {base_npz}"
-    bf = data_npz['baseline_future']
-    assert isinstance(bf, np.ndarray) and bf.ndim == 2, f"Baseline 'baseline_future' must be 2D (T,N). Got shape: {getattr(bf, 'shape', None)}"
-    BASELINE_FUTURE = bf.astype(np.float32)
+    if base_npz and os.path.exists(base_npz):
+        data_npz = np.load(base_npz)
+        assert 'baseline_future' in data_npz, f"Baseline NPZ missing key 'baseline_future': {base_npz}"
+        bf = data_npz['baseline_future']
+        assert isinstance(bf, np.ndarray) and bf.ndim == 2, f"Baseline 'baseline_future' must be 2D (T,N). Got shape: {getattr(bf, 'shape', None)}"
+        BASELINE_FUTURE = bf.astype(np.float32)
+    else:
+        try:
+            # Use future truth from AR run as baseline if available
+            with h5py.File(CFG.data.ar_h5, 'r') as f:
+                if 'future_truth_rates' in f:
+                    BASELINE_FUTURE = f['future_truth_rates'][()].astype(np.float32)
+        except Exception:
+            BASELINE_FUTURE = None
 
     # Start worker thread
     QUEUE_OBJ = ExperimentQueue(max_batch_size=int(CFG.ui.max_batch_size))

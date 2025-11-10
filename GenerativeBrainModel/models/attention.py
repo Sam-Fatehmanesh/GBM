@@ -917,7 +917,7 @@ class SparseSpikeFullAttention(nn.Module):
         #    Queries: NON-spiking, valid neurons only. KV: spiking, valid neurons only.
         valid_bt = (neuron_pad_mask != 0).unsqueeze(1).expand(B, T, N).reshape(S, N)
         spiking_bt = (spike_mask != 0).reshape(S, N) & valid_bt
-        keep_bt = valid_bt & (~spiking_bt)   # remove spiking neurons from Q
+        keep_bt = valid_bt # & (~spiking_bt)   # remove spiking neurons from Q
         send_bt = spiking_bt
         idx_q, idx_kv, cu_q, cu_k, lens_q, lens_k, max_q, max_k = _build_varlen_metadata_from_masks(keep_bt, send_bt)
 

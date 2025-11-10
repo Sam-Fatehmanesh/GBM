@@ -26,85 +26,14 @@ Upweight higher rate neurons in the loss, high weight for high predicted rate no
 test short context but large layers aka 4 layres but 48 seqlen - done
 test super long context but only 1 lr aka 1 lr but 192 seqlen
 
-test masking out same neuron to same neuron attention, ways to try, remove spiking neurons from Q [in prog], switch to flexattn which has attn bias support
+test masking out same neuron to same neuron attention, ways to try, remove spiking neurons from Q [in prog], switch to flexattn which has attn bias support - done
 
-test using log mse or regular mse
+test using log mse or regular mse - done
 
-test removing global vector or just setting to zero or using film layer etc
+test removing global vector or just setting to zero or using film layer etc - done
 
-interneuron dependent loss function:
+interneuron dependent loss function - done
 
-"""- Add a low-rank covariance head to the model
-  - In gbm.py, after the attention body and before decoding, add a small linear head to predict r latent “coupling” factors per neuron token:
-```python
-self.cov_factor_head = nn.Linear(d_model, r, bias=False)  # r = 8..32
-...
-factors = self.cov_factor_head(x)  # (B, T, N, r)
-mu, log_sigma_raw, ... = self.neuron_scalar_decoder_head(x)
-return mu, log_sigma_raw, factors, ...
-```
+switch to bce on spike prob
 
-- Compute the MVN NLL with Woodbury in the train loop (z-domain)
-  - After you build z_tg, mu_z, sigma_z (your existing code), add:
-```python
-# e, diag variance and its inverse
-e = (z_tg.to(torch.float32) - mu_z)                   # (B, L-1, N)
-var = (sigma_z.to(torch.float32)).pow(2).clamp_min(1e-6)
-s   = 1.0 / var                                       # diag(D)^{-1}
-
-# Optional: subsample K valid neurons to keep cost bounded
-# idx: (B, K) with valid indices per batch item
-# e, s, U -> gather along neuron dimension to shape (B, L-1, K) and (B, L-1, K, r)
-# If you skip subsampling, use all valid neurons (N), cost ~ O(N*r + r^3).
-
-U  = factors.to(torch.float32)                        # (B, L-1, N, r)
-# Weight U by s (elementwise on neuron axis): U_w = S U
-U_w = U * s[..., None]                                # (B, L-1, N, r)
-
-# K = U^T S U, shape (B, L-1, r, r)
-K   = torch.matmul(U.transpose(-1, -2), U_w)          # (B, L-1, r, r)
-C   = torch.eye(r, device=K.device).expand_as(K) + K  # I + K
-Lch = torch.linalg.cholesky(C)                        # (B, L-1, r, r)
-
-# v = U^T S e, shape (B, L-1, r, 1)
-v = torch.matmul(U.transpose(-1, -2), (s * e)[..., None])
-
-# Solve y = C^{-1} v via Cholesky
-y = torch.cholesky_solve(v, Lch)                      # (B, L-1, r, 1)
-
-# Quadratic form e^T Σ^{-1} e = e^T S e − v^T C^{-1} v
-quad_diag = (e * (s * e)).sum(dim=-1)                 # (B, L-1)
-quad_lowr = (v.squeeze(-1) * y.squeeze(-1)).sum(dim=-1)
-quad = quad_diag - quad_lowr
-
-# log|Σ| = log|D| + log|I + U^T S U| = sum(log var) + 2*sum(log diag(L))
-logdetD = var.log().sum(dim=-1)                       # (B, L-1)
-logdetC = 2.0 * torch.log(torch.diagonal(Lch, dim1=-2, dim2=-1)).sum(dim=-1)
-logdet  = logdetD + logdetC
-
-# NLL per (B, t)
-nll_mvn = 0.5 * (quad + logdet + e.size(-1) * math.log(2.0 * math.pi))
-# mask padded neurons by gathering valid neurons (preferred), or compute on a subsample of valid indices
-loss_mvn = nll_mvn.mean()
-```
-  - Final loss: `loss_total = loss_independent + lambda_mvn * loss_mvn` with `lambda_mvn ~ 1e-2 … 1e-1` (tune).
-
-- Masking and scale
-  - Best: gather only valid neurons (where `mask==1`) before all operations so N equals the real count per sample/time.
-
-- Numeric stability and dtype
-  - Compute the MVN branch in float32 (even if the model runs bf16).
-  - Clamp `var` with `clamp_min(1e-6)`.
-  - Add a tiny jitter to `C` if Cholesky fails: `C = C + 1e-5 * I`.
-
-- Configuration knobs (in training config)
-  - `mvn_rank: 16`, `mvn_weight: 0.05`, `mvn_subsample_neurons: 2048` (optional), `mvn_eps: 1e-6`.
-  - Gate with a flag so you can ablate easily.
-
-- Why this is “best”
-  - Minimal model change (one small head).
-  - Captures shared error modes without O(N^2).
-  - Plug-in loss, compatible with your current z-domain pipeline and masks.
-  - Improves AR stability by aligning corrections with learned network modes.
-
-If you want, I can draft the exact edits for `gbm.py` (adding `cov_factor_head` and returning `factors`) and the training loss snippet inserted after your z-domain NLL, including the valid-neuron subsampling block."""
+try remove the z norm from loss
