@@ -23,11 +23,15 @@ import numpy as np
 import random
 import yaml
 from tqdm import tqdm
+import os
 
 from GenerativeBrainModel.models.gbm import GBM
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
 from GenerativeBrainModel.metrics import CombinedMetricsTracker
-from GenerativeBrainModel.visualizations import create_nextstep_video, create_autoregression_video
+from GenerativeBrainModel.visualizations import (
+    create_nextstep_video,
+    create_autoregression_video,
+)
 from GenerativeBrainModel.utils.sas import sas_nll, sas_rate_median
 import pdb
 import math
@@ -35,14 +39,24 @@ import math
 
 # ------------------------------- CUDA prefetcher (casts to bf16) -------------------------------
 
+
 class CUDAPrefetchLoader:
     """Wrap a DataLoader to prefetch the next batch to CUDA on a dedicated stream.
     Casts spikes/stim to bf16 to minimize cast kernels on the default stream.
     """
-    def __init__(self, loader: torch.utils.data.DataLoader, device: torch.device, *, cast_bf16: bool = True):
+
+    def __init__(
+        self,
+        loader: torch.utils.data.DataLoader,
+        device: torch.device,
+        *,
+        cast_bf16: bool = True,
+    ):
         self.loader = loader
         self.device = device
-        self.stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
+        self.stream = (
+            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        )
         self.cast_bf16 = cast_bf16
 
     def __len__(self):
@@ -51,15 +65,17 @@ class CUDAPrefetchLoader:
     def _to_device(self, batch):
         non_blocking = True
         out = {}
-        out['spikes'] = batch['spikes'].to(self.device, non_blocking=non_blocking)
-        out['positions'] = batch['positions'].to(self.device, non_blocking=non_blocking)
-        out['neuron_mask'] = batch['neuron_mask'].to(self.device, non_blocking=non_blocking)
-        out['stimulus'] = batch['stimulus'].to(self.device, non_blocking=non_blocking)
+        out["spikes"] = batch["spikes"].to(self.device, non_blocking=non_blocking)
+        out["positions"] = batch["positions"].to(self.device, non_blocking=non_blocking)
+        out["neuron_mask"] = batch["neuron_mask"].to(
+            self.device, non_blocking=non_blocking
+        )
+        out["stimulus"] = batch["stimulus"].to(self.device, non_blocking=non_blocking)
         if self.cast_bf16:
-            out['spikes'] = out['spikes'].to(torch.bfloat16)
-            out['stimulus'] = out['stimulus'].to(torch.bfloat16)
-        out['file_path'] = batch['file_path']
-        out['start_idx'] = batch['start_idx']
+            out["spikes"] = out["spikes"].to(torch.bfloat16)
+            out["stimulus"] = out["stimulus"].to(torch.bfloat16)
+        out["file_path"] = batch["file_path"]
+        out["start_idx"] = batch["start_idx"]
         return out
 
     def __iter__(self):
@@ -67,77 +83,77 @@ class CUDAPrefetchLoader:
             for b in self.loader:
                 yield self._to_device(b)
             return
-        first = True
+        cur = None
         next_batch = None
         for b in self.loader:
             with torch.cuda.stream(self.stream):
                 next_batch = self._to_device(b)
-            if not first:
+            if cur is not None:
                 torch.cuda.current_stream().wait_stream(self.stream)
                 yield cur
-            else:
-                first = False
             cur = next_batch
         torch.cuda.current_stream().wait_stream(self.stream)
-        if next_batch is not None:
-            yield next_batch
+        if cur is not None:
+            yield cur
 
 
 # ---------------------------------- Default config & utilities ----------------------------------
 
+
 def create_default_config() -> Dict[str, Any]:
     return {
-        'experiment': {
-            'name': 'gbm_neural_training',
+        "experiment": {
+            "name": "gbm_neural_training",
         },
-        'data': {
-            'data_dir': 'processed_spike_voxels_2018',
-            'test_subjects': [],
-            'use_cache': False,
-            'spikes_are_rates': False,
-            'spikes_are_zcalcium': False,
+        "data": {
+            "data_dir": "processed_spike_voxels_2018",
+            "test_subjects": [],
+            "use_cache": False,
+            "spikes_are_rates": False,
+            "spikes_are_zcalcium": False,
         },
-        'model': {
-            'd_model': 256,
-            'n_heads': 8,
-            'n_layers': 4,
-            'd_stimuli': None,  # inferred from data (stimulus_onehot width)
+        "model": {
+            "d_model": 256,
+            "n_heads": 8,
+            "n_layers": 4,
+            "d_stimuli": None,  # inferred from data (stimulus_onehot width)
+            "temporal_gate_k": None,
         },
-        'training': {
-            'batch_size': 2,
-            'num_epochs': 50,
-            'learning_rate': 5e-4,
-            'muon_lr': 2e-2,
-            'adamw_betas': (0.9, 0.95),
-            'weight_decay': 1e-4,
-            'scheduler': 'warmup_cosine',
-            'min_lr_ratio': 0.01,
-            'sequence_length': 12,
-            'stride': 3,
-            'max_timepoints_per_subject': None,
-            'num_workers': 0,
-            'pin_memory': False,
-            'persistent_workers': False,
-            'prefetch_factor': 2,
-            'use_gpu': True,
-            'distributed': False,
-            'backend': 'nccl',
-            'compile_model': False,     # set True to enable torch.compile(dynamic=True)
-            'seed': 42,
-            'validation_frequency': 8,
-            'val_sample_batches': 64,
-            'gradient_clip_norm': 1.0,
-            'gradient_accumulation_steps': None,
-            'profile': False,
-            'profile_steps': 50,
-            'profile_dir': './tb_prof',
+        "training": {
+            "batch_size": 2,
+            "num_epochs": 50,
+            "learning_rate": 5e-4,
+            "muon_lr": 2e-2,
+            "adamw_betas": (0.9, 0.95),
+            "weight_decay": 1e-4,
+            "scheduler": "warmup_cosine",
+            "min_lr_ratio": 0.01,
+            "sequence_length": 12,
+            "stride": 3,
+            "max_timepoints_per_subject": None,
+            "num_workers": 0,
+            "pin_memory": False,
+            "persistent_workers": False,
+            "prefetch_factor": 2,
+            "use_gpu": True,
+            "distributed": False,
+            "backend": "nccl",
+            "compile_model": False,  # set True to enable torch.compile(dynamic=True)
+            "seed": 42,
+            "validation_frequency": 8,
+            "val_sample_batches": 64,
+            "gradient_clip_norm": 1.0,
+            "gradient_accumulation_steps": None,
+            "profile": False,
+            "profile_steps": 50,
+            "profile_dir": "./tb_prof",
             # Mean activation MSE removed; training uses only primary loss per mode
             # No sampling rate needed; pipeline is domain-pure (probs or rates)
             # Scheduled sampling settings
-            'scheduled_sampling': None,
+            "scheduled_sampling": None,
         },
-        'logging': {
-            'log_level': 'INFO',
+        "logging": {
+            "log_level": "INFO",
         },
     }
 
@@ -157,41 +173,53 @@ def sanitized_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     Removes training.scheduler_obj (LambdaLR) and global_step counter.
     """
     import copy
+
     cfg_copy = copy.deepcopy(cfg)
     # If a full config dict is passed
-    if isinstance(cfg_copy, dict) and 'training' in cfg_copy and isinstance(cfg_copy['training'], dict):
-        tr = cfg_copy['training']
-        tr.pop('scheduler_obj', None)
-        tr.pop('global_step', None)
+    if (
+        isinstance(cfg_copy, dict)
+        and "training" in cfg_copy
+        and isinstance(cfg_copy["training"], dict)
+    ):
+        tr = cfg_copy["training"]
+        tr.pop("scheduler_obj", None)
+        tr.pop("global_step", None)
     # If just the training dict is passed
     elif isinstance(cfg_copy, dict):
-        cfg_copy.pop('scheduler_obj', None)
-        cfg_copy.pop('global_step', None)
+        cfg_copy.pop("scheduler_obj", None)
+        cfg_copy.pop("global_step", None)
     return cfg_copy
 
+
 def setup_experiment_dirs(base_dir: Path, name: str) -> Dict[str, Path]:
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     exp_dir = base_dir / f"{name}_{ts}"
-    log_dir = exp_dir / 'logs'
-    plots_dir = log_dir / 'plots'
-    videos_dir = exp_dir / 'videos'
-    ckpt_dir = exp_dir / 'checkpoints'
+    log_dir = exp_dir / "logs"
+    plots_dir = log_dir / "plots"
+    videos_dir = exp_dir / "videos"
+    ckpt_dir = exp_dir / "checkpoints"
     for p in [exp_dir, log_dir, plots_dir, videos_dir, ckpt_dir]:
         p.mkdir(parents=True, exist_ok=True)
-    return {'exp': exp_dir, 'logs': log_dir, 'plots': plots_dir, 'videos': videos_dir, 'ckpt': ckpt_dir}
+    return {
+        "exp": exp_dir,
+        "logs": log_dir,
+        "plots": plots_dir,
+        "videos": videos_dir,
+        "ckpt": ckpt_dir,
+    }
 
 
 def save_config(config: Dict[str, Any], path: Path) -> None:
-    with open(path, 'w') as f:
+    with open(path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, indent=2, sort_keys=False)
 
 
-def build_logger(log_dir: Path, level: str = 'INFO') -> logging.Logger:
-    logger = logging.getLogger('train_gbm')
+def build_logger(log_dir: Path, level: str = "INFO") -> logging.Logger:
+    logger = logging.getLogger("train_gbm")
     logger.setLevel(getattr(logging, level))
-    fh = logging.FileHandler(log_dir / 'training.log')
+    fh = logging.FileHandler(log_dir / "training.log")
     sh = logging.StreamHandler()
-    fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     fh.setFormatter(fmt)
     sh.setFormatter(fmt)
     logger.addHandler(fh)
@@ -211,65 +239,96 @@ def set_seeds(seed: int) -> None:
 
 # ------------------------------------- Optimizer & scheduler -------------------------------------
 
-def build_optimizer(model: GBM, cfg: Dict[str, Any]) -> Tuple[optim.Optimizer, Optional[optim.lr_scheduler._LRScheduler]]:
+
+def build_optimizer(
+    model: GBM, cfg: Dict[str, Any]
+) -> Tuple[optim.Optimizer, Optional[optim.lr_scheduler._LRScheduler]]:
     """Muon for hidden weights; AdamW for the rest."""
     try:
         from muon import MuonWithAuxAdam
     except ImportError as e:
-        raise ImportError("Muon optimizer not found. Install: pip install git+https://github.com/KellerJordan/Muon") from e
+        raise ImportError(
+            "Muon optimizer not found. Install: pip install git+https://github.com/KellerJordan/Muon"
+        ) from e
 
     # Hidden weights: parameters with ndim >= 2 from the attention body (layers)
-    hidden_weights = [p for p in model.body.parameters() if p.ndim >= 2 and p.requires_grad]
+    hidden_weights = [
+        p for p in model.body.parameters() if p.ndim >= 2 and p.requires_grad
+    ]
     # Hidden gains/biases: parameters with ndim < 2 from the body
-    hidden_gains_biases = [p for p in model.body.parameters() if p.ndim < 2 and p.requires_grad]
+    hidden_gains_biases = [
+        p for p in model.body.parameters() if p.ndim < 2 and p.requires_grad
+    ]
     # Non-hidden: embeddings + head
     nonhidden_params = []
     for m in model.embed.values():
         nonhidden_params += [p for p in m.parameters() if p.requires_grad]
-    for m in model.head.values():   
+    for m in model.head.values():
         nonhidden_params += [p for p in m.parameters() if p.requires_grad]
 
-    muon_lr = cfg.get('muon_lr', 0.02)
-    muon_weight_decay = cfg.get('weight_decay', 1e-4)
-    adamw_lr = cfg.get('learning_rate', 3e-4)
-    adamw_betas = tuple(cfg.get('adamw_betas', (0.9, 0.95)))
-    adamw_weight_decay = cfg.get('weight_decay', 1e-4)
+    muon_lr = cfg.get("muon_lr", 0.02)
+    muon_weight_decay = cfg.get("weight_decay", 1e-4)
+    adamw_lr = cfg.get("learning_rate", 3e-4)
+    adamw_betas = tuple(cfg.get("adamw_betas", (0.9, 0.95)))
+    adamw_weight_decay = cfg.get("weight_decay", 1e-4)
 
     param_groups = []
     if hidden_weights:
-        param_groups.append(dict(params=hidden_weights, use_muon=True, lr=muon_lr, weight_decay=muon_weight_decay))
+        param_groups.append(
+            dict(
+                params=hidden_weights,
+                use_muon=True,
+                lr=muon_lr,
+                weight_decay=muon_weight_decay,
+            )
+        )
     if hidden_gains_biases or nonhidden_params:
-        param_groups.append(dict(params=hidden_gains_biases + nonhidden_params, use_muon=False, lr=adamw_lr, betas=adamw_betas, weight_decay=adamw_weight_decay))
+        param_groups.append(
+            dict(
+                params=hidden_gains_biases + nonhidden_params,
+                use_muon=False,
+                lr=adamw_lr,
+                betas=adamw_betas,
+                weight_decay=adamw_weight_decay,
+            )
+        )
 
     opt = MuonWithAuxAdam(param_groups)
 
-    sched_type = cfg.get('scheduler', None)
+    sched_type = cfg.get("scheduler", None)
     scheduler = None
-    if sched_type == 'warmup_cosine':
-        scheduler = 'warmup_cosine_placeholder'
-    elif sched_type == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg['num_epochs'],
-                                                         eta_min=adamw_lr * cfg.get('min_lr_ratio', 0.01))
-    elif sched_type == 'step':
-        scheduler = optim.lr_scheduler.StepLR(opt, step_size=max(1, cfg['num_epochs'] // 3), gamma=0.1)
+    if sched_type == "warmup_cosine":
+        scheduler = "warmup_cosine_placeholder"
+    elif sched_type == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            opt,
+            T_max=cfg["num_epochs"],
+            eta_min=adamw_lr * cfg.get("min_lr_ratio", 0.01),
+        )
+    elif sched_type == "step":
+        scheduler = optim.lr_scheduler.StepLR(
+            opt, step_size=max(1, cfg["num_epochs"] // 3), gamma=0.1
+        )
     return opt, scheduler
 
 
-def write_architecture_file(model: nn.Module, dirs: Dict[str, Path], cfg: Dict[str, Any]) -> None:
+def write_architecture_file(
+    model: nn.Module, dirs: Dict[str, Path], cfg: Dict[str, Any]
+) -> None:
     """Write an architecture summary (model repr and params) at run start."""
-    exp_dir: Path = dirs['exp']
-    out_path = exp_dir / 'architecture.txt'
+    exp_dir: Path = dirs["exp"]
+    out_path = exp_dir / "architecture.txt"
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     untrainable_params = total_params - trainable_params
 
-    with open(out_path, 'w') as f:
+    with open(out_path, "w") as f:
         f.write("=" * 80 + "\n")
         f.write("GBM MODEL ARCHITECTURE SUMMARY\n")
         f.write("=" * 80 + "\n\n")
         f.write("MODEL CONFIGURATION\n")
         f.write("-" * 40 + "\n")
-        for k, v in cfg['model'].items():
+        for k, v in cfg["model"].items():
             f.write(f"  {k}: {v}\n")
         f.write("\nPARAMETERS\n")
         f.write("-" * 40 + "\n")
@@ -279,7 +338,9 @@ def write_architecture_file(model: nn.Module, dirs: Dict[str, Path], cfg: Dict[s
         f.write("PARAMETER BREAKDOWN (name, shape, count, trainable)\n")
         f.write("-" * 40 + "\n")
         for name, p in model.named_parameters():
-            f.write(f"  {name:<60} {tuple(p.shape)!s:<20} {p.numel():>12,}  {'✓' if p.requires_grad else '✗'}\n")
+            f.write(
+                f"  {name:<60} {tuple(p.shape)!s:<20} {p.numel():>12,}  {'✓' if p.requires_grad else '✗'}\n"
+            )
         f.write("\nMODEL STRUCTURE (repr)\n")
         f.write("-" * 40 + "\n")
         f.write(str(model))
@@ -287,6 +348,7 @@ def write_architecture_file(model: nn.Module, dirs: Dict[str, Path], cfg: Dict[s
 
 
 # ------------------------------------------- Train / Val -------------------------------------------
+
 
 def train_one_epoch(
     model: GBM,
@@ -304,24 +366,28 @@ def train_one_epoch(
     videos_dir: Path,
 ) -> Tuple[float, Optional[Path]]:
     model.train()
-    grad_accum = cfg.get('gradient_accumulation_steps') or 1
-    val_freq = int(cfg.get('validation_frequency') or 0)
-    val_sample_batches = int(cfg.get('val_sample_batches') or 1)
+    grad_accum = cfg.get("gradient_accumulation_steps") or 1
+    val_freq = int(cfg.get("validation_frequency") or 0)
+    val_sample_batches = int(cfg.get("val_sample_batches") or 1)
 
     # Wrap loader with CUDA prefetch to overlap H2D with compute (and cast to bf16)
-    prefetch = (device.type == 'cuda')
-    wrapped_loader = CUDAPrefetchLoader(loader, device, cast_bf16=True) if prefetch else loader
+    prefetch = device.type == "cuda"
+    wrapped_loader = (
+        CUDAPrefetchLoader(loader, device, cast_bf16=True) if prefetch else loader
+    )
     pbar = tqdm(wrapped_loader, desc=f"Epoch {epoch}", mininterval=0.1, smoothing=0.05)
 
     # Initialize warmup-cosine scheduler before the loop, aligned to optimizer steps
-    if scheduler == 'warmup_cosine_placeholder' and 'train_loader_len' in cfg:
-        if 'scheduler_obj' not in cfg:
-            accum = int(cfg.get('gradient_accumulation_steps') or 1)
-            steps_per_epoch = int(math.ceil(float(cfg['train_loader_len']) / float(accum)))
+    if scheduler == "warmup_cosine_placeholder" and "train_loader_len" in cfg:
+        if "scheduler_obj" not in cfg:
+            accum = int(cfg.get("gradient_accumulation_steps") or 1)
+            steps_per_epoch = int(
+                math.ceil(float(cfg["train_loader_len"]) / float(accum))
+            )
             warm = int(0.1 * steps_per_epoch)
-            total = int(cfg.get('num_epochs', 1)) * steps_per_epoch
-            base_lr = float(cfg.get('learning_rate', 3e-4))
-            min_lr = base_lr * float(cfg.get('min_lr_ratio', 0.01))
+            total = int(cfg.get("num_epochs", 1)) * steps_per_epoch
+            base_lr = float(cfg.get("learning_rate", 3e-4))
+            min_lr = base_lr * float(cfg.get("min_lr_ratio", 0.01))
 
             def lr_lambda(step_idx: int) -> float:
                 if warm <= 0 or total <= 0:
@@ -331,13 +397,15 @@ def train_one_epoch(
                 prog = (step_idx - warm) / float(max(1, total - warm))
                 prog = min(max(prog, 0.0), 1.0)
                 # Return factor relative to base_lr
-                return (min_lr + 0.5 * (base_lr - min_lr) * (1.0 + np.cos(np.pi * prog))) / base_lr
+                return (
+                    min_lr + 0.5 * (base_lr - min_lr) * (1.0 + np.cos(np.pi * prog))
+                ) / base_lr
 
-            cfg['scheduler_obj'] = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-            cfg['global_step'] = 0
+            cfg["scheduler_obj"] = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            cfg["global_step"] = 0
             # Seed scheduler to step 0 so initial LR starts near 0 (warmup start)
             try:
-                cfg['scheduler_obj'].step(0)
+                cfg["scheduler_obj"].step(0)
             except Exception:
                 pass
 
@@ -351,33 +419,45 @@ def train_one_epoch(
     if total_steps >= 4:
         triggers.add(4)
 
-    use_profiler = bool(cfg.get('profile', False)) and torch.cuda.is_available()
+    use_profiler = bool(cfg.get("profile", False)) and torch.cuda.is_available()
     prof = None
     if use_profiler:
         prof = torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=cfg.get('profile_steps', 50), repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(cfg.get('profile_dir', './tb_prof'))),
-            record_shapes=True, profile_memory=True, with_stack=True, with_modules=True
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=1, warmup=1, active=cfg.get("profile_steps", 50), repeat=1
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                str(cfg.get("profile_dir", "./tb_prof"))
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_modules=True,
         )
         prof.__enter__()
 
     for batch_idx, batch in enumerate(pbar, 1):
         # Batches are already on device and in bf16 via the prefetcher
-        spikes = batch['spikes']           # (B, L, N) bf16
-        positions = batch['positions']     # (B, N, 3) fp32
-        mask = batch['neuron_mask']        # (B, N) bool/int
-        stim = batch['stimulus']           # (B, L, K) bf16
+        spikes = batch["spikes"]  # (B, L, N) bf16
+        positions = batch["positions"]  # (B, N, 3) fp32
+        mask = batch["neuron_mask"]  # (B, N) bool/int
+        stim = batch["stimulus"]  # (B, L, K) bf16
 
         # Prepare seq2seq (input: 0..L-2, target: 1..L-1)
         x_in = spikes[:, :-1, :]
-        x_tgt = spikes[:, 1:, :].float()   # target (prob or rate depending on data mode)
+        x_tgt = spikes[:, 1:, :].float()  # target (prob or rate depending on data mode)
         stim_in = stim[:, :-1, :]
 
         if batch_idx % grad_accum == 1:
             optimizer.zero_grad()
 
-        mu, log_sigma_raw, eta, log_delta_raw = model(x_in, stim_in, positions, mask, get_logits=True)
+        mu, log_sigma_raw, eta, log_delta_raw = model(
+            x_in, stim_in, positions, mask, get_logits=True
+        )
         mask_exp = mask[:, None, :]
         if mask_exp.shape != x_tgt.shape:
             mask_exp = mask_exp.expand_as(x_tgt)
@@ -393,21 +473,25 @@ def train_one_epoch(
         (loss / grad_accum).backward()
 
         if batch_idx % grad_accum == 0:
-            if cfg.get('gradient_clip_norm'):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['gradient_clip_norm'])
+            if cfg.get("gradient_clip_norm"):
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg["gradient_clip_norm"]
+                )
             optimizer.step()
             # Per-batch scheduler (warmup_cosine) → step AFTER optimizer.step()
-            if scheduler == 'warmup_cosine_placeholder' and 'scheduler_obj' in cfg:
-                cfg['global_step'] = int(cfg.get('global_step', 0)) + 1
-                cfg['scheduler_obj'].step()
+            if scheduler == "warmup_cosine_placeholder" and "scheduler_obj" in cfg:
+                cfg["global_step"] = int(cfg.get("global_step", 0)) + 1
+                cfg["scheduler_obj"].step()
 
-        lr_now = optimizer.param_groups[0]['lr']
+        lr_now = optimizer.param_groups[0]["lr"]
         tracker.log_train(epoch, batch_idx, float(loss.detach().cpu().item()), lr_now)
         ema_now = tracker.loss_ema.get()
-        pbar.set_postfix({
-            'loss': f"{float(loss.detach().cpu().item()):.6f}",
-            'ema': f"{ema_now:.6f}" if ema_now is not None else 'N/A'
-        })
+        pbar.set_postfix(
+            {
+                "loss": f"{float(loss.detach().cpu().item()):.6f}",
+                "ema": f"{ema_now:.6f}" if ema_now is not None else "N/A",
+            }
+        )
 
         if prof is not None:
             prof.step()
@@ -421,10 +505,10 @@ def train_one_epoch(
             targs_all = []
             masks_all = []
             for vbatch in val_loader:
-                spikes_v = vbatch['spikes'].to(device).to(torch.bfloat16)
-                positions_v = vbatch['positions'].to(device)
-                mask_v = vbatch['neuron_mask'].to(device)
-                stim_v = vbatch['stimulus'].to(device).to(torch.bfloat16)
+                spikes_v = vbatch["spikes"].to(device).to(torch.bfloat16)
+                positions_v = vbatch["positions"].to(device)
+                mask_v = vbatch["neuron_mask"].to(device)
+                stim_v = vbatch["stimulus"].to(device).to(torch.bfloat16)
                 x_in_v = spikes_v[:, :-1, :]
                 x_tgt_v = spikes_v[:, 1:, :].float()
                 stim_in_v = stim_v[:, :-1, :]
@@ -433,7 +517,9 @@ def train_one_epoch(
                     if mask_exp_v.shape != x_tgt_v.shape:
                         mask_exp_v = mask_exp_v.expand_as(x_tgt_v)
                     mask_exp_v = mask_exp_v.float()
-                    mu_val, log_sigma_val, eta_val, log_delta_val = model(x_in_v, stim_in_v, positions_v, mask_v, get_logits=True)
+                    mu_val, log_sigma_val, eta_val, log_delta_val = model(
+                        x_in_v, stim_in_v, positions_v, mask_v, get_logits=True
+                    )
                     vloss = sas_nll(
                         x_tgt_v,
                         mu_val.float(),
@@ -442,7 +528,9 @@ def train_one_epoch(
                         log_delta_val.float(),
                         mask=mask_exp_v,
                     )
-                    preds_vis = sas_rate_median(mu_val, log_sigma_val, eta_val, log_delta_val)
+                    preds_vis = sas_rate_median(
+                        mu_val, log_sigma_val, eta_val, log_delta_val
+                    )
                     probs_v = preds_vis
                     targs_prob_v = x_tgt_v
                 total_vloss += float(vloss.detach().cpu().item())
@@ -464,48 +552,64 @@ def train_one_epoch(
                 valid = flat_mask > 0.5
                 preds_all = preds_all[valid]
                 targs_all = targs_all[valid]
-                tracker.log_validation(epoch, batch_idx, preds_all, targs_all, avg_vloss, compute_auc=False)
+                tracker.log_validation(
+                    epoch, batch_idx, preds_all, targs_all, avg_vloss, compute_auc=False
+                )
                 # Sample video
                 try:
                     sample_batch = next(iter(val_loader))
                     # Ensure a consistent per-sample shape for videos to avoid cat-size issues
-                    spikes0 = sample_batch['spikes'][0:1]
-                    stim0 = sample_batch['stimulus'][0:1]
-                    pos0 = sample_batch['positions'][0:1]
-                    mask0 = sample_batch['neuron_mask'][0:1]
+                    spikes0 = sample_batch["spikes"][0:1]
+                    stim0 = sample_batch["stimulus"][0:1]
+                    pos0 = sample_batch["positions"][0:1]
+                    mask0 = sample_batch["neuron_mask"][0:1]
                     # Diagnostics
-                    print(f"[VideoDebug] spikes {tuple(spikes0.shape)} stim {tuple(stim0.shape)} pos {tuple(pos0.shape)} mask {tuple(mask0.shape)}")
+                    print(
+                        f"[VideoDebug] spikes {tuple(spikes0.shape)} stim {tuple(stim0.shape)} pos {tuple(pos0.shape)} mask {tuple(mask0.shape)}"
+                    )
                     # Truncate to a common L if mismatch exists
                     Lx = spikes0.shape[1]
                     Ls = stim0.shape[1]
                     L = min(Lx, Ls)
                     if Lx != Ls:
-                        print(f"[VideoDebug] Truncating sequence length from spikes {Lx} / stim {Ls} to L={L}")
+                        print(
+                            f"[VideoDebug] Truncating sequence length from spikes {Lx} / stim {Ls} to L={L}"
+                        )
                     spikes0 = spikes0[:, :L]
                     stim0 = stim0[:, :L]
                     sample_batch = {
-                        'spikes': spikes0.float(),
-                        'positions': pos0,
-                        'neuron_mask': mask0,
-                        'stimulus': stim0,
+                        "spikes": spikes0.float(),
+                        "positions": pos0,
+                        "neuron_mask": mask0,
+                        "stimulus": stim0,
                     }
-                    generate_epoch_videos(model, sample_batch, device, videos_dir, epoch=f"{epoch}_step{batch_idx}")
+                    generate_epoch_videos(
+                        model,
+                        sample_batch,
+                        device,
+                        videos_dir,
+                        epoch=f"{epoch}_step{batch_idx}",
+                    )
                 except Exception as e:
                     # Log and continue; video generation should not break training
                     import traceback
+
                     traceback.print_exc()
                     print(f"Video generation failed at step {batch_idx}: {e}")
                 # Save best checkpoint if improved
                 if avg_vloss < best_loss:
                     best_loss = avg_vloss
                     ckpt_path = ckpt_dir / f"best_step_{epoch}_{batch_idx}.pth"
-                    torch.save({
-                        'epoch': epoch,
-                        'step': batch_idx,
-                        'model': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'config': sanitized_config({'training': cfg})
-                    }, ckpt_path)
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "step": batch_idx,
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "config": sanitized_config({"training": cfg}),
+                        },
+                        ckpt_path,
+                    )
                     best_ckpt = ckpt_path
             model.train()
             # Update plots immediately after frequent validation
@@ -520,8 +624,14 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.device,
-             tracker: CombinedMetricsTracker, epoch: int, training_cfg: Dict[str, Any]) -> Dict[str, float]:
+def validate(
+    model: GBM,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    tracker: CombinedMetricsTracker,
+    epoch: int,
+    training_cfg: Dict[str, Any],
+) -> Dict[str, float]:
     """Run end-of-epoch validation and log a SINGLE aggregated entry to CSV/plots."""
     model.eval()
     total_loss = 0.0
@@ -530,16 +640,18 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
     targs_all = []
     masks_all = []
     for batch in tqdm(loader, desc=f"Validation E{epoch}"):
-        spikes = batch['spikes'].to(device).to(torch.bfloat16)
-        positions = batch['positions'].to(device)
-        mask = batch['neuron_mask'].to(device)
-        stim = batch['stimulus'].to(device).to(torch.bfloat16)
+        spikes = batch["spikes"].to(device).to(torch.bfloat16)
+        positions = batch["positions"].to(device)
+        mask = batch["neuron_mask"].to(device)
+        stim = batch["stimulus"].to(device).to(torch.bfloat16)
 
         x_in = spikes[:, :-1, :]
         x_tgt = spikes[:, 1:, :].float()
         stim_in = stim[:, :-1, :]
 
-        mu_val, log_sigma_val, eta_val, log_delta_val = model(x_in, stim_in, positions, mask, get_logits=True)
+        mu_val, log_sigma_val, eta_val, log_delta_val = model(
+            x_in, stim_in, positions, mask, get_logits=True
+        )
         mask_exp = mask[:, None, :]
         if mask_exp.shape != x_tgt.shape:
             mask_exp = mask_exp.expand_as(x_tgt)
@@ -566,28 +678,37 @@ def validate(model: GBM, loader: torch.utils.data.DataLoader, device: torch.devi
         preds_all = torch.cat([p.reshape(-1) for p in preds_all], dim=0)
         targs_all = torch.cat([t.reshape(-1) for t in targs_all], dim=0)
         valid = flat_mask > 0.5
-        tracker.log_validation(epoch, 1, preds_all[valid], targs_all[valid], avg_loss, compute_auc=False)
-    return {'val_loss': avg_loss}
+        tracker.log_validation(
+            epoch, 1, preds_all[valid], targs_all[valid], avg_loss, compute_auc=False
+        )
+    return {"val_loss": avg_loss}
 
 
-def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: torch.device,
-                           videos_dir: Path, epoch: int | str) -> None:
+def generate_epoch_videos(
+    model: GBM,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    videos_dir: Path,
+    epoch: int | str,
+) -> None:
     model.eval()
     # Keep spikes in fp32 to preserve small probabilities for visualization
-    spikes = batch['spikes'].to(device).float()                 # (B, L, N)
-    positions = batch['positions'].to(device)                   # (B, N, 3)
-    mask = batch['neuron_mask'].to(device)
-    stim = batch['stimulus'].to(device).float()                 # (B, L, K)
+    spikes = batch["spikes"].to(device).float()  # (B, L, N)
+    positions = batch["positions"].to(device)  # (B, N, 3)
+    mask = batch["neuron_mask"].to(device)
+    stim = batch["stimulus"].to(device).float()  # (B, L, K)
 
     # Next-step comparison on last step of input
     x_in = spikes[:, :-1, :]
     x_tgt = spikes[:, 1:, :]
     stim_in = stim[:, :-1, :]
-    mu_vis, log_sigma_vis, eta_vis, log_delta_vis = model(x_in, stim_in, positions, mask, get_logits=True)
+    mu_vis, log_sigma_vis, eta_vis, log_delta_vis = model(
+        x_in, stim_in, positions, mask, get_logits=True
+    )
     preds_vis = sas_rate_median(mu_vis, log_sigma_vis, eta_vis, log_delta_vis)
     truth_vis = x_tgt
-    nextstep_path = videos_dir / f'nextstep_epoch_{epoch}.mp4'
-    #pdb.set_trace()
+    nextstep_path = videos_dir / f"nextstep_epoch_{epoch}.mp4"
+    # pdb.set_trace()
     create_nextstep_video(truth_vis, preds_vis, positions, nextstep_path)
 
     # Autoregression demo (double-panel): use half window as context, half as truth horizon
@@ -599,58 +720,76 @@ def generate_epoch_videos(model: GBM, batch: Dict[str, torch.Tensor], device: to
         init_stim = stim[0:1, :context_len, :]
         # Build future stimulus of length n_steps from the second half; pad with zeros if needed
         K = stim.shape[-1]
-        future_real = stim[0:1, context_len: context_len + n_steps, :]
+        future_real = stim[0:1, context_len : context_len + n_steps, :]
         pad_len = n_steps - future_real.shape[1]
         if pad_len > 0:
-            future_pad = torch.zeros((1, pad_len, K), device=stim.device, dtype=stim.dtype)
+            future_pad = torch.zeros(
+                (1, pad_len, K), device=stim.device, dtype=stim.dtype
+            )
             future_stim = torch.cat([future_real, future_pad], dim=1)
         else:
             future_stim = future_real
         pos0 = positions[0:1]
         mask0 = mask[0:1]
-        gen_seq = model.autoregress(init_x, init_stim, pos0, mask0, future_stim,
-                                     n_steps=n_steps, context_len=context_len)
-        ar_path = videos_dir / f'autoreg_epoch_{epoch}.mp4'
+        gen_seq = model.autoregress(
+            init_x,
+            init_stim,
+            pos0,
+            mask0,
+            future_stim,
+            n_steps=n_steps,
+            context_len=context_len,
+        )
+        ar_path = videos_dir / f"autoreg_epoch_{epoch}.mp4"
         # In rates mode, spikes already hold rates; in prob mode spikes hold probabilities
-        truth_horizon = spikes[0:1, context_len: context_len + n_steps, :]
-        create_autoregression_video(gen_seq[:, -n_steps:, :], pos0, ar_path, truth=truth_horizon)
+        truth_horizon = spikes[0:1, context_len : context_len + n_steps, :]
+        create_autoregression_video(
+            gen_seq[:, -n_steps:, :], pos0, ar_path, truth=truth_horizon
+        )
 
 
 # ---------------------------------------------- Main ----------------------------------------------
 
+
 def main():
-    parser = argparse.ArgumentParser(description='Train GBM on neuron sequences')
-    parser.add_argument('--config', type=str, required=False, help='Path to YAML config')
+    parser = argparse.ArgumentParser(description="Train GBM on neuron sequences")
+    parser.add_argument(
+        "--config", type=str, required=False, help="Path to YAML config"
+    )
     args = parser.parse_args()
 
     cfg = create_default_config()
     if args.config:
-        with open(args.config, 'r') as f:
+        with open(args.config, "r") as f:
             user = yaml.safe_load(f)
         cfg = deep_update(cfg, user)
 
     # Dirs & logger
-    base_dir = Path('experiments/gbm_neural')
-    dirs = setup_experiment_dirs(base_dir, cfg['experiment']['name'])
-    save_config(cfg, dirs['exp'] / 'config.yaml')
-    logger = build_logger(dirs['logs'], cfg['logging'].get('log_level', 'INFO'))
+    base_dir = Path("experiments/gbm_neural")
+    dirs = setup_experiment_dirs(base_dir, cfg["experiment"]["name"])
+    save_config(cfg, dirs["exp"] / "config.yaml")
+    logger = build_logger(dirs["logs"], cfg["logging"].get("log_level", "INFO"))
 
     # Device & seeds
-    device = torch.device('cuda' if (cfg['training']['use_gpu'] and torch.cuda.is_available()) else 'cpu')
-    set_seeds(cfg['training']['seed'])
-    if device.type == 'cuda':
+    device = torch.device(
+        "cuda" if (cfg["training"]["use_gpu"] and torch.cuda.is_available()) else "cpu"
+    )
+    set_seeds(cfg["training"]["seed"])
+    if device.type == "cuda":
         logger.info(f"Using GPU: {torch.cuda.get_device_name()}")
 
     torch.backends.cuda.matmul.allow_tf32 = True
-    if device.type == 'cuda':
+    if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
     # If not distributed, stub minimal torch.distributed funcs so Muon works single-process
     try:
         import torch.distributed as dist
+
         if dist.is_available() and not dist.is_initialized():
             dist.get_world_size = lambda group=None: 1
             dist.get_rank = lambda group=None: 0
+
             def _fake_all_gather(tensor_list, tensor, group=None):
                 if tensor_list is None or len(tensor_list) == 0:
                     return
@@ -658,37 +797,47 @@ def main():
                     tensor_list[0].copy_(tensor)
                 else:
                     tensor_list[0].resize_(tensor.shape).copy_(tensor)
+
             dist.all_gather = _fake_all_gather
     except Exception:
         pass
 
     # Data
     train_loader, val_loader, train_sampler, val_sampler = create_dataloaders(cfg)
-    cfg['training']['train_loader_len'] = len(train_loader)
+    cfg["training"]["train_loader_len"] = len(train_loader)
 
     # Model
-    mcfg = cfg['model']
+    mcfg = cfg["model"]
     # Infer d_stimuli from data one-hot width if not provided
     inferred_d_stimuli: Optional[int] = None
     try:
         sample_batch = next(iter(train_loader))
-        inferred_d_stimuli = int(sample_batch['stimulus'].shape[-1])
+        inferred_d_stimuli = int(sample_batch["stimulus"].shape[-1])
     except Exception:
         pass
-    d_stimuli = mcfg['d_stimuli'] if mcfg['d_stimuli'] is not None else (inferred_d_stimuli or 1)
+    d_stimuli = (
+        mcfg["d_stimuli"]
+        if mcfg["d_stimuli"] is not None
+        else (inferred_d_stimuli or 1)
+    )
 
-    model = GBM(d_model=mcfg['d_model'], d_stimuli=d_stimuli,
-                n_heads=mcfg['n_heads'], n_layers=mcfg['n_layers']).to(device)
+    model = GBM(
+        d_model=mcfg["d_model"],
+        d_stimuli=d_stimuli,
+        n_heads=mcfg["n_heads"],
+        n_layers=mcfg["n_layers"],
+        temporal_gate_k=mcfg.get("temporal_gate_k", None),
+    ).to(device)
     # Propagate data mode flags into model for forward(get_logits=False)
     model.spikes_are_rates = False
     model.spikes_are_zcalcium = False
 
     # Run the whole model in bf16 on CUDA (norms/centroids handled internally in fp32)
-    if device.type == 'cuda':
+    if device.type == "cuda":
         model = model.to(dtype=torch.bfloat16)
 
     # Optional torch.compile with dynamic shapes
-    if cfg['training'].get('compile_model', False):
+    if cfg["training"].get("compile_model", False):
         try:
             model = torch.compile(model)
             logger.info("torch.compile enabled.")
@@ -696,63 +845,89 @@ def main():
             logger.warning(f"torch.compile failed: {e}")
 
     # Initialize DDP if requested
-    ddp_enabled = bool(cfg['training'].get('distributed', False))
+    ddp_enabled = bool(cfg["training"].get("distributed", False))
     if ddp_enabled and torch.cuda.device_count() > 1:
         try:
             import torch.distributed as dist
+
             if not dist.is_initialized():
-                dist.init_process_group(backend=cfg['training'].get('backend', 'nccl'))
-            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+                dist.init_process_group(backend=cfg["training"].get("backend", "nccl"))
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
             torch.cuda.set_device(local_rank)
             model = torch.nn.parallel.DistributedDataParallel(
-                model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
             )
             logger.info("Initialized DistributedDataParallel")
         except Exception as e:
             logger.warning(f"Failed to initialize DDP, continuing single-process: {e}")
 
     # Optimizer & scheduler
-    optimizer, scheduler = build_optimizer(model, cfg['training'])
+    optimizer, scheduler = build_optimizer(model, cfg["training"])
 
     # Metrics
-    tracker = CombinedMetricsTracker(log_dir=dirs['logs'], ema_alpha=0.01, val_threshold=0.5, enable_plots=True)
+    tracker = CombinedMetricsTracker(
+        log_dir=dirs["logs"], ema_alpha=0.01, val_threshold=0.5, enable_plots=True
+    )
     try:
         write_architecture_file(model, dirs, cfg)
     except Exception as e:
         logger.warning(f"Failed to write architecture file: {e}")
 
-    best_loss = float('inf')
+    best_loss = float("inf")
     best_ckpt: Optional[Path] = None
 
-    num_epochs = cfg['training']['num_epochs']
+    num_epochs = cfg["training"]["num_epochs"]
     for epoch in range(1, num_epochs + 1):
         # Shuffle between epochs for distributed samplers
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
         best_loss, best_ckpt = train_one_epoch(
-            model, train_loader, val_loader, device, optimizer, scheduler,
-            tracker, epoch, cfg['training'], best_loss, best_ckpt, dirs['ckpt'], dirs['videos']
+            model,
+            train_loader,
+            val_loader,
+            device,
+            optimizer,
+            scheduler,
+            tracker,
+            epoch,
+            cfg["training"],
+            best_loss,
+            best_ckpt,
+            dirs["ckpt"],
+            dirs["videos"],
         )
 
-        val_metrics = validate(model, val_loader, device, tracker, epoch, cfg['training'])
+        val_metrics = validate(
+            model, val_loader, device, tracker, epoch, cfg["training"]
+        )
         logger.info(f"Epoch {epoch} - Val: {val_metrics}")
 
         # Save checkpoint
-        ckpt_path = dirs['ckpt'] / f'epoch_{epoch}.pth'
-        torch.save({'epoch': epoch, 'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(), 'config': sanitized_config(cfg)}, ckpt_path)
+        ckpt_path = dirs["ckpt"] / f"epoch_{epoch}.pth"
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "config": sanitized_config(cfg),
+            },
+            ckpt_path,
+        )
 
         # Videos on a small sampled batch
         try:
             sample_batch = next(iter(val_loader))
-            generate_epoch_videos(model, sample_batch, device, dirs['videos'], epoch)
+            generate_epoch_videos(model, sample_batch, device, dirs["videos"], epoch)
         except Exception as e:
             logger.warning(f"Epoch {epoch} video generation failed: {e}")
 
         # Track best
-        if val_metrics['val_loss'] < best_loss:
-            best_loss = val_metrics['val_loss']
+        if val_metrics["val_loss"] < best_loss:
+            best_loss = val_metrics["val_loss"]
             best_ckpt = ckpt_path
 
         # Update plots
@@ -763,13 +938,15 @@ def main():
     if best_ckpt is not None:
         logger.info(f"Loading best checkpoint: {best_ckpt}")
         state = torch.load(best_ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(state['model'])
+        model.load_state_dict(state["model"])
         try:
             sample_batch = next(iter(val_loader))
-            generate_epoch_videos(model, sample_batch, device, dirs['videos'], epoch='best')
+            generate_epoch_videos(
+                model, sample_batch, device, dirs["videos"], epoch="best"
+            )
         except Exception as e:
             logger.warning(f"Best checkpoint video generation failed: {e}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
