@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from GenerativeBrainModel.models.rms import RMSNorm
 from torch.nn.attention import sdpa_kernel, SDPBackend
+import os
 import math
 from flash_attn.flash_attn_interface import (
     flash_attn_varlen_qkvpacked_func as flash_varlen_qkv,
@@ -235,7 +236,7 @@ class SparseSpikeFullAttention(nn.Module):
         #    Queries: NON-spiking, valid neurons only. KV: spiking, valid neurons only.
         valid_bt = (neuron_pad_mask != 0).unsqueeze(1).expand(B, T, N).reshape(S, N)
         spiking_bt = (spike_mask != 0).reshape(S, N) & valid_bt
-        keep_bt = valid_bt  # & (~spiking_bt)   # remove spiking neurons from Q
+        keep_bt = valid_bt & (~spiking_bt)   # remove spiking neurons from Q
         send_bt = spiking_bt
         idx_q, idx_kv, cu_q, cu_k, lens_q, lens_k, max_q, max_k = (
             _build_varlen_metadata_from_masks(keep_bt, send_bt)
@@ -335,6 +336,7 @@ class NeuronCausalAttention(nn.Module):
         max_seq_len: int = 512,
         # --- Gating controls (optional) ---
         gate_capacity_k: int | None = None,
+        gate_capacity_fraction: float | None = None,
         gate_temperature: float = 0.0,
         state_rank: int = 16,
     ):
@@ -354,9 +356,12 @@ class NeuronCausalAttention(nn.Module):
 
         # --- Gating params ---
         self.gate_capacity_k = gate_capacity_k
+        self.gate_capacity_fraction = gate_capacity_fraction
         self.gate_temperature = gate_temperature
         self.state_rank = state_rank
-        if self.gate_capacity_k is not None:
+        if (self.gate_capacity_k is not None and self.gate_capacity_k > 0) or (
+            self.gate_capacity_fraction is not None and float(self.gate_capacity_fraction) > 0.0
+        ):
             # Learned gate vector over neuron embedding
             self.gate_vector = nn.Parameter(torch.zeros(d_model))
             # Low-rank state embedding over neuron axis (N,D) -> (D), created lazily on first forward
@@ -364,6 +369,12 @@ class NeuronCausalAttention(nn.Module):
             self.state_neuron_proj2: nn.Linear | None = None  # (R -> 1)
             nn.init.normal_(self.gate_vector, mean=0.0, std=(1.0 / (d_model**0.5)))
             # Note: the neuron-axis projections will be initialized when created
+            # Optional logging cadence (env: GBM_LOG_GATING_EVERY)
+            try:
+                self._log_every = int(os.getenv("GBM_LOG_GATING_EVERY", "0") or 0)
+            except Exception:
+                self._log_every = 0
+            self._gating_calls = 0
 
         # --- Timewise RoPE (rotary) ---
         self.max_seq_len = max_seq_len
@@ -462,13 +473,25 @@ class NeuronCausalAttention(nn.Module):
                 )
 
             # --- Optional neuron-time gating before attention ---
-            use_gating = self.gate_capacity_k is not None and self.gate_capacity_k > 0
+            use_gating = False
+            k_cap: int | None = None
+            if self.gate_capacity_k is not None and self.gate_capacity_k > 0:
+                k_cap = min(int(self.gate_capacity_k), N)
+                use_gating = k_cap > 0
+            elif self.gate_capacity_fraction is not None:
+                frac = float(self.gate_capacity_fraction)
+                if frac > 0.0:
+                    # Compute capacity relative to the number of valid neurons, not padded N
+                    valid_counts_bt = neuron_pad_mask.unsqueeze(1).expand(B, T, N).sum(dim=2)  # (B,T)
+                    max_valid = int(valid_counts_bt.max().item()) if valid_counts_bt.numel() > 0 else 0
+                    k_cap = max(1, min(N, int(frac * max_valid)))
+                    use_gating = True
             if use_gating:
                 # Compute per-(B,T,N) logits using gate vector and low-rank state embedding
                 # xn: (B,T,N,D)
                 x_for_gate = xn
                 # Mask padded neurons to avoid leaking into state summary
-                pad_mask_bt = neuron_pad_mask.unsqueeze(1).expand(B, T, N)  # (B,T,N)
+                pad_mask_bt = (neuron_pad_mask != 0).unsqueeze(1).expand(B, T, N)  # (B,T,N) as bool
                 x_masked = x_for_gate.masked_fill(~pad_mask_bt.unsqueeze(-1), 0)
 
                 # Build low-rank linear map over neuron axis: (N,D) -> (D)
@@ -503,8 +526,8 @@ class NeuronCausalAttention(nn.Module):
                     u = torch.rand_like(logits, dtype=torch.float32)
                     g = -torch.log(-torch.log(u.clamp_(min=1e-6, max=1 - 1e-6)))
                     logits = logits + self.gate_temperature * g.to(logits.dtype)
-                k_cap = min(self.gate_capacity_k, N)
                 # Top-k over neurons per (B,T)
+                assert k_cap is not None and k_cap > 0
                 topk = torch.topk(logits, k=k_cap, dim=2, largest=True, sorted=False)
                 selected = torch.zeros_like(logits, dtype=torch.bool)
                 selected.scatter_(2, topk.indices, True)
@@ -518,20 +541,29 @@ class NeuronCausalAttention(nn.Module):
                 sel_positions = torch.nonzero(
                     selected_bnT_valid, as_tuple=False
                 )  # (total, 2) [row, t]
-                if sel_positions.numel() > 0:
-                    row_idx = sel_positions[:, 0]
+                # Chunk by rows to ensure (rows_chunk * H) stays within kernel limits
+                rows_step = max(1, min(Bv, MAX_BATCH_SIZE // H))
+                out_valid_bhld = q.new_zeros((Bv, H, L, Dh))
+                for i in range(0, Bv, rows_step):
+                    selected_chunk = selected_bnT_valid[i : i + rows_step]
+                    if not bool(selected_chunk.any().item()):
+                        continue
+                    sel_positions = torch.nonzero(selected_chunk, as_tuple=False)
+                    row_idx_local = sel_positions[:, 0]
                     t_idx = sel_positions[:, 1]
-                    # Gather selected Q/K/V tokens: (total,H,Dh)
-                    qs_sel = q[row_idx, :, t_idx, :]
-                    ks_sel = k[row_idx, :, t_idx, :]
-                    vs_sel = v[row_idx, :, t_idx, :]
+                    # Gather selected Q/K/V tokens for this chunk: (total,H,Dh)
+                    qs_sel = q[i + row_idx_local, :, t_idx, :]
+                    ks_sel = k[i + row_idx_local, :, t_idx, :]
+                    vs_sel = v[i + row_idx_local, :, t_idx, :]
                     # Pack QKV for flash varlen
                     qkv_packed = torch.stack(
                         [qs_sel, ks_sel, vs_sel], dim=1
                     ).contiguous()  # (total,3,H,Dh)
-                    # cu_seqlens from per-row counts
-                    lens = selected_bnT_valid.sum(dim=1, dtype=torch.int32)  # (Bv,)
-                    cu = torch.zeros(Bv + 1, dtype=torch.int32, device=x.device)
+                    # cu_seqlens from per-row counts (chunk)
+                    lens = selected_chunk.sum(dim=1, dtype=torch.int32)  # (rows_step_chunk,)
+                    cu = torch.zeros(
+                        lens.shape[0] + 1, dtype=torch.int32, device=x.device
+                    )
                     cu[1:] = torch.cumsum(lens, dim=0)
                     max_len = int(lens.max().item()) if lens.numel() > 0 else 0
                     p_drop = self.dropout_p if self.training else 0.0
@@ -544,13 +576,13 @@ class NeuronCausalAttention(nn.Module):
                         softmax_scale=None,
                         causal=True,
                     )  # (total,H,Dh)
-                    # Scatter back into (Bv,H,L,Dh), leaving non-selected steps as zero (cheap path -> residual only)
-                    out_valid_bhld = q.new_zeros((Bv, H, L, Dh))
-                    out_valid_bhld[row_idx, :, t_idx, :] = attn_sel
-                    out_valid = self._from_bhld(out_valid_bhld).to(res.dtype)
-                else:
-                    # No tokens selected anywhere: leave out_valid as zeros => identity path after residual
-                    out_valid = torch.zeros_like(q_in)
+                    # Scatter back into (rows_chunk,H,L,Dh)
+                    out_valid_bhld_chunk = q.new_zeros(
+                        (selected_chunk.shape[0], H, L, Dh)
+                    )
+                    out_valid_bhld_chunk[row_idx_local, :, t_idx, :] = attn_sel
+                    out_valid_bhld[i : i + selected_chunk.shape[0]] = out_valid_bhld_chunk
+                out_valid = self._from_bhld(out_valid_bhld).to(res.dtype)
             else:
                 # No gating: full causal SDPA per row chunked by heads
                 # Choose row chunk so (rows_chunk * H) <= max_bh_per_call

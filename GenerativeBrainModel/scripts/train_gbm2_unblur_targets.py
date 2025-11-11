@@ -46,6 +46,11 @@ def create_default_config() -> Dict[str, Any]:
             "d_stimuli": None,
             "num_neurons_total": 4_000_000,
             "cov_rank": 32,
+            # Optional neuron-time gating
+            "gate_capacity_k": None,
+            "gating_capacity_fraction": None,
+            "gate_temperature": 0.0,
+            "gating_state_rank": 16,
         },
         "training": {
             "batch_size": 2,
@@ -327,6 +332,10 @@ def main():
         num_neurons_total=int(cfg["model"]["num_neurons_total"]),
         global_neuron_ids=unique_neuron_ids,
         cov_rank=int(cfg["model"].get("cov_rank", 32)),
+        gate_capacity_k=cfg["model"].get("gate_capacity_k"),
+        gate_capacity_fraction=cfg["model"].get("gating_capacity_fraction"),
+        gate_temperature=float(cfg["model"].get("gate_temperature", 0.0) or 0.0),
+        gating_state_rank=int(cfg["model"].get("gating_state_rank", 16)),
     ).to(device)
 
     if device.type == "cuda":

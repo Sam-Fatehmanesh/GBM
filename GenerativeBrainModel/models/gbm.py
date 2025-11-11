@@ -26,6 +26,11 @@ class GBM(nn.Module):
         neuron_pad_id: int = 0,
         global_neuron_ids: torch.Tensor | None = None,
         cov_rank: int = 32,
+        # Optional neuron-time gating controls
+        gate_capacity_k: int | None = None,
+        gate_capacity_fraction: float | None = None,
+        gate_temperature: float = 0.0,
+        gating_state_rank: int = 16,
     ):
         super(GBM, self).__init__()
 
@@ -36,9 +41,23 @@ class GBM(nn.Module):
         self.n_layers = n_layers
         self.d_stimuli = d_stimuli
         self.neuron_pad_id = int(neuron_pad_id)
+        self.gate_capacity_k = gate_capacity_k
+        self.gate_capacity_fraction = gate_capacity_fraction
+        self.gate_temperature = float(gate_temperature)
+        self.gating_state_rank = int(gating_state_rank)
 
         self.layers = nn.ModuleList(
-            [SpatioTemporalNeuralAttention(d_model, n_heads) for _ in range(n_layers)]
+            [
+                SpatioTemporalNeuralAttention(
+                    d_model,
+                    n_heads,
+                    gate_capacity_k=self.gate_capacity_k,
+                    gate_capacity_fraction=self.gate_capacity_fraction,
+                    gate_temperature=self.gate_temperature,
+                    state_rank=self.gating_state_rank,
+                )
+                for _ in range(n_layers)
+            ]
         )
 
         self.conv = nn.Sequential(

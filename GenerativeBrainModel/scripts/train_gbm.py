@@ -118,6 +118,11 @@ def create_default_config() -> Dict[str, Any]:
             "n_heads": 8,
             "n_layers": 4,
             "d_stimuli": None,  # inferred from data (stimulus_onehot width)
+            # Optional neuron-time gating
+            "gate_capacity_k": None,
+            "gating_capacity_fraction": None,
+            "gate_temperature": 0.0,
+            "gating_state_rank": 16,
         },
         "training": {
             "batch_size": 2,
@@ -826,6 +831,10 @@ def main():
         d_stimuli=d_stimuli,
         n_heads=mcfg["n_heads"],
         n_layers=mcfg["n_layers"],
+        gate_capacity_k=mcfg.get("gate_capacity_k"),
+        gate_capacity_fraction=mcfg.get("gating_capacity_fraction"),
+        gate_temperature=float(mcfg.get("gate_temperature", 0.0) or 0.0),
+        gating_state_rank=int(mcfg.get("gating_state_rank", 16)),
     ).to(device)
     # Propagate data mode flags into model for forward(get_logits=False)
     model.spikes_are_rates = False

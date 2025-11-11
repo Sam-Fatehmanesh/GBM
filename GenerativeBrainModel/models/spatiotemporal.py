@@ -24,7 +24,15 @@ class GlobalMeanPool(nn.Module):
 
 
 class SpatioTemporalNeuralAttention(nn.Module):
-    def __init__(self, d_model, n_heads):
+    def __init__(
+        self,
+        d_model,
+        n_heads,
+        gate_capacity_k: int | None = None,
+        gate_capacity_fraction: float | None = None,
+        gate_temperature: float = 0.0,
+        state_rank: int = 16,
+    ):
         super(SpatioTemporalNeuralAttention, self).__init__()
         self.d_model = d_model
         self.n_heads = n_heads
@@ -32,7 +40,12 @@ class SpatioTemporalNeuralAttention(nn.Module):
             d_model=d_model, n_heads=n_heads
         )
         self.temporal_attention = NeuronCausalAttention(
-            d_model=d_model, n_heads=n_heads
+            d_model=d_model,
+            n_heads=n_heads,
+            gate_capacity_k=gate_capacity_k,
+            gate_capacity_fraction=gate_capacity_fraction,
+            gate_temperature=gate_temperature,
+            state_rank=state_rank,
         )
 
         self.FFN0 = FFN(d_model, d_model * 3)
