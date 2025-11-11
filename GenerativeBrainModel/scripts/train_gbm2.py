@@ -915,7 +915,10 @@ def main():
                                 las_v[0:1] if las_v.numel() > 0 else None,
                                 Tf_v,
                                 sampling_rate_hz=sr_v,
-                                max_context_len=int(cfg["training"].get("sequence_length", 12)) - 1,
+                                max_context_len=int(
+                                    cfg["training"].get("sequence_length", 12)
+                                )
+                                - 1,
                             )
                             final_ctx = init_context_v[0].cpu()
                             final_truth = x_in_v[0, Tc_v : Tc_v + Tf_v, :].cpu()
@@ -951,11 +954,7 @@ def main():
                         )
                     _update_loss_plot()
                     # If we failed to prepare an AR visualization, raise with context
-                    if (
-                        final_ctx is None
-                        or final_truth is None
-                        or final_pred is None
-                    ):
+                    if final_ctx is None or final_truth is None or final_pred is None:
                         raise RuntimeError(
                             "No AR visualization produced during intra-epoch validation: "
                             "no eligible batch/window met requirements (check sequence_length-1 vs horizon, "
@@ -1119,7 +1118,8 @@ def main():
                         las[0:1] if las.numel() > 0 else None,
                         Tf,
                         sampling_rate_hz=sr,
-                        max_context_len=int(cfg["training"].get("sequence_length", 12)) - 1,
+                        max_context_len=int(cfg["training"].get("sequence_length", 12))
+                        - 1,
                     )
                     final_ctx = init_context[0].cpu()
                     final_truth = x_in[0, Tc : Tc + Tf, :].cpu()

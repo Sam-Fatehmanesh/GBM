@@ -813,10 +813,11 @@ def gumbel_topk(logits: torch.Tensor, k: int, temperature: float = 1.0):
     if temperature == 0.0:
         topk_values, topk_indices = torch.topk(logits, k, dim=-1)
         return topk_values, topk_indices
-    gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8) / temperature
+    gumbel_noise = (
+        -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8) / temperature
+    )
     topk_values, topk_indices = torch.topk(logits + gumbel_noise, k, dim=-1)
     return topk_values, topk_indices
-
 
 
 class SparseSpikeFullAttention(nn.Module):
