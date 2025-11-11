@@ -149,9 +149,7 @@ class SparseSpikeFullAttention(nn.Module):
 
     # -------- helpers --------
     @torch.no_grad()
-    def _rope_angles(
-        self, positions
-    ):  # positions: (B, N, 3)  (do NOT normalize; you said RMS-scaled & centered)
+    def _rope_angles(self, positions):
         rope_dirs = self.rope_dirs.to(dtype=positions.dtype, device=positions.device)
         rope_freqs = self.rope_freqs.to(
             dtype=positions.dtype, device=positions.device
@@ -172,25 +170,50 @@ class SparseSpikeFullAttention(nn.Module):
     @staticmethod
     def _apply_rotary_inplace(x, theta, m):
         """
-        x: (total_tokens, H, Dh)
-        theta: (total_tokens, F)  -> we use only first m angles
-        m: number of rotary pairs (first 2m dims per head will be rotated)
+        Apply in-place rotary positional embedding to the first 2*m dimensions of each attention head.
+
+        Args:
+            x (Tensor): Input tensor of shape (total_tokens, n_heads, head_dim).
+            theta (Tensor): Rotary angles of shape (total_tokens, F). Only the first m angles are used.
+            m (int): Number of rotary pairs. The first 2*m channels per head are rotated.
+
+        Returns:
+            Tensor: The input tensor x with rotary embedding applied to first 2*m dims.
         """
+
         if m <= 0:
             return x
-        # pairwise rotate: (even, odd)
+
         x_even = x[..., : 2 * m : 2]  # (total, H, m)
         x_odd = x[..., 1 : 2 * m : 2]  # (total, H, m)
-        sin = torch.sin(theta[:, :m]).unsqueeze(1)  # (total,1,m)
-        cos = torch.cos(theta[:, :m]).unsqueeze(1)  # (total,1,m)
-        xe = x_even * cos - x_odd * sin
-        xo = x_even * sin + x_odd * cos
-        x[..., : 2 * m : 2] = xe
-        x[..., 1 : 2 * m : 2] = xo
+        sin = torch.sin(theta[:, :m]).unsqueeze(1)  # (total, 1, m)
+        cos = torch.cos(theta[:, :m]).unsqueeze(1)  # (total, 1, m)
+
+        x[..., : 2 * m : 2] = x_even * cos - x_odd * sin
+        x[..., 1 : 2 * m : 2] = x_even * sin + x_odd * cos
         return x
 
-    # @torch._dynamo.disable
     def forward(self, x, point_positions, neuron_pad_mask, spike_mask):
+        """
+        Forward pass for attention module with rotary and RFF-based spatial embeddings.
+
+        Args:
+            x (Tensor): Input activations of shape (B, T, N, D).
+            point_positions (Tensor): Neuron positions, shape (B, N, 3).
+            neuron_pad_mask (Tensor): Mask for valid (unpadded) neurons, shape (B, N), nonzero for valid.
+            spike_mask (Tensor): Mask for "spiking" positions/tokens, shape (B, T, N), nonzero for spikes.
+
+        Returns:
+            Tensor:
+                Output tensor after attention, preserving input shape and padding:
+                of shape (B, T, N, D).
+
+        Note:
+            - Non-spiking, valid tokens are used as queries; spiking, valid as keys/values.
+            - Rotary (RoPE) and Random Fourier Features (RFF) positional information are injected into Q/K.
+            - In-place, varlen sparse attention is computed with memory and compute optimizations.
+            - Handles variable batch sizes, variable numbers of neurons (N), and masking.
+        """
         # x: (B,T,N,D), positions: (B,N,3), masks as described
         B, T, N, D = x.shape
         H, Dh = self.n_heads, self.head_dim
