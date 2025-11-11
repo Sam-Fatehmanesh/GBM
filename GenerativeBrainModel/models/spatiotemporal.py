@@ -68,25 +68,17 @@ class SpatioTemporalNeuralAttention(nn.Module):
             dim=1,
         )  # (B, n_neurons + 1, 3)
 
-        # Add a one to the neuron_spike_probs to account for the stimulus token
-        neuron_spike_probs = torch.cat(
+        # Add a True to the neuron_spike mask to account for the stimulus token
+        neuron_spike_mask = (neuron_spike_probs != 0)
+        neuron_spike_mask = torch.cat(
             [
-                neuron_spike_probs,
-                torch.ones_like(neuron_spike_probs[:, :, :1]).to(torch.float32),
+                neuron_spike_mask,
+                torch.ones_like(neuron_spike_mask[:, :, :1]).to(torch.bool),
             ],
             dim=2,
         )  # (B, T, n_neurons + 1)
-        # Sample the neuron spike probabilities (clamp to [0,1] in fp32 to avoid device-side asserts)
-        probs_fp32 = torch.nan_to_num(
-            neuron_spike_probs.to(torch.float32), nan=0.0, posinf=1.0, neginf=0.0
-        ).clamp_(0.0, 1.0)
-        if debug_enabled():
-            assert_no_nan(probs_fp32, "STNA.probs_fp32_before_bernoulli")
-        neuron_spike_mask = torch.bernoulli(probs_fp32).to(torch.bool)
 
-        x = self.spatial_attention(
-            x, point_positions, neuron_pad_mask, neuron_spike_mask
-        )
+        x = self.spatial_attention(x, point_positions, neuron_pad_mask, neuron_spike_mask)
         if debug_enabled():
             assert_no_nan(x, "STNA.after_spatial")
 

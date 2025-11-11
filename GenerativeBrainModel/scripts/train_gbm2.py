@@ -905,8 +905,7 @@ def main():
                             Tc_v = max(1, Lm1_v - Tf_v)
                             init_context_v = x_in_v[0:1, :Tc_v, :].to(torch.float32)
                             stim_full_v = stim_v[0:1, : Tc_v + Tf_v, :]
-                            pred_future_v = autoregressive_rollout(
-                                model,
+                            pred_future_v, _ctx_ct_v, _pred_ct_v = model.autoregress(
                                 init_context_v,
                                 stim_full_v,
                                 positions_v[0:1],
@@ -914,9 +913,9 @@ def main():
                                 neuron_ids_v[0:1],
                                 lam_v[0:1] if lam_v.numel() > 0 else None,
                                 las_v[0:1] if las_v.numel() > 0 else None,
-                                device,
                                 Tf_v,
                                 sampling_rate_hz=sr_v,
+                                max_context_len=int(cfg["training"].get("sequence_length", 12)) - 1,
                             )
                             final_ctx = init_context_v[0].cpu()
                             final_truth = x_in_v[0, Tc_v : Tc_v + Tf_v, :].cpu()
@@ -951,8 +950,24 @@ def main():
                             title=f"E{epoch} step {count} autoreg 16 neurons",
                         )
                     _update_loss_plot()
-                except Exception:
-                    pass
+                    # If we failed to prepare an AR visualization, raise with context
+                    if (
+                        final_ctx is None
+                        or final_truth is None
+                        or final_pred is None
+                    ):
+                        raise RuntimeError(
+                            "No AR visualization produced during intra-epoch validation: "
+                            "no eligible batch/window met requirements (check sequence_length-1 vs horizon, "
+                            "val_sample_batches, or dataset windowing)."
+                        )
+                except Exception as e:
+                    # Print error before re-raising to stop silently skipping AR
+                    try:
+                        print(f"[train_gbm2][intra-epoch val] Exception: {e}")
+                    except Exception:
+                        pass
+                    raise
                 model.train()
                 # Free cached VRAM after validation + plotting to reduce peak usage
                 _maybe_empty_cuda_cache()
@@ -1094,8 +1109,7 @@ def main():
                     Tc = max(1, Lm1 - Tf)
                     init_context = x_in[0:1, :Tc, :].to(torch.float32)
                     stim_full = stim[0:1, : Tc + Tf, :]
-                    pred_future = autoregressive_rollout(
-                        model,
+                    pred_future, _ctx_ct, _pred_ct = model.autoregress(
                         init_context,
                         stim_full,
                         positions[0:1],
@@ -1103,9 +1117,9 @@ def main():
                         neuron_ids[0:1],
                         lam[0:1] if lam.numel() > 0 else None,
                         las[0:1] if las.numel() > 0 else None,
-                        device,
                         Tf,
                         sampling_rate_hz=sr,
+                        max_context_len=int(cfg["training"].get("sequence_length", 12)) - 1,
                     )
                     final_ctx = init_context[0].cpu()
                     final_truth = x_in[0, Tc : Tc + Tf, :].cpu()
@@ -1134,6 +1148,11 @@ def main():
                     final_truth,
                     final_pred,
                     title=f"E{epoch} autoreg 16 neurons",
+                )
+            else:
+                raise RuntimeError(
+                    "No AR visualization produced for this epoch: no eligible validation sample/window "
+                    "met requirements (ensure sequence_length-1 > 0 and that horizon fits within available context)."
                 )
 
             # Track best
