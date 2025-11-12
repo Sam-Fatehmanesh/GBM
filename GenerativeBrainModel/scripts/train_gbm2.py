@@ -284,6 +284,104 @@ def make_validation_plots(
 
 
 @torch.no_grad()
+def make_mean_rate_plot(
+    step_dir: Path,
+    context_truth: torch.Tensor,
+    future_truth: torch.Tensor,
+    future_pred: torch.Tensor,
+    title: str,
+) -> None:
+    """Plot mean rate over neurons vs time for context, true future, and AR prediction."""
+    step_dir.mkdir(parents=True, exist_ok=True)
+    Tc, N = context_truth.shape
+    Tf = future_truth.shape[0]
+    ctx_mean = (
+        context_truth.to(torch.float32).mean(dim=1).cpu().numpy()
+        if context_truth.numel() > 0
+        else np.zeros((0,), dtype=np.float32)
+    )
+    fut_mean = (
+        future_truth.to(torch.float32).mean(dim=1).cpu().numpy()
+        if future_truth.numel() > 0
+        else np.zeros((0,), dtype=np.float32)
+    )
+    pred_mean = (
+        future_pred.to(torch.float32).mean(dim=1).cpu().numpy()
+        if future_pred.numel() > 0
+        else np.zeros((0,), dtype=np.float32)
+    )
+    x_context = np.arange(Tc)
+    x_future = np.arange(Tc, Tc + Tf)
+    fig, ax = plt.subplots(1, 1, figsize=(10, 3))
+    if ctx_mean.size:
+        ax.plot(x_context, ctx_mean, color="gray", lw=1.5, label="context mean rate")
+    if fut_mean.size:
+        ax.plot(x_future, fut_mean, color="tab:blue", lw=1.5, label="future truth mean")
+    if pred_mean.size:
+        ax.plot(
+            x_future, pred_mean, color="tab:orange", lw=1.5, label="future pred mean"
+        )
+    ax.set_xlabel("time")
+    ax.set_ylabel("mean rate")
+    ax.set_title(title)
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    out = step_dir / "mean_rate_over_time.png"
+    fig.savefig(out)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def make_median_rate_plot(
+    step_dir: Path,
+    context_truth: torch.Tensor,
+    future_truth: torch.Tensor,
+    future_pred: torch.Tensor,
+    title: str,
+) -> None:
+    """Plot median rate over neurons vs time for context, true future, and AR prediction."""
+    step_dir.mkdir(parents=True, exist_ok=True)
+    Tc, N = context_truth.shape
+    Tf = future_truth.shape[0]
+    ctx_med = (
+        context_truth.to(torch.float32).median(dim=1).values.cpu().numpy()
+        if context_truth.numel() > 0
+        else np.zeros((0,), dtype=np.float32)
+    )
+    fut_med = (
+        future_truth.to(torch.float32).median(dim=1).values.cpu().numpy()
+        if future_truth.numel() > 0
+        else np.zeros((0,), dtype=np.float32)
+    )
+    pred_med = (
+        future_pred.to(torch.float32).median(dim=1).values.cpu().numpy()
+        if future_pred.numel() > 0
+        else np.zeros((0,), dtype=np.float32)
+    )
+    x_context = np.arange(Tc)
+    x_future = np.arange(Tc, Tc + Tf)
+    fig, ax = plt.subplots(1, 1, figsize=(10, 3))
+    if ctx_med.size:
+        ax.plot(x_context, ctx_med, color="gray", lw=1.5, label="context median rate")
+    if fut_med.size:
+        ax.plot(
+            x_future, fut_med, color="tab:blue", lw=1.5, label="future truth median"
+        )
+    if pred_med.size:
+        ax.plot(
+            x_future, pred_med, color="tab:orange", lw=1.5, label="future pred median"
+        )
+    ax.set_xlabel("time")
+    ax.set_ylabel("median rate")
+    ax.set_title(title)
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    out = step_dir / "median_rate_over_time.png"
+    fig.savefig(out)
+    plt.close(fig)
+
+
+@torch.no_grad()
 def autoregressive_rollout(
     model: GBM,
     init_context: torch.Tensor,  # (1, Tc, N) rates
@@ -922,7 +1020,7 @@ def main():
                             )
                             final_ctx = init_context_v[0].cpu()
                             final_truth = x_in_v[0, Tc_v : Tc_v + Tf_v, :].cpu()
-                            final_pred = pred_future_v.cpu()
+                            final_pred = pred_future_v[0].cpu()
                             if vb >= val_sample_batches_local:
                                 break
 
@@ -952,6 +1050,47 @@ def main():
                             final_pred,
                             title=f"E{epoch} step {count} autoreg 16 neurons",
                         )
+                        # Save a checkpoint for this validation run (per-step)
+                        try:
+                            torch.save(
+                                {
+                                    "epoch": epoch,
+                                    "global_step": global_step,
+                                    "step_in_epoch": count,
+                                    "model": model.state_dict(),
+                                },
+                                ckpt_dir / f"epoch_{epoch}_step_{count}.pth",
+                            )
+                        except Exception as _e_ckpt_step:
+                            try:
+                                print(
+                                    f"[train_gbm2][AR E{epoch} step {count}] ckpt save failed: {_e_ckpt_step}"
+                                )
+                            except Exception:
+                                pass
+                        # Mean/median over time plots (context and future: true/pred)
+                        try:
+                            make_mean_rate_plot(
+                                step_dir,
+                                final_ctx,
+                                final_truth,
+                                final_pred,
+                                title=f"E{epoch} step {count} mean rate over time",
+                            )
+                            make_median_rate_plot(
+                                step_dir,
+                                final_ctx,
+                                final_truth,
+                                final_pred,
+                                title=f"E{epoch} step {count} median rate over time",
+                            )
+                        except Exception as _e_stats:
+                            try:
+                                print(
+                                    f"[train_gbm2][AR E{epoch} step {count}] mean/median plot failed: {_e_stats}"
+                                )
+                            except Exception:
+                                pass
                     _update_loss_plot()
                     # If we failed to prepare an AR visualization, raise with context
                     if final_ctx is None or final_truth is None or final_pred is None:
@@ -1123,7 +1262,7 @@ def main():
                     )
                     final_ctx = init_context[0].cpu()
                     final_truth = x_in[0, Tc : Tc + Tf, :].cpu()
-                    final_pred = pred_future.cpu()
+                    final_pred = pred_future[0].cpu()
                     if vb >= val_sample_batches:
                         break
             val_loss = total / max(1, vb)
@@ -1149,6 +1288,46 @@ def main():
                     final_pred,
                     title=f"E{epoch} autoreg 16 neurons",
                 )
+                # Save a checkpoint for this validation run (per-epoch)
+                try:
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "global_step": global_step,
+                            "model": model.state_dict(),
+                        },
+                        ckpt_dir / f"epoch_{epoch}.pth",
+                    )
+                except Exception as _e_ckpt_epoch:
+                    try:
+                        print(
+                            f"[train_gbm2][AR E{epoch}] ckpt save failed: {_e_ckpt_epoch}"
+                        )
+                    except Exception:
+                        pass
+                # Mean/median over time plots (context and future: true/pred)
+                try:
+                    make_mean_rate_plot(
+                        step_dir,
+                        final_ctx,
+                        final_truth,
+                        final_pred,
+                        title=f"E{epoch} mean rate over time",
+                    )
+                    make_median_rate_plot(
+                        step_dir,
+                        final_ctx,
+                        final_truth,
+                        final_pred,
+                        title=f"E{epoch} median rate over time",
+                    )
+                except Exception as _e_stats2:
+                    try:
+                        print(
+                            f"[train_gbm2][AR E{epoch}] mean/median plot failed: {_e_stats2}"
+                        )
+                    except Exception:
+                        pass
             else:
                 raise RuntimeError(
                     "No AR visualization produced for this epoch: no eligible validation sample/window "
