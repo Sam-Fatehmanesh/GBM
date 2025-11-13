@@ -1,39 +1,57 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
-import numpy as np
 from GenerativeBrainModel.models.rms import RMSNorm
-from GenerativeBrainModel.models.mlp import MLP, FFN
+from GenerativeBrainModel.models.mlp import FFN
 from GenerativeBrainModel.models.attention import (
     SparseSpikeFullAttention,
     NeuronCausalAttention,
 )
-from GenerativeBrainModel.models.conv import CausalResidualNeuralConv1d
 from GenerativeBrainModel.utils.debug import assert_no_nan, debug_enabled
-
-# from mamba_ssm import Mamba2 as Mamba
-import os
+from GenerativeBrainModel.models.config import GBMConfig
 
 
 class GlobalMeanPool(nn.Module):
     """Pools across the neuron (N) dimension, keeping dims."""
 
     def forward(self, x):
+        """Return mean over neuron axis with dims kept: (B, T, N, D) -> (B, T, 1, D)."""
         # x: (B, T, N, D)
         return x.mean(dim=2, keepdim=True)  # (B, T, 1, D)
 
 
 class SpatioTemporalNeuralAttention(nn.Module):
-    def __init__(self, d_model, n_heads):
+    def __init__(self, d_model, n_heads, config: GBMConfig | None = None):
+        """Compose spatial and temporal modules; temporal uses gating via GBMConfig.
+
+        - Spatial attention operates across neurons per timestep (uses spike mask).
+        - Temporal attention operates per neuron across time with optional gating
+          (fixed or fractional top-k) configured by GBMConfig.
+        """
         super(SpatioTemporalNeuralAttention, self).__init__()
         self.d_model = d_model
         self.n_heads = n_heads
+        self.config = config
         self.spatial_attention = SparseSpikeFullAttention(
             d_model=d_model, n_heads=n_heads
         )
-        self.temporal_attention = NeuronCausalAttention(
-            d_model=d_model, n_heads=n_heads
-        )
+        # Forward GBMConfig into temporal attention if provided; otherwise run dense
+        if self.config is None:
+            self.temporal_attention = NeuronCausalAttention(
+                d_model=d_model, n_heads=n_heads
+            )
+        else:
+            self.temporal_attention = NeuronCausalAttention(
+                d_model=d_model,
+                n_heads=n_heads,
+                dropout_p=float(self.config.temporal_dropout_p),
+                max_bh_per_call=int(self.config.temporal_max_bh_per_call),
+                max_seq_len=int(self.config.temporal_max_seq_len),
+                gate_capacity=self.config.gate_capacity,
+                gate_fraction=self.config.gate_fraction,
+                gate_temperature=float(self.config.gate_temperature),
+                state_proj_rank=int(self.config.state_proj_rank),
+                stochastic_topk=bool(self.config.stochastic_topk),
+            )
 
         self.FFN0 = FFN(d_model, d_model * 3)
         self.FFN1 = FFN(d_model, d_model * 3)

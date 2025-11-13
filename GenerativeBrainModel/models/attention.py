@@ -2,12 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from GenerativeBrainModel.models.rms import RMSNorm
-import numpy as np
-
-# from mamba_ssm import Mamba2 as Mamba  # kept for parity
 from torch.nn.attention import sdpa_kernel, SDPBackend
-from GenerativeBrainModel.utils.debug import assert_no_nan, debug_enabled
-
 import math
 
 # Require FlashAttention-2 varlen
@@ -17,8 +12,6 @@ from flash_attn.flash_attn_interface import (
 
 # Also get normal FlashAttention-2
 from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func
-
-import torch.distributed as dist
 
 MAX_BATCH_SIZE = 65535
 
@@ -1019,12 +1012,9 @@ class SparseSpikeFullAttention(nn.Module):
 
 class NeuronCausalAttention(nn.Module):
     """
-    Causal self-attention over time per neuron independently, with timewise RoPE.
-    - Operates on each neuron timeline (length T) with causal attention.
-    - Respects neuron_pad_mask (B,N): skip padded neurons entirely to save compute.
-    - Spike mask is ignored.
-    - Launches at most (2^18) sequences per FLASH call by chunking rows.
-    - Adds rotary positional embeddings over time axis per neuron.
+    Causal self-attention over time per neuron with optional stochastic top-k gating.
+    The gate selects, per timestep, which neuron timelines run temporal attention,
+    reducing compute while maintaining causal masking.
     """
 
     def __init__(
@@ -1034,6 +1024,11 @@ class NeuronCausalAttention(nn.Module):
         dropout_p: float = 0.0,
         max_bh_per_call: int = (2**16 - 1),
         max_seq_len: int = 512,
+        gate_capacity: int | None = None,
+        gate_fraction: float | None = None,
+        gate_temperature: float = 0.1,
+        state_proj_rank: int = 2,
+        stochastic_topk: bool = True,
     ):
         super().__init__()
         assert d_model % n_heads == 0
@@ -1043,6 +1038,36 @@ class NeuronCausalAttention(nn.Module):
         self.dropout_p = float(dropout_p)
         self.max_bh_per_call = int(max_bh_per_call)
 
+        # Gating configuration (exactly one of capacity or fraction)
+        assert not (gate_capacity is not None and gate_fraction is not None), (
+            "Specify exactly one of gate_capacity or gate_fraction, not both."
+        )
+        assert not (gate_capacity is None and gate_fraction is None), (
+            "Specify gate_capacity (absolute) or gate_fraction (fractional) for gating."
+        )
+        if gate_capacity is not None:
+            assert gate_capacity > 0, "gate_capacity must be positive when provided."
+        if gate_fraction is not None:
+            assert 0.0 < float(gate_fraction) <= 1.0, (
+                "gate_fraction must lie in the interval (0, 1]."
+            )
+
+        self.gate_capacity = int(gate_capacity) if gate_capacity is not None else None
+        self.gate_fraction = float(gate_fraction) if gate_fraction is not None else None
+        self.gate_temperature = float(gate_temperature)
+        self.state_proj_rank = max(1, int(state_proj_rank))
+        self.stochastic_topk = bool(stochastic_topk)
+
+        # Gating parameters
+        self.gate_vector = nn.Parameter(torch.empty(d_model))
+        self.gate_bias = nn.Parameter(torch.zeros(1))
+        nn.init.normal_(self.gate_vector, mean=0.0, std=1.0 / math.sqrt(d_model))
+        self.state_proj_in = nn.Linear(d_model, self.state_proj_rank, bias=False)
+        self.state_proj_out = nn.Linear(self.state_proj_rank, d_model, bias=False)
+        nn.init.kaiming_uniform_(self.state_proj_in.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.state_proj_out.weight)
+
+        # Core projections
         self.norm = RMSNorm(d_model)
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
@@ -1051,100 +1076,251 @@ class NeuronCausalAttention(nn.Module):
 
         # --- Timewise RoPE (rotary) ---
         self.max_seq_len = max_seq_len
-        # Precompute sin/cos tables for rotary, with 32 rotary dims per head by default (or as many as fit)
         self.rotary_frac = 0.5
         self.rotary_dim = int(self.head_dim * self.rotary_frac)
-        inv_freq = 1.0 / (
-            10000 ** (torch.arange(0, self.rotary_dim, 2).float() / self.rotary_dim)
-        )
-        t = torch.arange(self.max_seq_len)
-        freqs = torch.outer(t, inv_freq)  # (T, rotary_dim // 2)
-        sin, cos = freqs.sin(), freqs.cos()
+        if self.rotary_dim > 0:
+            inv_freq = 1.0 / (
+                10000 ** (torch.arange(0, self.rotary_dim, 2).float() / self.rotary_dim)
+            )
+            t = torch.arange(self.max_seq_len)
+            freqs = torch.outer(t, inv_freq)  # (T, rotary_dim // 2)
+            sin, cos = freqs.sin(), freqs.cos()
+        else:
+            sin = torch.zeros(self.max_seq_len, 0)
+            cos = torch.zeros(self.max_seq_len, 0)
         self.register_buffer("rope_sin", sin, persistent=False)
         self.register_buffer("rope_cos", cos, persistent=False)
 
     def _to_bhld(self, x):  # (B*, L, D) -> (B*, H, L, Dh)
+        """Reshape (batch*, length, d_model) to (batch*, n_heads, length, head_dim)."""
         Bx, L, D = x.shape
         return (
             x.view(Bx, L, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         )
 
     def _from_bhld(self, x):  # (B*, H, L, Dh) -> (B*, L, D)
+        """Reshape (batch*, n_heads, length, head_dim) back to (batch*, length, d_model)."""
         Bx, H, L, Dh = x.shape
         return x.permute(0, 2, 1, 3).contiguous().view(Bx, L, H * Dh)
 
     def _apply_timewise_rope(self, x, seq_len):
-        """
-        Apply rotary positional embeddings along the time axis.
-        x: (batch*, H, seq_len, Dh)
-        Only applies to the first rotary_dim of Dh.
+        """Apply rotary embeddings along time for the first rotary_dim channels.
+
+        Uses precomputed sin/cos at indices [0:seq_len] and writes the rotated
+        slice back into x, preserving non-rotary channels.
         """
         rotary_dim = self.rotary_dim
         if rotary_dim == 0:
             return x
-        # get sin/cos for this seq_len, shape (seq_len, rotary_dim // 2)
         sin = self.rope_sin[:seq_len].to(dtype=x.dtype, device=x.device)
         cos = self.rope_cos[:seq_len].to(dtype=x.dtype, device=x.device)
-        # Shape to (1,1,seq_len, rotary_dim), broadcast along batch/H
         sin = sin[None, None, :, :]
         cos = cos[None, None, :, :]
-
         x1 = x[..., :rotary_dim]
         x2 = x[..., rotary_dim:]
-        # Reshape for pairwise treatment
         x1 = x1.reshape(*x.shape[:-1], rotary_dim // 2, 2)
-        sin, cos = sin, cos
         x1_0 = x1[..., 0]
         x1_1 = x1[..., 1]
         rope_x0 = x1_0 * cos - x1_1 * sin
         rope_x1 = x1_0 * sin + x1_1 * cos
-        # Stack and reshape back
         x1_rope = torch.stack([rope_x0, rope_x1], dim=-1).reshape(
             *x.shape[:-1], rotary_dim
         )
-        # Concatenate with remaining dims
         return torch.cat([x1_rope, x2], dim=-1)
 
-    # @torch._dynamo.disable
-    def forward(self, x: torch.Tensor, neuron_pad_mask: torch.Tensor):
-        # x: (B, T, N, D)
-        B, T, N, D = x.shape
-        xn = self.norm(x)
-        xt = xn.permute(0, 2, 1, 3).contiguous().view(B * N, T, D)  # (B*N, T, D)
+    def _apply_timewise_rope_indexed(self, x, time_indices: torch.Tensor):
+        """Apply rotary embeddings using per-token time indices for varlen sequences.
+
+        time_indices maps each token to a timestep [0, max_seq_len). This enables
+        correct rotation when tokens from multiple timesteps are packed together.
+        """
+        if self.rotary_dim == 0 or x.numel() == 0:
+            return x
+        sin = self.rope_sin.index_select(0, time_indices).to(
+            dtype=x.dtype, device=x.device
+        )
+        cos = self.rope_cos.index_select(0, time_indices).to(
+            dtype=x.dtype, device=x.device
+        )
+        sin = sin.unsqueeze(1)
+        cos = cos.unsqueeze(1)
+        x1 = x[..., : self.rotary_dim].reshape(
+            x.shape[0], x.shape[1], self.rotary_dim // 2, 2
+        )
+        xe = x1[..., 0]
+        xo = x1[..., 1]
+        r0 = xe * cos - xo * sin
+        r1 = xe * sin + xo * cos
+        rot = torch.stack([r0, r1], dim=-1).reshape(
+            x.shape[0], x.shape[1], self.rotary_dim
+        )
+        x[..., : self.rotary_dim] = rot
+        return x
+
+    def _varlen_attention_fallback(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        seq_lengths: torch.Tensor,
+        dropout_p: float,
+    ) -> torch.Tensor:
+        """Compute causal SDPA per sequence when Flash varlen is unavailable.
+
+        Splits the flat-packed tokens using seq_lengths, applies SDPA per
+        sequence (causal=True), and concatenates the outputs back to a flat
+        layout matching q.shape.
+        """
+        if q.numel() == 0 or seq_lengths.numel() == 0:
+            return q.new_zeros(q.shape)
+        outputs = []
+        start = 0
+        orig_dtype = q.dtype
+        compute_dtype = (
+            torch.float32
+            if q.device.type != "cuda"
+            else (
+                q.dtype
+                if q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                else torch.bfloat16
+            )
+        )
+        for length in seq_lengths.tolist():
+            end = start + int(length)
+            q_seq = q[start:end].permute(1, 0, 2).unsqueeze(0)
+            k_seq = k[start:end].permute(1, 0, 2).unsqueeze(0)
+            v_seq = v[start:end].permute(1, 0, 2).unsqueeze(0)
+            if q_seq.dtype != compute_dtype:
+                q_seq = q_seq.to(compute_dtype)
+                k_seq = k_seq.to(compute_dtype)
+                v_seq = v_seq.to(compute_dtype)
+            out_seq = F.scaled_dot_product_attention(
+                q_seq, k_seq, v_seq, is_causal=True, dropout_p=dropout_p
+            )
+            outputs.append(out_seq.squeeze(0).permute(1, 0, 2).to(orig_dtype))
+            start = end
+        return torch.cat(outputs, dim=0)
+
+    def _compute_gate_mask(
+        self, x: torch.Tensor, neuron_pad_mask: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Compute top-k boolean gate per (batch, time, neuron) and return (mask, probs).
+
+        Gate logits are computed as dot(gate_vector, x + low_rank_state), where
+        low_rank_state is a learned rank-{state_proj_rank} projection of the
+        per-(B,T) mean over valid neurons. Supports either fixed capacity
+        (gate_capacity) or fractional capacity (gate_fraction). If the selected
+        set equals all valid neurons, returns (None, probs) to signal identity.
+        """
+        # x: (B,T,N,D)
+        B, T, N, _ = x.shape
+        valid_neurons = (neuron_pad_mask != 0).to(torch.bool)
+        if not valid_neurons.any():
+            return None, None
+        valid_bt = valid_neurons.unsqueeze(1).expand(B, T, N)
+        mask_bt = valid_bt.unsqueeze(-1).to(dtype=x.dtype)
+        # State mean over valid neurons
+        state_sum = (x * mask_bt).sum(dim=2)
+        denom = mask_bt.sum(dim=2).clamp_min(1.0)
+        state_mean = state_sum / denom
+        state_embed = self.state_proj_out(self.state_proj_in(state_mean))  # (B,T,D)
+        gate_input = x + state_embed.unsqueeze(2)
+        logits = (
+            torch.einsum("btnd,d->btn", gate_input, self.gate_vector) + self.gate_bias
+        )
+        gate_probs = torch.sigmoid(logits).to(x.dtype)
+        scores = logits.to(torch.float32)
+        if self.training and self.stochastic_topk and self.gate_temperature > 0.0:
+            noise = torch.rand_like(scores).clamp_(1e-9, 1.0 - 1e-9)
+            gumbel = -torch.log(-torch.log(noise))
+            scores = scores + self.gate_temperature * gumbel
+        scores = scores.masked_fill(~valid_bt, float("-inf"))
+
+        if self.gate_capacity is not None:
+            if self.gate_capacity >= N:
+                return None, gate_probs
+            k = min(self.gate_capacity, scores.shape[-1])
+            if k <= 0:
+                selected_mask = torch.zeros_like(valid_bt, dtype=torch.bool)
+            else:
+                topk_idx = torch.topk(scores, k=k, dim=-1).indices
+                selected_mask = torch.zeros_like(valid_bt, dtype=torch.bool)
+                selected_mask.scatter_(-1, topk_idx, True)
+                selected_mask &= valid_bt
+        else:
+            # Fractional capacity
+            valid_counts = valid_bt.sum(dim=-1)  # (B,T)
+            capacities = torch.floor(
+                valid_counts.to(torch.float32) * self.gate_fraction + 1e-6
+            ).to(torch.int64)
+            capacities = torch.clamp(capacities, min=1)
+            capacities = torch.minimum(capacities, valid_counts.to(torch.int64))
+            if capacities.numel() == 0:
+                return torch.zeros_like(valid_bt, dtype=torch.bool), gate_probs
+            if torch.all(capacities == valid_counts.to(torch.int64)):
+                return None, gate_probs
+            max_capacity = int(capacities.max().item()) if capacities.numel() > 0 else 0
+            if max_capacity <= 0:
+                selected_mask = torch.zeros_like(valid_bt, dtype=torch.bool)
+            else:
+                topk_idx = torch.topk(
+                    scores, k=max_capacity, dim=-1
+                ).indices  # (B,T,maxK)
+                selected_mask = torch.zeros_like(valid_bt, dtype=torch.bool)  # (B,T,N)
+                selected_flat = selected_mask.view(-1, N)
+                idx_flat = topk_idx.view(-1, max_capacity)
+                cap_flat = capacities.view(-1)
+                arange_cap = torch.arange(max_capacity, device=scores.device).unsqueeze(
+                    0
+                )
+                cap_mask = arange_cap < cap_flat.unsqueeze(-1)
+                if cap_mask.any():
+                    idx_masked = idx_flat.masked_fill(~cap_mask, 0)
+                    selected_flat.scatter_(1, idx_masked, cap_mask)
+                selected_mask = selected_flat.view(B, T, N)
+                selected_mask &= valid_bt
+
+        total_valid = int(valid_bt.sum().item())
+        if total_valid == 0:
+            return torch.zeros_like(valid_bt, dtype=torch.bool), gate_probs
+        selected_count = int(selected_mask.sum().item())
+        if selected_count == 0:
+            return torch.zeros_like(valid_bt, dtype=torch.bool), gate_probs
+        if selected_count == total_valid:
+            return None, gate_probs
+        return selected_mask, gate_probs
+
+    def _full_attention(self, xn: torch.Tensor, neuron_pad_mask: torch.Tensor):
+        """Dense temporal attention for all valid neurons (no gating).
+
+        Runs per-row causal attention across the entire time axis using chunked
+        FLASH SDPA to respect max_bh_per_call, then restores to (B,T,N,D).
+        """
+        B, T, N, D = xn.shape
+        xt = xn.permute(0, 2, 1, 3).contiguous().view(B * N, T, D)
         res = xt
-
-        # Row filter from neuron_pad_mask
         valid_rows = neuron_pad_mask.reshape(-1) != 0
-
         out = torch.zeros_like(xt)
         if valid_rows.any():
             q_in = xt[valid_rows]
             k_in = q_in
             v_in = q_in
-
-            # Projections
-            q = self._to_bhld(self.q_proj(q_in))  # (Bv, H, L, Dh)
+            q = self._to_bhld(self.q_proj(q_in))
             k = self._to_bhld(self.k_proj(k_in))
             v = self._to_bhld(self.v_proj(v_in))
-
-            # Apply timewise RoPE to q/k
             q = self._apply_timewise_rope(q, seq_len=q.shape[2])
             k = self._apply_timewise_rope(k, seq_len=k.shape[2])
-
-            # Ensure FLASH dtype
             if q.dtype not in (torch.bfloat16, torch.float16):
                 q = q.to(torch.bfloat16)
             if k.dtype not in (torch.bfloat16, torch.float16):
                 k = k.to(torch.bfloat16)
             if v.dtype not in (torch.bfloat16, torch.float16):
                 v = v.to(torch.bfloat16)
-
             Bv, H, L, Dh = q.shape
             if H > self.max_bh_per_call:
                 raise RuntimeError(
                     f"n_heads={H} exceeds max_bh_per_call={self.max_bh_per_call}; reduce heads or increase cap"
                 )
-            # Choose row chunk so (rows_chunk * H) <= max_bh_per_call
             rows_step = max(1, min(Bv, self.max_bh_per_call // H))
             out_chunks = []
             for i in range(0, Bv, rows_step):
@@ -1156,10 +1332,104 @@ class NeuronCausalAttention(nn.Module):
                         qs, ks, vs, is_causal=True, dropout_p=self.dropout_p
                     )
                 out_chunks.append(out_chunk)
-            out_valid = torch.cat(out_chunks, dim=0)  # (Bv,H,L,Dh)
+            out_valid = torch.cat(out_chunks, dim=0)
             out_valid = self._from_bhld(out_valid).to(res.dtype)
             out = _index_copy_rows(out, out_valid, valid_rows)
-
         out = out + res
         out = out.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
         return self.o_proj(out)
+
+    def _gated_attention(
+        self,
+        xn: torch.Tensor,
+        neuron_pad_mask: torch.Tensor,
+        gate_mask: torch.Tensor,
+        gate_probs: torch.Tensor,
+    ):
+        """Temporal attention only on selected (top-k) timesteps per neuron sequence.
+
+        Packs selected tokens (per-row) into a flat varlen layout, applies
+        causal attention (Flash varlen when available, SDPA fallback otherwise),
+        scales outputs by gate probabilities, and scatters them back to their
+        original positions.
+        """
+        B, T, N, D = xn.shape
+        xt = xn.permute(0, 2, 1, 3).contiguous().view(B * N, T, D)
+        res = xt
+        out = torch.zeros_like(xt)
+        gate_mask = gate_mask.to(torch.bool)
+        mask_flat = gate_mask.permute(0, 2, 1).reshape(B * N, T)
+        if mask_flat.any():
+            row_idx, time_idx = torch.nonzero(mask_flat, as_tuple=True)
+            flat_idx = row_idx * T + time_idx
+            tokens = xt.view(B * N * T, D).index_select(0, flat_idx)
+            q = self.q_proj(tokens).view(-1, self.n_heads, self.head_dim)
+            k = self.k_proj(tokens).view(-1, self.n_heads, self.head_dim)
+            v = self.v_proj(tokens).view(-1, self.n_heads, self.head_dim)
+            q = self._apply_timewise_rope_indexed(q, time_idx)
+            k = self._apply_timewise_rope_indexed(k, time_idx)
+            if q.device.type == "cuda":
+                target_dtype = (
+                    torch.bfloat16
+                    if q.dtype not in (torch.float16, torch.bfloat16)
+                    else q.dtype
+                )
+            else:
+                target_dtype = torch.float32
+            if q.dtype != target_dtype:
+                q = q.to(target_dtype)
+                k = k.to(target_dtype)
+                v = v.to(target_dtype)
+            seq_counts = torch.bincount(row_idx, minlength=B * N)
+            active_rows = (seq_counts > 0).nonzero(as_tuple=False).squeeze(-1)
+            seq_lengths = seq_counts[active_rows].to(torch.int32)
+            dropout = self.dropout_p if self.training else 0.0
+            attn_out = None
+            if (
+                q.device.type == "cuda"
+                and q.dtype in (torch.bfloat16, torch.float16)
+                and seq_lengths.numel() > 0
+            ):
+                qkv = torch.stack([q, k, v], dim=1).contiguous()
+                cu_seqlens = torch.zeros(
+                    seq_lengths.numel() + 1, dtype=torch.int32, device=q.device
+                )
+                cu_seqlens[1:] = torch.cumsum(seq_lengths, dim=0)
+                max_len = (
+                    int(seq_lengths.max().item()) if seq_lengths.numel() > 0 else 0
+                )
+                try:
+                    attn_out = flash_varlen_qkv(
+                        qkv,
+                        cu_seqlens,
+                        max_len,
+                        dropout,
+                        softmax_scale=None,
+                        causal=True,
+                    )
+                except Exception:
+                    attn_out = None
+            if attn_out is None:
+                attn_out = self._varlen_attention_fallback(
+                    q, k, v, seq_lengths, dropout
+                )
+            attn_out = attn_out.reshape(-1, self.n_heads * self.head_dim)
+            prob_flat = gate_probs.permute(0, 2, 1).reshape(B * N, T)[mask_flat]
+            attn_out = attn_out * prob_flat.unsqueeze(-1).to(attn_out.dtype)
+            out_flat = out.view(B * N * T, D)
+            out_flat.index_copy_(0, flat_idx, attn_out.to(out_flat.dtype))
+        out = out + res
+        out = out.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
+        return self.o_proj(out)
+
+    def forward(self, x: torch.Tensor, neuron_pad_mask: torch.Tensor):
+        """Run temporal attention with gating.
+
+        If gating selects all valid tokens, falls back to the dense attention
+        path for efficiency.
+        """
+        xn = self.norm(x)
+        gate_mask, gate_probs = self._compute_gate_mask(x, neuron_pad_mask)
+        if gate_mask is None:
+            return self._full_attention(xn, neuron_pad_mask)
+        return self._gated_attention(xn, neuron_pad_mask, gate_mask, gate_probs)

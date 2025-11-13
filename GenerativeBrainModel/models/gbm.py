@@ -1,21 +1,29 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import numpy as np
 from GenerativeBrainModel.models.rms import RMSNorm
-from GenerativeBrainModel.models.mlp import MLP
 from GenerativeBrainModel.models.conv import CausalResidualNeuralConv1d
 from GenerativeBrainModel.models.spatiotemporal import SpatioTemporalNeuralAttention
+from GenerativeBrainModel.models.config import GBMConfig
 from GenerativeBrainModel.utils.debug import assert_no_nan, debug_enabled
 
 # cimport pdb
-import os
 
 
 LOGRATE_EPS = 1e-6
 
 
 class GBM(nn.Module):
+    """Generative Brain Model with spatial+temporal attention and gated temporal routing.
+
+    Stages:
+    - Input embedding: log-rate expansion, stimulus encoding, neuron ID embedding,
+      position encoding, causal residual convs.
+    - Attention stack: repeated spatial (across neurons) then temporal (per neuron)
+      attention; temporal stage can use learned top-k gating.
+    - Heads: per-neuron scalar parameters and low-rank covariance factors.
+    """
+
     def __init__(
         self,
         d_model,
@@ -26,19 +34,37 @@ class GBM(nn.Module):
         neuron_pad_id: int = 0,
         global_neuron_ids: torch.Tensor | None = None,
         cov_rank: int = 32,
+        config: GBMConfig | None = None,
     ):
         super(GBM, self).__init__()
 
         assert d_model % 2 == 0, "d_model must be even for rotary embeddings"
 
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.d_stimuli = d_stimuli
+        # Consolidated configuration
+        if config is None:
+            self.config = GBMConfig(
+                d_model=int(d_model),
+                n_heads=int(n_heads),
+                n_layers=int(n_layers),
+                d_stimuli=int(d_stimuli),
+                cov_rank=int(cov_rank),
+            )
+        else:
+            self.config = config
+
+        self.d_model = self.config.d_model
+        self.n_heads = self.config.n_heads
+        self.n_layers = self.config.n_layers
+        self.d_stimuli = self.config.d_stimuli
         self.neuron_pad_id = int(neuron_pad_id)
 
         self.layers = nn.ModuleList(
-            [SpatioTemporalNeuralAttention(d_model, n_heads) for _ in range(n_layers)]
+            [
+                SpatioTemporalNeuralAttention(
+                    self.d_model, self.n_heads, config=self.config
+                )
+                for _ in range(self.n_layers)
+            ]
         )
 
         self.conv = nn.Sequential(
@@ -63,7 +89,9 @@ class GBM(nn.Module):
         )
 
         # Low-rank correlation/covariance factors head (for dependence in loss)
-        self.cov_factor_head = nn.Linear(d_model, int(cov_rank), bias=False)
+        self.cov_factor_head = nn.Linear(
+            self.d_model, int(self.config.cov_rank), bias=False
+        )
         # Initialize near-zero so early MVN term is small but learnable
         nn.init.normal_(self.cov_factor_head.weight, mean=0.0, std=1e-3)
 
@@ -74,17 +102,31 @@ class GBM(nn.Module):
         )
 
         # If a global mapping of unique neuron IDs is provided, build a compact embedding table
-        if global_neuron_ids.dtype != torch.long:
-            global_neuron_ids = global_neuron_ids.to(torch.long)
-        # Sorted unique IDs for deterministic behavior
-        uniq_ids, _ = torch.sort(global_neuron_ids.unique())
-        # Build an ID->index map via a hash table (Python dict) for CPU lookups; moved to device on forward
-        self.register_buffer("global_neuron_ids_sorted", uniq_ids, persistent=True)
-        self.register_buffer(
-            "has_global_id_map", torch.tensor([1], dtype=torch.uint8), persistent=False
-        )
+        if global_neuron_ids is not None:
+            if global_neuron_ids.dtype != torch.long:
+                global_neuron_ids = global_neuron_ids.to(torch.long)
+            uniq_ids, _ = torch.sort(global_neuron_ids.unique())
+            self.register_buffer("global_neuron_ids_sorted", uniq_ids, persistent=True)
+            self.register_buffer(
+                "has_global_id_map",
+                torch.tensor([1], dtype=torch.uint8),
+                persistent=False,
+            )
+            embed_size = int(uniq_ids.numel()) + 1
+        else:
+            self.register_buffer(
+                "global_neuron_ids_sorted",
+                torch.zeros(0, dtype=torch.long),
+                persistent=True,
+            )
+            self.register_buffer(
+                "has_global_id_map",
+                torch.tensor([0], dtype=torch.uint8),
+                persistent=False,
+            )
+            embed_size = max(1, int(num_neurons_total or 1)) + 1
         self.neuron_embed = nn.Embedding(
-            int(uniq_ids.numel()) + 1, d_model, padding_idx=self.neuron_pad_id
+            embed_size, d_model, padding_idx=self.neuron_pad_id
         )
 
         # Parameter groups for optimizers
