@@ -27,6 +27,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from GenerativeBrainModel.models.gbm import GBM
+from GenerativeBrainModel.models.config import GBMConfig
 from GenerativeBrainModel.dataloaders.neural_dataloader import create_dataloaders
 from GenerativeBrainModel.utils.lognormal import (
     lognormal_nll,
@@ -50,6 +51,16 @@ def create_default_config() -> Dict[str, Any]:
             "d_stimuli": None,  # infer from data
             "num_neurons_total": 4_000_000,  # capacity of neuron embedding table (>= max distinct IDs)
             "cov_rank": 32,  # rank of low-rank correlation factors U
+            # --- temporal attention & gating defaults (can be overridden in user config) ---
+            "temporal_dropout_p": 0.0,
+            "temporal_max_bh_per_call": 2**16 - 1,
+            "temporal_max_seq_len": 512,
+            # Exactly one of the two should be set by the user to enable gating:
+            "gate_capacity": None,  # e.g., 64  (int > 0)
+            "gate_fraction": None,  # e.g., 0.25 (0 < frac ≤ 1)
+            "gate_temperature": 0.1,
+            "state_proj_rank": 2,
+            "stochastic_topk": True,
         },
         "training": {
             "batch_size": 2,
@@ -414,14 +425,33 @@ def main():
         d_stimuli = cfg["model"].get("d_stimuli") or 1
         max_n = 100_000
 
+    m = cfg["model"]
+    # Build GBMConfig with optional gating fields if present
+    gbm_cfg = GBMConfig(
+        d_model=int(m["d_model"]),
+        n_heads=int(m["n_heads"]),
+        n_layers=int(m["n_layers"]),
+        d_stimuli=int(d_stimuli),
+        temporal_dropout_p=float(m.get("temporal_dropout_p", 0.0)),
+        temporal_max_bh_per_call=int(m.get("temporal_max_bh_per_call", 2**16 - 1)),
+        temporal_max_seq_len=int(m.get("temporal_max_seq_len", 512)),
+        gate_capacity=(int(m["gate_capacity"]) if "gate_capacity" in m else None),
+        gate_fraction=(float(m["gate_fraction"]) if "gate_fraction" in m else None),
+        gate_temperature=float(m.get("gate_temperature", 0.1)),
+        state_proj_rank=int(m.get("state_proj_rank", 2)),
+        stochastic_topk=bool(m.get("stochastic_topk", True)),
+        cov_rank=int(m.get("cov_rank", 32)),
+    )
+
     model = GBM(
-        d_model=cfg["model"]["d_model"],
-        d_stimuli=d_stimuli,
-        n_heads=cfg["model"]["n_heads"],
-        n_layers=cfg["model"]["n_layers"],
-        num_neurons_total=int(cfg["model"]["num_neurons_total"]),
+        d_model=gbm_cfg.d_model,
+        d_stimuli=gbm_cfg.d_stimuli,
+        n_heads=gbm_cfg.n_heads,
+        n_layers=gbm_cfg.n_layers,
+        num_neurons_total=int(m["num_neurons_total"]),
         global_neuron_ids=unique_neuron_ids,
-        cov_rank=int(cfg["model"].get("cov_rank", 32)),
+        cov_rank=int(m.get("cov_rank", 32)),
+        config=gbm_cfg,
     ).to(device)
 
     # Run bf16 on CUDA
