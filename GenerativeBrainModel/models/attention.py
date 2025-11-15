@@ -1346,80 +1346,84 @@ class NeuronCausalAttention(nn.Module):
         gate_mask: torch.Tensor,
         gate_probs: torch.Tensor,
     ):
-        """Temporal attention only on selected (top-k) timesteps per neuron sequence.
-
-        Packs selected tokens (per-row) into a flat varlen layout, applies
-        causal attention (Flash varlen when available, SDPA fallback otherwise),
-        scales outputs by gate probabilities, and scatters them back to their
-        original positions.
-        """
+        """Temporal attention only on selected timesteps using ragged packing."""
         B, T, N, D = xn.shape
-        xt = xn.permute(0, 2, 1, 3).contiguous().view(B * N, T, D)
-        res = xt
-        out = torch.zeros_like(xt)
         gate_mask = gate_mask.to(torch.bool)
-        mask_flat = gate_mask.permute(0, 2, 1).reshape(B * N, T)
-        if mask_flat.any():
-            row_idx, time_idx = torch.nonzero(mask_flat, as_tuple=True)
-            flat_idx = row_idx * T + time_idx
-            tokens = xt.view(B * N * T, D).index_select(0, flat_idx)
-            q = self.q_proj(tokens).view(-1, self.n_heads, self.head_dim)
-            k = self.k_proj(tokens).view(-1, self.n_heads, self.head_dim)
-            v = self.v_proj(tokens).view(-1, self.n_heads, self.head_dim)
-            q = self._apply_timewise_rope_indexed(q, time_idx)
-            k = self._apply_timewise_rope_indexed(k, time_idx)
-            if q.device.type == "cuda":
-                target_dtype = (
-                    torch.bfloat16
-                    if q.dtype not in (torch.float16, torch.bfloat16)
-                    else q.dtype
+        if not bool(gate_mask.any().item()):
+            return self._full_attention(xn, neuron_pad_mask)
+
+        xt = xn.permute(0, 2, 1, 3)
+        xt_flat = xt.reshape(B * N, T, D)
+        mask_rows = gate_mask.permute(0, 2, 1).reshape(B * N, T)
+        probs_rows = gate_probs.permute(0, 2, 1).reshape(B * N, T)
+
+        if not bool(mask_rows.any().item()):
+            return self._full_attention(xn, neuron_pad_mask)
+
+        row_idx, time_idx = torch.nonzero(mask_rows, as_tuple=True)
+        seq_lengths = torch.bincount(row_idx, minlength=mask_rows.shape[0])
+        seq_lengths = seq_lengths[seq_lengths > 0]
+        if seq_lengths.numel() == 0:
+            return self._full_attention(xn, neuron_pad_mask)
+        seq_lengths = seq_lengths.to(torch.int32)
+
+        tokens = xt_flat[row_idx, time_idx]
+        q = self.q_proj(tokens).view(-1, self.n_heads, self.head_dim)
+        k = self.k_proj(tokens).view(-1, self.n_heads, self.head_dim)
+        v = self.v_proj(tokens).view(-1, self.n_heads, self.head_dim)
+        q = self._apply_timewise_rope_indexed(q, time_idx)
+        k = self._apply_timewise_rope_indexed(k, time_idx)
+
+        if q.device.type == "cuda":
+            target_dtype = (
+                torch.bfloat16
+                if q.dtype not in (torch.float16, torch.bfloat16)
+                else q.dtype
+            )
+        else:
+            target_dtype = torch.float32
+        if q.dtype != target_dtype:
+            q = q.to(target_dtype)
+            k = k.to(target_dtype)
+            v = v.to(target_dtype)
+
+        dropout = self.dropout_p if self.training else 0.0
+        attn_out = None
+        if q.device.type == "cuda" and q.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            qkv = torch.stack([q, k, v], dim=1).contiguous()
+            cu_seqlens = torch.zeros(
+                seq_lengths.numel() + 1, dtype=torch.int32, device=q.device
+            )
+            cu_seqlens[1:] = torch.cumsum(seq_lengths, dim=0)
+            max_len = int(seq_lengths.max().item())
+            try:
+                attn_out = flash_varlen_qkv(
+                    qkv,
+                    cu_seqlens,
+                    max_len,
+                    dropout,
+                    softmax_scale=None,
+                    causal=True,
                 )
-            else:
-                target_dtype = torch.float32
-            if q.dtype != target_dtype:
-                q = q.to(target_dtype)
-                k = k.to(target_dtype)
-                v = v.to(target_dtype)
-            seq_counts = torch.bincount(row_idx, minlength=B * N)
-            active_rows = (seq_counts > 0).nonzero(as_tuple=False).squeeze(-1)
-            seq_lengths = seq_counts[active_rows].to(torch.int32)
-            dropout = self.dropout_p if self.training else 0.0
-            attn_out = None
-            if (
-                q.device.type == "cuda"
-                and q.dtype in (torch.bfloat16, torch.float16)
-                and seq_lengths.numel() > 0
-            ):
-                qkv = torch.stack([q, k, v], dim=1).contiguous()
-                cu_seqlens = torch.zeros(
-                    seq_lengths.numel() + 1, dtype=torch.int32, device=q.device
-                )
-                cu_seqlens[1:] = torch.cumsum(seq_lengths, dim=0)
-                max_len = (
-                    int(seq_lengths.max().item()) if seq_lengths.numel() > 0 else 0
-                )
-                try:
-                    attn_out = flash_varlen_qkv(
-                        qkv,
-                        cu_seqlens,
-                        max_len,
-                        dropout,
-                        softmax_scale=None,
-                        causal=True,
-                    )
-                except Exception:
-                    attn_out = None
-            if attn_out is None:
-                attn_out = self._varlen_attention_fallback(
-                    q, k, v, seq_lengths, dropout
-                )
-            attn_out = attn_out.reshape(-1, self.n_heads * self.head_dim)
-            prob_flat = gate_probs.permute(0, 2, 1).reshape(B * N, T)[mask_flat]
-            attn_out = attn_out * prob_flat.unsqueeze(-1).to(attn_out.dtype)
-            out_flat = out.view(B * N * T, D)
-            out_flat.index_copy_(0, flat_idx, attn_out.to(out_flat.dtype))
-        out = out + res
-        out = out.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
+            except Exception:
+                attn_out = None
+        if attn_out is None:
+            attn_out = self._varlen_attention_fallback(
+                q, k, v, seq_lengths, dropout
+            )
+
+        attn_out = attn_out.reshape(-1, self.n_heads * self.head_dim)
+        prob_sel = probs_rows[row_idx, time_idx].to(attn_out.dtype)
+        delta = (attn_out * prob_sel.unsqueeze(-1)).to(xt_flat.dtype)
+
+        xt_lin = xt_flat.reshape(B * N * T, D)
+        out_lin = xt_lin.clone()
+        flat_idx = row_idx * T + time_idx
+        out_lin.index_add_(0, flat_idx, delta)
+        out = out_lin.view(B, N, T, D).permute(0, 2, 1, 3).contiguous()
         return self.o_proj(out)
 
     def forward(self, x: torch.Tensor, neuron_pad_mask: torch.Tensor):

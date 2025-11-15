@@ -1,7 +1,7 @@
 experiment:
   name: gbm2_neural_training
 data:
-  data_dir: processed_spike_rates_2018_floor0,003
+  data_dir: processed_spike_rates_2018
   use_cache: true
 model:
   d_model: 48
@@ -10,6 +10,11 @@ model:
   d_stimuli: null
   num_neurons_total: 1500000
   cov_rank: 32
+  gate_fraction: 0.1
+  gate_temperature: 0.1
+  state_proj_rank: 2
+  stochastic_topk: true
+  gate_token_cap: null
 training:
   batch_size: 1
   num_epochs: 1
@@ -22,7 +27,7 @@ training:
   pin_memory: true
   test_split_fraction: 0.1
   use_gpu: true
-  compile_model: true
+  compile_model: false
   validation_frequency: 32
   val_sample_batches: 16
   gradient_clip_norm: 1.0
@@ -34,3 +39,11 @@ training:
   copula_warmup_floor: 0.001
   copula_jitter: 0.001
   copula_detach_burnin_steps: 0
+  memory_profile_topk: 15
+  memory_profile_every: 64
+  memory_profile_backward: false
+  memory_profile_leaf_only: true
+  memory_profile_sort_key: delta
+  log_temporal_gate_stats: true
+  log_temporal_memory: true
+  temporal_log_every: 64
