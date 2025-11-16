@@ -645,19 +645,22 @@ def main():
             las = batch.get("log_activity_std", torch.empty(0)).to(device)
             sr = float(cfg["training"].get("sampling_rate_hz", 3.0))
 
-            # Prepare autoregressive pairs
-            x_in = spikes[:, :-1, :]  # (B, L-1, N)
-            x_tg = spikes[:, 1:, :].float()
-            if debug_enabled():
-                assert_no_nan(x_in, "batch.x_in_raw")
-                assert_no_nan(x_tg, "batch.x_tg_raw")
-            # Guard against NaNs/Infs in raw data
-            x_in = torch.nan_to_num(x_in, nan=0.0, posinf=0.0, neginf=0.0)
-            x_tg = torch.nan_to_num(x_tg, nan=0.0, posinf=0.0, neginf=0.0)
+            # Prepare autoregressive pairs and reuse precomputed transforms
+            spikes = torch.nan_to_num(spikes, nan=0.0, posinf=0.0, neginf=0.0)
+            rates_context = spikes[:, :-1, :]  # (B, L-1, N)
+            rates_target = spikes[:, 1:, :].to(torch.float32)
             stim_in = stim[:, :-1, :]
+            eps = 1e-7
+            log_spikes = torch.log(spikes.clamp_min(eps))
+            log_context = log_spikes[:, :-1, :]
+            log_target = log_spikes[:, 1:, :]
+            if debug_enabled():
+                assert_no_nan(rates_context, "batch.rates_context")
+                assert_no_nan(rates_target, "batch.rates_target")
+                assert_no_nan(log_context, "pre.zlog.log_context")
 
             # Spike probabilities from rates for attention routing
-            spike_probs = 1.0 - torch.exp(-x_in.to(torch.float32) / sr)
+            spike_probs = 1.0 - torch.exp(-rates_context.to(torch.float32) / sr)
             # Robustify probs to [0,1] and finite before model use
             spike_probs = torch.nan_to_num(
                 spike_probs, nan=0.0, posinf=1.0, neginf=0.0
@@ -666,20 +669,23 @@ def main():
                 assert_no_nan(spike_probs, "routing.spike_probs")
 
             # z-normalize log input when stats available: z = (log(x+eps) - mean)/std
-            eps = 1e-7
-            x_log = torch.log(x_in.clamp_min(eps))
-            if debug_enabled():
-                assert_no_nan(x_log, "pre.zlog.x_log")
-            if lam.numel() > 0 and las.numel() > 0:
-                lam_e = lam[:, None, :].to(dtype=x_log.dtype)
-                las_e = las[:, None, :].to(dtype=x_log.dtype).clamp_min(1e-6)
-                x_in_z = (x_log - lam_e) / las_e
+            has_stats = lam.numel() > 0 and las.numel() > 0
+            lam_broadcast = las_broadcast = None
+            if has_stats:
+                lam_broadcast = lam[:, None, :]
+                las_broadcast = las[:, None, :].clamp_min(1e-6)
+                lam_ctx = lam_broadcast.to(dtype=log_context.dtype)
+                las_ctx = las_broadcast.to(dtype=log_context.dtype)
+                x_in_z = (log_context - lam_ctx) / las_ctx
+                z_tg = (log_target - lam_ctx) / las_ctx
             else:
-                x_in_z = x_log
+                x_in_z = log_context
+                z_tg = log_target
             # Ensure inputs are finite before entering model
             x_in_z = torch.nan_to_num(x_in_z, nan=0.0, posinf=0.0, neginf=0.0)
             if debug_enabled():
                 assert_no_nan(x_in_z, "pre.model.x_in_z")
+                assert_no_nan(z_tg, "pre.loss.z_tg")
 
             if device.type == "cuda" and not use_cuda_autocast:
                 x_in_z = x_in_z.to(torch.bfloat16)
@@ -744,19 +750,14 @@ def main():
                     raw_log_sigma, nan=0.0, posinf=0.0, neginf=0.0
                 )
 
-            # Z-normalized target for loss in Normal(z) domain
-            eps_n = 1e-7
-            y_tg = torch.log(x_tg.clamp_min(eps_n))  # (B, L-1, N)
-            if lam.numel() > 0 and las.numel() > 0:
-                lam_e_loss = lam[:, None, :].to(dtype=y_tg.dtype)
-                las_e_loss = las[:, None, :].to(dtype=y_tg.dtype).clamp_min(1e-6)
-                z_tg = (y_tg - lam_e_loss) / las_e_loss
-            else:
-                z_tg = y_tg
+            # Z-normalized target for loss in Normal(z) domain (reuse log_target/z_tg)
+            y_tg = log_target  # (B, L-1, N)
 
             # Normal NLL on z_tg with optional left-censoring below r_min
             sigma_y = F.softplus(raw_log_sigma.to(torch.float32)) + 1e-6
-            if lam.numel() > 0 and las.numel() > 0:
+            if has_stats:
+                lam_e_loss = lam_broadcast.to(dtype=mu.dtype)
+                las_e_loss = las_broadcast.to(dtype=mu.dtype)
                 mu_z = (
                     mu.to(torch.float32) - lam_e_loss.to(torch.float32)
                 ) / las_e_loss.to(torch.float32)
@@ -775,7 +776,7 @@ def main():
                     ) / las_e_loss.to(mu_z.dtype)
                 else:
                     z_min = torch.tensor(y_min, dtype=mu_z.dtype, device=mu_z.device)
-                is_cens = x_tg <= r_min
+                is_cens = rates_target <= r_min
                 z_err = (z_tg.to(torch.float32) - mu_z) / sigma_z
                 nll_pdf = (
                     0.5 * z_err.pow(2)
@@ -797,7 +798,7 @@ def main():
                     + 0.5 * math.log(2.0 * math.pi)
                 )
             # Build mask for loss to match target shape
-            mask_exp = mask[:, None, :].expand_as(x_tg).float()
+            mask_exp = mask[:, None, :].expand_as(rates_target).float()
             if mask_exp is not None:
                 total_m = mask_exp.sum().clamp_min(1.0)
                 loss = (nll * mask_exp).sum() / total_m
