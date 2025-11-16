@@ -805,6 +805,21 @@ def _indices_from_mask(mask_1d: torch.Tensor):
 #         return out
 
 
+def gumbel_topk(logits: torch.Tensor, k: int, temperature: float = 1.0):
+    """
+    Gumbel top-k sampling.
+    Returns: (topk_values, topk_indices)
+    """
+    if temperature == 0.0:
+        topk_values, topk_indices = torch.topk(logits, k, dim=-1)
+        return topk_values, topk_indices
+    gumbel_noise = (
+        -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8) / temperature
+    )
+    topk_values, topk_indices = torch.topk(logits + gumbel_noise, k, dim=-1)
+    return topk_values, topk_indices
+
+
 class SparseSpikeFullAttention(nn.Module):
     def __init__(
         self,
@@ -819,6 +834,8 @@ class SparseSpikeFullAttention(nn.Module):
         pos_tail_scale: float = 0.1,  # γ: strength of positional kernel in logits
         n_rot_pairs: int
         | None = None,  # m: rotary pairs per head (first 2m dims rotated)
+        topk_fraction: float = 0.1,  # fraction of valid neurons to select via Gumbel top-k
+        gumbel_temperature: float = 1.0,  # temperature for Gumbel noise
     ):
         super().__init__()
         assert d_model % n_heads == 0
@@ -826,6 +843,9 @@ class SparseSpikeFullAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.dropout = float(dropout)
+        # Top-k config
+        self.topk_fraction = float(topk_fraction)
+        self.gumbel_temperature = float(gumbel_temperature)
 
         self.norm = RMSNorm(d_model)
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
@@ -933,10 +953,10 @@ class SparseSpikeFullAttention(nn.Module):
         xn_bt = xn.view(B, T, N, D).reshape(S, N, D)
 
         # 4) Build masks and compact indices BEFORE projections
-        #    Queries: NON-spiking, valid neurons only. KV: spiking, valid neurons only.
+        #    Queries: all valid neurons. KV: provided boolean spike mask (senders).
         valid_bt = (neuron_pad_mask != 0).unsqueeze(1).expand(B, T, N).reshape(S, N)
         spiking_bt = (spike_mask != 0).reshape(S, N) & valid_bt
-        keep_bt = valid_bt  # & (~spiking_bt)   # remove spiking neurons from Q
+        keep_bt = valid_bt
         send_bt = spiking_bt
         idx_q, idx_kv, cu_q, cu_k, lens_q, lens_k, max_q, max_k = (
             _build_varlen_metadata_from_masks(keep_bt, send_bt)

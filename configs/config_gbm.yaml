@@ -10,6 +10,7 @@ model:
   d_stimuli: null
   num_neurons_total: 1500000
   cov_rank: 32
+  
 training:
   batch_size: 1
   num_epochs: 1

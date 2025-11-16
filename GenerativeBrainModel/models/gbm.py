@@ -6,6 +6,7 @@ from GenerativeBrainModel.models.rms import RMSNorm
 from GenerativeBrainModel.models.mlp import MLP
 from GenerativeBrainModel.models.conv import CausalResidualNeuralConv1d
 from GenerativeBrainModel.models.spatiotemporal import SpatioTemporalNeuralAttention
+from GenerativeBrainModel.models.attention import gumbel_topk
 from GenerativeBrainModel.utils.debug import assert_no_nan, debug_enabled
 
 # cimport pdb
@@ -27,6 +28,8 @@ class GBM(nn.Module):
         global_neuron_ids: torch.Tensor | None = None,
         cov_rank: int = 32,
         use_ffn_checkpoint: bool = False,
+        topk_fraction: float = 0.1,
+        gumbel_temperature: float = 1.0,
     ):
         super(GBM, self).__init__()
 
@@ -37,6 +40,8 @@ class GBM(nn.Module):
         self.n_layers = n_layers
         self.d_stimuli = d_stimuli
         self.neuron_pad_id = int(neuron_pad_id)
+        self.topk_fraction = float(topk_fraction)
+        self.gumbel_temperature = float(gumbel_temperature)
 
         self.layers = nn.ModuleList(
             [
@@ -248,32 +253,70 @@ class GBM(nn.Module):
             dim=1,
         )  # (B, n_neurons + 1, 3)
 
-        # Add a one to the neuron_spike_probs to account for the stimulus token
-        neuron_spike_probs = torch.cat(
+        # Build spike sender mask:
+        # - If a boolean mask is provided, use it directly.
+        # - Otherwise, perform per-timepoint Gumbel top-k on provided scores (probabilities).
+        if neuron_spike_probs.dtype == torch.bool:
+            neuron_spike_mask = neuron_spike_probs
+        else:
+            if neuron_spike_probs.dtype != torch.float32:
+                scores_fp32 = neuron_spike_probs.to(torch.float32)
+            else:
+                scores_fp32 = neuron_spike_probs
+            scores_fp32 = torch.nan_to_num(
+                scores_fp32, nan=0.0, posinf=1.0, neginf=0.0
+            ).clamp_(0.0, 1.0)  # (B,T,N)
+            # Mask invalid neurons before selection (use ONLY real neuron tokens, exclude the extra stimulus token)
+            valid_btn = (
+                neuron_pad_mask[:, :N].unsqueeze(1).expand(B, T, N) != 0
+            )  # (B,T,N)
+            scores_masked = scores_fp32.masked_fill(~valid_btn, float("-inf"))
+            # Flatten to rows (B*T, N)
+            S = B * T
+            scores_SN = scores_masked.reshape(S, N)
+            valid_SN = valid_btn.reshape(S, N)
+            valid_counts = valid_SN.sum(dim=1)
+            frac = max(0.0, min(1.0, self.topk_fraction))
+            k_per_row = (valid_counts.to(torch.float32) * frac).round().to(torch.int64)
+            k_per_row = torch.where(
+                valid_counts > 0, k_per_row.clamp_min(1), torch.zeros_like(k_per_row)
+            )
+            K_max = int(k_per_row.max().item()) if k_per_row.numel() > 0 else 0
+            if K_max > 0:
+                _, topk_idx = gumbel_topk(
+                    scores_SN, K_max, temperature=float(self.gumbel_temperature)
+                )
+                send_SN = torch.zeros_like(valid_SN, dtype=torch.bool)  # (S,N)
+                row_ids = (
+                    torch.arange(S, device=scores_SN.device)
+                    .unsqueeze(1)
+                    .expand(S, K_max)
+                )
+                pos = (
+                    torch.arange(K_max, device=scores_SN.device)
+                    .unsqueeze(0)
+                    .expand(S, K_max)
+                )
+                keep_pos = pos < k_per_row.unsqueeze(1)
+                if keep_pos.any():
+                    rows_sel = row_ids[keep_pos]
+                    cols_sel = topk_idx[keep_pos]
+                    send_SN[rows_sel, cols_sel] = True
+            else:
+                send_SN = torch.zeros_like(valid_SN, dtype=torch.bool)
+            neuron_spike_mask = send_SN.view(B, T, N)
+        # Append True for the stimulus token (n_neurons + 1)
+        neuron_spike_mask = torch.cat(
             [
-                neuron_spike_probs,
-                torch.ones(
-                    B, T, 1, device=neuron_spike_probs.device, dtype=torch.float32
-                ),
+                neuron_spike_mask,
+                torch.ones(B, T, 1, device=neuron_spike_mask.device, dtype=torch.bool),
             ],
             dim=2,
-        )  # (B, T, n_neurons + 1)
-
-        # Sample spike mask robustly: clamp to [0,1] in fp32 to avoid bf16 rounding issues
-        if neuron_spike_probs.dtype != torch.float32:
-            probs_fp32 = neuron_spike_probs.to(torch.float32)
-        else:
-            probs_fp32 = neuron_spike_probs
-        probs_fp32 = torch.nan_to_num(
-            probs_fp32, nan=0.0, posinf=1.0, neginf=0.0
-        ).clamp_(0.0, 1.0)
-        if debug_enabled():
-            assert_no_nan(probs_fp32, "GBM.probs_fp32_before_bernoulli")
-        neuron_spike_probs = torch.bernoulli(probs_fp32).to(torch.bool)
+        )
 
         # Apply the layers
         for i, layer in enumerate(self.layers):
-            x = layer(x, rel_point_positions, neuron_pad_mask, neuron_spike_probs)
+            x = layer(x, rel_point_positions, neuron_pad_mask, neuron_spike_mask)
             if debug_enabled():
                 assert_no_nan(x, f"GBM.layer_{i}_out")
 
@@ -311,77 +354,176 @@ class GBM(nn.Module):
         median = sas_rate_median(mu, log_sigma_raw, eta, log_delta_raw)
         return median.to(mu.dtype)
 
-    def autoregress_sample(
+    @torch.no_grad()
+    def autoregress(
         self,
-        init_x,  # (B, T, N)   rates (Hz)
-        init_stimuli,  # (B, T, dS)
-        point_positions,  # (B, N, 3)
-        neuron_pad_mask,  # (B, N)
-        future_stimuli=None,  # (B, n_steps, dS) or None -> zeros
-        n_steps=10,
-        context_len=12,
-        eps=LOGRATE_EPS,
-        temperature: float = 1.0,
-        generator: torch.Generator | None = None,
-        return_log: bool = False,
-    ):
+        init_context: torch.Tensor,  # (B, Tc, N) rates
+        stim_full: torch.Tensor,  # (B, Tc+Tf, K)
+        point_positions: torch.Tensor,  # (B, N, 3)
+        neuron_pad_mask: torch.Tensor,  # (B, N)
+        neuron_ids: torch.Tensor,  # (B, N)
+        lam: torch.Tensor | None,  # (B, N)
+        las: torch.Tensor | None,  # (B, N)
+        Tf: int,
+        sampling_rate_hz: float = 3.0,
+        max_context_len: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Stochastic rollout using SAS sampling on log-rate:
-        Y = mu + sigma * sinh((U - eta) / delta),  U ~ N(0, temperature^2).
-        Returns: (B, T + n_steps, N) rates (or log-rates if return_log=True).
+        Autoregressive rollout with an expanding context window up to max_context_len:
+        - Keeps top-k sender selections fixed for past timepoints.
+        - Only samples top-k for the newest AR step.
+        Returns:
+          pred rates: (B, Tf, N)
+          spike counts for initial context: (B, Tc)
+          spike counts for predicted future: (B, Tf)
         """
-        assert n_steps > 0 and context_len > 0
-        B, T, N = init_x.shape
-        assert T >= context_len, "context_len must be ≤ T"
-
-        if future_stimuli is None:
-            future_stimuli = torch.zeros(
-                B, n_steps, self.d_stimuli, device=init_x.device, dtype=init_x.dtype
+        device = init_context.device
+        dtype_params = next(self.parameters()).dtype
+        B, Tc, N = init_context.shape
+        assert B >= 1 and Tf > 0 and Tc > 0
+        sr_f = float(sampling_rate_hz)
+        eps = 1e-7
+        # Context buffers
+        context_rates = init_context.clone()  # (B,Tc,N)
+        # Build fixed top-k sender mask for existing context (temperature=0 for stability)
+        prob_ctx = 1.0 - torch.exp(-context_rates.to(torch.float32) / sr_f)
+        prob_ctx = torch.nan_to_num(prob_ctx, nan=0.0, posinf=1.0, neginf=0.0).clamp_(
+            0.0, 1.0
+        )
+        valid_btn = neuron_pad_mask.unsqueeze(1).expand(B, Tc, N) != 0
+        scores_masked = prob_ctx.masked_fill(~valid_btn, float("-inf"))
+        S0 = B * Tc
+        scores_SN = scores_masked.reshape(S0, N)
+        valid_SN = valid_btn.reshape(S0, N)
+        valid_counts = valid_SN.sum(dim=1)
+        frac = max(0.0, min(1.0, self.topk_fraction))
+        k_per_row = (valid_counts.to(torch.float32) * frac).round().to(torch.int64)
+        k_per_row = torch.where(
+            valid_counts > 0, k_per_row.clamp_min(1), torch.zeros_like(k_per_row)
+        )
+        K_max = int(k_per_row.max().item()) if k_per_row.numel() > 0 else 0
+        if K_max > 0:
+            _, topk_idx = gumbel_topk(scores_SN, K_max, temperature=0.0)
+            send_SN = torch.zeros_like(valid_SN, dtype=torch.bool)  # (S0,N)
+            row_ids = (
+                torch.arange(S0, device=scores_SN.device).unsqueeze(1).expand(S0, K_max)
             )
+            pos = (
+                torch.arange(K_max, device=scores_SN.device)
+                .unsqueeze(0)
+                .expand(S0, K_max)
+            )
+            keep_pos = pos < k_per_row.unsqueeze(1)
+            if keep_pos.any():
+                rows_sel = row_ids[keep_pos]
+                cols_sel = topk_idx[keep_pos]
+                send_SN[rows_sel, cols_sel] = True
         else:
-            assert future_stimuli.shape == (B, n_steps, self.d_stimuli)
-
-        params_dtype = next(self.parameters()).dtype
-        current_log_rates = torch.log(init_x.clamp_min(eps) + eps).to(params_dtype)
-        current_stimuli = init_stimuli.to(params_dtype)
-        point_positions = point_positions.to(params_dtype)
-
-        POS_EPS = 1e-8
-
-        def _pos(x):
-            return F.softplus(x) + POS_EPS
-
-        for t in range(n_steps):
-            # context
-            context_log = current_log_rates[:, -context_len:]
-            context_stim = current_stimuli[:, -context_len:, :]
-
-            # one-step-ahead params for log-rate
-            mu, log_sigma_raw, eta, log_delta_raw = self.forward(
-                context_log,
-                context_stim,
+            send_SN = torch.zeros_like(valid_SN, dtype=torch.bool)
+        mask_ctx = send_SN.view(B, Tc, N)  # boolean
+        # Spike counts for initial context
+        ctx_counts = mask_ctx.sum(dim=2).to(torch.float32)  # (B,Tc)
+        preds: list[torch.Tensor] = []
+        pred_counts: list[torch.Tensor] = []
+        for t in range(Tf):
+            # Determine window length
+            win_len = int(context_rates.shape[1])
+            if max_context_len is not None:
+                win_len = min(win_len, int(max_context_len))
+            x_in = context_rates[:, -win_len:, :]  # (B,win_len,N)
+            x_log = torch.log(x_in.clamp_min(eps))
+            if (
+                lam is not None
+                and las is not None
+                and lam.numel() > 0
+                and las.numel() > 0
+            ):
+                lam_e = lam[:, None, :].to(dtype=x_log.dtype)
+                las_e = las[:, None, :].to(dtype=x_log.dtype).clamp_min(1e-6)
+                x_in_z = (x_log - lam_e) / las_e
+            else:
+                x_in_z = x_log
+            stim_step = stim_full[
+                :, (context_rates.shape[1] - win_len) : (context_rates.shape[1]), :
+            ]
+            # Build boolean sender mask window (B, win_len, N) from fixed mask_ctx
+            mask_window = mask_ctx[:, -win_len:, :]
+            # Dtypes for compute on CUDA
+            if self.training is False and x_in_z.device.type == "cuda":
+                x_in_z = x_in_z.to(dtype_params)
+                stim_step = stim_step.to(dtype_params)
+            # Forward using precomputed boolean sender mask
+            mu, raw_log_sigma, _, _ = self.forward(
+                x_in_z,
+                stim_step,
                 point_positions,
                 neuron_pad_mask,
+                neuron_ids,
+                mask_window,  # boolean mask
                 get_logits=True,
                 input_log_rates=True,
             )
-            mu = mu[:, -1:, :]  # (B,1,N)
-            sig = _pos(log_sigma_raw[:, -1:, :])
-            eta = eta[:, -1:, :]
-            delt = _pos(log_delta_raw[:, -1:, :])
+            mu_last = mu[:, -1:, :]
+            sig_last = raw_log_sigma[:, -1:, :]
+            # Sample next-step rate from LogNormal
+            from GenerativeBrainModel.utils.lognormal import sample_lognormal
 
-            # sample next log-rate
-            U = torch.randn_like(mu, generator=generator) * float(temperature)
-            next_log_rate = mu + sig * torch.sinh((U - eta) / delt)
-
-            # append
-            current_log_rates = torch.cat([current_log_rates, next_log_rate], dim=1)
-            current_stimuli = torch.cat(
-                [current_stimuli, future_stimuli[:, t : t + 1, :].to(params_dtype)],
-                dim=1,
+            samp = sample_lognormal(mu_last, sig_last)  # (B,1,N)
+            preds.append(samp[:, 0, :].to(torch.float32))
+            # Append prediction
+            context_rates = torch.cat(
+                [context_rates, samp.to(context_rates.dtype)], dim=1
             )
-
-        if return_log:
-            return current_log_rates
-        # back to rate domain with the SAME eps used going in
-        return torch.exp(current_log_rates) - eps
+            # Compute top-k sender mask for the NEW step only (B,1,N)
+            prob_next = 1.0 - torch.exp(-samp.to(torch.float32) / sr_f)
+            prob_next = torch.nan_to_num(
+                prob_next, nan=0.0, posinf=1.0, neginf=0.0
+            ).clamp_(0.0, 1.0)
+            valid_next = (neuron_pad_mask != 0).unsqueeze(1)  # (B,1,N)
+            scores_next = prob_next.masked_fill(~valid_next, float("-inf"))  # (B,1,N)
+            S1 = B * 1
+            scores_next_SN = scores_next.view(S1, N)
+            valid_next_SN = valid_next.view(S1, N)
+            valid_counts_next = valid_next_SN.sum(dim=1)
+            k_row_next = (
+                (valid_counts_next.to(torch.float32) * frac).round().to(torch.int64)
+            )
+            k_row_next = torch.where(
+                valid_counts_next > 0,
+                k_row_next.clamp_min(1),
+                torch.zeros_like(k_row_next),
+            )
+            K1 = int(k_row_next.max().item()) if k_row_next.numel() > 0 else 0
+            if K1 > 0:
+                _, topk_idx_n = gumbel_topk(
+                    scores_next_SN, K1, temperature=float(self.gumbel_temperature)
+                )
+                send_next = torch.zeros_like(valid_next_SN, dtype=torch.bool)
+                row_ids_n = (
+                    torch.arange(S1, device=scores_next_SN.device)
+                    .unsqueeze(1)
+                    .expand(S1, K1)
+                )
+                pos_n = (
+                    torch.arange(K1, device=scores_next_SN.device)
+                    .unsqueeze(0)
+                    .expand(S1, K1)
+                )
+                keep_pos_n = pos_n < k_row_next.unsqueeze(1)
+                if keep_pos_n.any():
+                    rows_sel_n = row_ids_n[keep_pos_n]
+                    cols_sel_n = topk_idx_n[keep_pos_n]
+                    send_next[rows_sel_n, cols_sel_n] = True
+            else:
+                send_next = torch.zeros_like(valid_next_SN, dtype=torch.bool)
+            next_mask = send_next.view(B, 1, N)
+            mask_ctx = torch.cat([mask_ctx, next_mask], dim=1)  # append boolean mask
+            # Record spike count for newest predicted step
+            pred_counts.append(next_mask.sum(dim=2)[:, 0].to(torch.float32))  # (B,)
+        pred_rates = torch.stack(preds, dim=1)  # (B,Tf,N)
+        pred_counts_T = (
+            torch.stack(pred_counts, dim=1)
+            if len(pred_counts) > 0
+            else torch.zeros((B, 0), device=device)
+        )
+        return pred_rates, ctx_counts, pred_counts_T
