@@ -1,7 +1,7 @@
 experiment:
   name: gbm2_neural_training
 data:
-  data_dir: processed_spike_rates_2018_floor0,003
+  data_dir: processed_spike_rates_2018
   use_cache: true
 model:
   d_model: 48
@@ -16,10 +16,12 @@ training:
   num_epochs: 1
   learning_rate: 0.0005
   muon_lr: 0.002
+  use_ffn_checkpoint: true
   weight_decay: 0.0001
   sequence_length: 48
   stride: 1
-  num_workers: 0
+  m_workers: 8
+  num_workers: 8
   pin_memory: true
   test_split_fraction: 0.1
   use_gpu: true
@@ -27,6 +29,7 @@ training:
   validation_frequency: 32
   val_sample_batches: 16
   gradient_clip_norm: 1.0
+  use_cuda_autocast: true
   seed: 42
   plots_dir: experiments/gbm2/plots
   sampling_rate_hz: 3.0
@@ -35,3 +38,7 @@ training:
   copula_warmup_floor: 0.001
   copula_jitter: 0.001
   copula_detach_burnin_steps: 0
+  memory_profile:
+    enabled: true
+    log_interval: 25
+    verbose: true

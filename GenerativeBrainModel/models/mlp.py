@@ -43,8 +43,8 @@ class MLP(nn.Module):
 class FFN(nn.Module):
     def __init__(self, d_model, d_ff):
         super(FFN, self).__init__()
-        self.linear_1 = nn.Linear(d_model, d_ff, bias=False)
-        self.linear_2 = nn.Linear(d_model, d_ff, bias=False)
+        self.d_ff = int(d_ff)
+        self.linear_fused = nn.Linear(d_model, 2 * d_ff, bias=False)
         self.act = nn.SiLU()
         self.linear_3 = nn.Linear(d_ff, d_model, bias=False)
         self.norm = RMSNorm(d_model)
@@ -52,8 +52,9 @@ class FFN(nn.Module):
     def forward(self, x):
         res = x
         x = self.norm(x)
-        x1 = self.act(self.linear_1(x))
-        x2 = self.linear_2(x)
-        x = self.linear_3(x2 * x1)
+        fused = self.linear_fused(x)
+        x1 = fused[..., : self.d_ff]
+        x2 = fused[..., self.d_ff :]
+        x = self.linear_3(self.act(x1) * x2)
         x = x + res
         return x
