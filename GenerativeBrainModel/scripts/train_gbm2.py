@@ -12,8 +12,10 @@ Clean training script for GBM:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from datetime import datetime
+from contextlib import nullcontext
 from typing import Dict, Any, Optional, Tuple
 import math
 
@@ -34,7 +36,12 @@ from GenerativeBrainModel.utils.lognormal import (
     sample_lognormal,
 )
 from GenerativeBrainModel.utils.debug import assert_no_nan, debug_enabled
+from GenerativeBrainModel.utils.memory_profiler import (
+    MemoryProfiler,
+    estimate_batch_static_memory,
+)
 
+USE_CUDA_AUTOCAST = False
 
 def create_default_config() -> Dict[str, Any]:
     return {
@@ -56,11 +63,13 @@ def create_default_config() -> Dict[str, Any]:
             "num_epochs": 20,
             "learning_rate": 5e-4,  # AdamW for non-body
             "muon_lr": 2e-2,  # Muon for attention body
+            "use_ffn_checkpoint": False,
             "weight_decay": 1e-4,
             "sequence_length": 12,
             "stride": 3,
-            "num_workers": 0,
-            "pin_memory": False,
+            "m_workers": 8,  # alias for DataLoader num_workers
+            "num_workers": 8,
+            "pin_memory": True,
             "test_split_fraction": 0.1,
             "use_gpu": True,
             "compile_model": False,
@@ -70,6 +79,7 @@ def create_default_config() -> Dict[str, Any]:
             "seed": 42,
             "plots_dir": "experiments/gbm2/plots",
             "sampling_rate_hz": 3.0,
+            "use_cuda_autocast": True,
             # Left-censored LogNormal threshold for loss (rates below are treated as "≤ r_min")
             # Set to 0.0 to disable; e.g., 1e-2 to ignore exact values below 0.01
             "loss_r_min": 0.0,
@@ -326,7 +336,7 @@ def autoregressive_rollout(
             x_in_z = x_log
         # Align stimuli to the sliding window
         stim_step = stim_full[:, (context.shape[1] - Lc) : (context.shape[1]), :]
-        if device.type == "cuda":
+        if (device.type == "cuda") and (not USE_CUDA_AUTOCAST):
             x_in_z = x_in_z.to(torch.bfloat16)
             stim_step = stim_step.to(torch.bfloat16)
         # Use pre-sampled spike mask window (0/1 floats) to make routing deterministic
@@ -372,10 +382,56 @@ def main():
             user = yaml.safe_load(f)
         cfg = deep_update(cfg, user)
 
+    # Ensure new loader configuration knobs are respected
+    training_cfg = cfg.setdefault("training", {})
+    if "m_workers" in training_cfg:
+        training_cfg["num_workers"] = int(training_cfg["m_workers"])
+    else:
+        training_cfg["m_workers"] = int(training_cfg.get("num_workers", 0))
+    training_cfg["pin_memory"] = bool(training_cfg.get("pin_memory", True))
+
     device = torch.device(
         "cuda" if (cfg["training"]["use_gpu"] and torch.cuda.is_available()) else "cpu"
     )
+
+    use_cuda_autocast = bool(training_cfg.get("use_cuda_autocast", True)) and (
+        device.type == "cuda"
+    )
+    global USE_CUDA_AUTOCAST
+    USE_CUDA_AUTOCAST = use_cuda_autocast
+
+    def autocast_context():
+        if use_cuda_autocast:
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
+
     set_seeds(int(cfg["training"]["seed"]))
+
+    # Prepare per-run directories up front for logging/profiling artifacts
+    base_dir = Path("experiments/gbm2")
+    run_dir = base_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
+    plots_dir = run_dir / "plots"
+    ckpt_dir = run_dir / "checkpoints"
+    logs_dir = run_dir / "logs"
+    for p in (plots_dir, ckpt_dir, logs_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    mem_cfg = cfg["training"].get("memory_profile", {})
+    mem_profiler = MemoryProfiler(
+        enabled=bool(mem_cfg.get("enabled", False)),
+        device=device,
+        log_path=logs_dir / "memory_profile.jsonl",
+        log_interval=int(mem_cfg.get("log_interval", 50)),
+        verbose=bool(mem_cfg.get("verbose", False)),
+    )
+    if mem_profiler.enabled:
+        mem_profiler.snapshot(
+            "startup",
+            extra={
+                "memory_profile_config": mem_cfg,
+                "device": str(device),
+            },
+        )
 
     # Allow Muon optimizer to run single-process by stubbing minimal torch.distributed APIs
     try:
@@ -404,6 +460,16 @@ def main():
 
     # Data (with global unique neuron IDs)
     train_loader, val_loader, _, _, unique_neuron_ids = create_dataloaders(cfg)
+    if mem_profiler.enabled:
+        mem_profiler.snapshot(
+            "after_dataloader_init",
+            extra={
+                "train_batches": len(train_loader),
+                "val_batches": len(val_loader),
+                "batch_size": cfg["training"]["batch_size"],
+                "sequence_length": cfg["training"]["sequence_length"],
+            },
+        )
 
     # Model
     try:
@@ -422,12 +488,26 @@ def main():
         num_neurons_total=int(cfg["model"]["num_neurons_total"]),
         global_neuron_ids=unique_neuron_ids,
         cov_rank=int(cfg["model"].get("cov_rank", 32)),
+        use_ffn_checkpoint=bool(cfg["training"].get("use_ffn_checkpoint", False)),
     ).to(device)
 
     # Run bf16 on CUDA
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
-        model = model.to(dtype=torch.bfloat16)
+        if not use_cuda_autocast:
+            model = model.to(dtype=torch.bfloat16)
+
+    model_dtype = next(model.parameters()).dtype
+    model_total_params = sum(p.numel() for p in model.parameters())
+    if mem_profiler.enabled:
+        mem_profiler.snapshot(
+            "after_model_init",
+            extra={
+                "total_params": model_total_params,
+                "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+                "model_dtype": str(next(model.parameters()).dtype),
+            },
+        )
 
     # Enable autograd anomaly and grad NaN/Inf checks in debug mode
     if debug_enabled():
@@ -455,20 +535,12 @@ def main():
 
     optimizer = build_optimizer(model, cfg["training"])
 
-    # Per-run directory under experiments/gbm2/<YYYYmmdd_HHMMSS>
-    base_dir = Path("experiments/gbm2")
-    run_dir = base_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
-    plots_dir = run_dir / "plots"
-    ckpt_dir = run_dir / "checkpoints"
-    logs_dir = run_dir / "logs"
-    for p in (plots_dir, ckpt_dir, logs_dir):
-        p.mkdir(parents=True, exist_ok=True)
     # Save resolved config for reproducibility
     with open(run_dir / "config.yaml", "w") as f:
         yaml.dump(cfg, f, default_flow_style=False, indent=2, sort_keys=False)
     # Write a simple architecture summary
     try:
-        total_params = sum(p.numel() for p in model.parameters())
+        total_params = model_total_params
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         with open(run_dir / "architecture.txt", "w") as f:
             f.write(
@@ -609,24 +681,54 @@ def main():
             if debug_enabled():
                 assert_no_nan(x_in_z, "pre.model.x_in_z")
 
-            if device.type == "cuda":
+            if device.type == "cuda" and not use_cuda_autocast:
                 x_in_z = x_in_z.to(torch.bfloat16)
                 stim_in = stim_in.to(torch.bfloat16)
+
+            log_this_step = mem_profiler.should_log(global_step) if mem_profiler.enabled else False
+            static_estimate = None
+            if log_this_step:
+                static_estimate = estimate_batch_static_memory(
+                    batch_size=int(spikes.shape[0]),
+                    seq_len=int(spikes.shape[1]),
+                    num_neurons=int(spikes.shape[2]),
+                    d_model=int(cfg["model"]["d_model"]),
+                    n_layers=int(cfg["model"]["n_layers"]),
+                    n_heads=int(cfg["model"]["n_heads"]),
+                    cov_rank=int(cfg["model"].get("cov_rank", 0)),
+                    dtype=model_dtype,
+                    include_copula=bool(cfg["training"].get("copula_weight", 0.0)),
+                )
+                mem_profiler.snapshot(
+                    "train_batch_pre_forward" if train else "val_batch_pre_forward",
+                    step=global_step,
+                    extra={
+                        "phase": "train" if train else "val",
+                        "batch_shape": {
+                            "B": int(spikes.shape[0]),
+                            "L": int(spikes.shape[1]),
+                            "N": int(spikes.shape[2]),
+                        },
+                        "static_total": static_estimate["total_h"],
+                        "static_breakdown": static_estimate["breakdown_h"],
+                    },
+                )
 
             if train:
                 optimizer.zero_grad()
 
-            out = model(
-                x_in_z,
-                stim_in,
-                positions,
-                mask,
-                neuron_ids,
-                spike_probs,
-                get_logits=True,
-                input_log_rates=True,
-                return_factors=True,
-            )
+            with autocast_context():
+                out = model(
+                    x_in_z,
+                    stim_in,
+                    positions,
+                    mask,
+                    neuron_ids,
+                    spike_probs,
+                    get_logits=True,
+                    input_log_rates=True,
+                    return_factors=True,
+                )
             if isinstance(out, tuple) and len(out) == 5:
                 mu, raw_log_sigma, _eta, _delta, factors = out
             else:
@@ -725,6 +827,17 @@ def main():
                     )
                 optimizer.step()
 
+            if log_this_step:
+                mem_profiler.snapshot(
+                    "train_batch_post_backward" if train else "val_batch_post_forward",
+                    step=global_step,
+                    extra={
+                        "phase": "train" if train else "val",
+                        "loss": float(loss_total.detach().cpu()) if train else float(loss.detach().cpu()),
+                        "static_total": static_estimate["total_h"] if static_estimate else None,
+                    },
+                )
+
             total_loss += float(loss.detach().cpu().item())
             count += 1
 
@@ -791,22 +904,23 @@ def main():
                             else:
                                 x_in_z_v = x_log_v
 
-                            if device.type == "cuda":
+                            if device.type == "cuda" and not use_cuda_autocast:
                                 x_in_z_v = x_in_z_v.to(torch.bfloat16)
                                 stim_in_v = stim_in_v.to(torch.bfloat16)
 
                             spike_probs_v = 1.0 - torch.exp(-x_in_v.float() / sr_v)
-                            out_v = model(
-                                x_in_z_v,
-                                stim_in_v,
-                                positions_v,
-                                mask_v,
-                                neuron_ids_v,
-                                spike_probs_v,
-                                get_logits=True,
-                                input_log_rates=True,
-                                return_factors=True,
-                            )
+                            with autocast_context():
+                                out_v = model(
+                                    x_in_z_v,
+                                    stim_in_v,
+                                    positions_v,
+                                    mask_v,
+                                    neuron_ids_v,
+                                    spike_probs_v,
+                                    get_logits=True,
+                                    input_log_rates=True,
+                                    return_factors=True,
+                                )
                             if isinstance(out_v, tuple) and len(out_v) == 5:
                                 mu_v, raw_log_sigma_v, _e_v, _d_v, factors_v = out_v
                             else:
@@ -905,19 +1019,20 @@ def main():
                             Tc_v = max(1, Lm1_v - Tf_v)
                             init_context_v = x_in_v[0:1, :Tc_v, :].to(torch.float32)
                             stim_full_v = stim_v[0:1, : Tc_v + Tf_v, :]
-                            pred_future_v = autoregressive_rollout(
-                                model,
-                                init_context_v,
-                                stim_full_v,
-                                positions_v[0:1],
-                                mask_v[0:1],
-                                neuron_ids_v[0:1],
-                                lam_v[0:1] if lam_v.numel() > 0 else None,
-                                las_v[0:1] if las_v.numel() > 0 else None,
-                                device,
-                                Tf_v,
-                                sampling_rate_hz=sr_v,
-                            )
+                            with autocast_context():
+                                pred_future_v = autoregressive_rollout(
+                                    model,
+                                    init_context_v,
+                                    stim_full_v,
+                                    positions_v[0:1],
+                                    mask_v[0:1],
+                                    neuron_ids_v[0:1],
+                                    lam_v[0:1] if lam_v.numel() > 0 else None,
+                                    las_v[0:1] if las_v.numel() > 0 else None,
+                                    device,
+                                    Tf_v,
+                                    sampling_rate_hz=sr_v,
+                                )
                             final_ctx = init_context_v[0].cpu()
                             final_truth = x_in_v[0, Tc_v : Tc_v + Tf_v, :].cpu()
                             final_pred = pred_future_v.cpu()
@@ -998,7 +1113,7 @@ def main():
                     else:
                         x_in_z = x_log
 
-                    if device.type == "cuda":
+                    if device.type == "cuda" and not use_cuda_autocast:
                         x_in_z = x_in_z.to(torch.bfloat16)
                         stim_in = stim_in.to(torch.bfloat16)
 
@@ -1007,17 +1122,18 @@ def main():
                     spike_probs = torch.nan_to_num(
                         spike_probs, nan=0.0, posinf=1.0, neginf=0.0
                     ).clamp_(0.0, 1.0)
-                    out_e = model(
-                        x_in_z,
-                        stim_in,
-                        positions,
-                        mask,
-                        neuron_ids,
-                        spike_probs,
-                        get_logits=True,
-                        input_log_rates=True,
-                        return_factors=True,
-                    )
+                    with autocast_context():
+                        out_e = model(
+                            x_in_z,
+                            stim_in,
+                            positions,
+                            mask,
+                            neuron_ids,
+                            spike_probs,
+                            get_logits=True,
+                            input_log_rates=True,
+                            return_factors=True,
+                        )
                     if isinstance(out_e, tuple) and len(out_e) == 5:
                         mu, raw_log_sigma, _ee, _dd, factors_e = out_e
                     else:
@@ -1094,19 +1210,20 @@ def main():
                     Tc = max(1, Lm1 - Tf)
                     init_context = x_in[0:1, :Tc, :].to(torch.float32)
                     stim_full = stim[0:1, : Tc + Tf, :]
-                    pred_future = autoregressive_rollout(
-                        model,
-                        init_context,
-                        stim_full,
-                        positions[0:1],
-                        mask[0:1],
-                        neuron_ids[0:1],
-                        lam[0:1] if lam.numel() > 0 else None,
-                        las[0:1] if las.numel() > 0 else None,
-                        device,
-                        Tf,
-                        sampling_rate_hz=sr,
-                    )
+                    with autocast_context():
+                        pred_future = autoregressive_rollout(
+                            model,
+                            init_context,
+                            stim_full,
+                            positions[0:1],
+                            mask[0:1],
+                            neuron_ids[0:1],
+                            lam[0:1] if lam.numel() > 0 else None,
+                            las[0:1] if las.numel() > 0 else None,
+                            device,
+                            Tf,
+                            sampling_rate_hz=sr,
+                        )
                     final_ctx = init_context[0].cpu()
                     final_truth = x_in[0, Tc : Tc + Tf, :].cpu()
                     final_pred = pred_future.cpu()
@@ -1161,6 +1278,11 @@ def main():
     print("Training complete. Best val:", best_val)
     # Final cleanup
     _maybe_empty_cuda_cache()
+    if mem_profiler.enabled:
+        mem_profiler.snapshot("training_complete", step=global_step)
+        summary_path = logs_dir / "memory_profile_summary.json"
+        with summary_path.open("w") as f:
+            json.dump(mem_profiler.summary(), f, indent=2)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import numpy as np
+from torch.utils.checkpoint import checkpoint
 from GenerativeBrainModel.models.rms import RMSNorm
 from GenerativeBrainModel.models.mlp import MLP, FFN
 from GenerativeBrainModel.models.attention import (
@@ -24,10 +25,11 @@ class GlobalMeanPool(nn.Module):
 
 
 class SpatioTemporalNeuralAttention(nn.Module):
-    def __init__(self, d_model, n_heads):
+    def __init__(self, d_model, n_heads, use_ffn_checkpoint: bool = False):
         super(SpatioTemporalNeuralAttention, self).__init__()
         self.d_model = d_model
         self.n_heads = n_heads
+        self.use_ffn_checkpoint = bool(use_ffn_checkpoint)
         self.spatial_attention = SparseSpikeFullAttention(
             d_model=d_model, n_heads=n_heads
         )
@@ -45,6 +47,11 @@ class SpatioTemporalNeuralAttention(nn.Module):
             # Output shape: (B, T, N, D) -> (B, T, 1, D)
         )
 
+    def _run_ffn(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        if self.use_ffn_checkpoint and self.training and x.requires_grad:
+            return checkpoint(module, x)
+        return module(x)
+
     def forward(self, x, point_positions, neuron_pad_mask, neuron_spike_probs):
         # expects x of shape (batch_size, seq_len, n_neurons, d_model)
         B, T, N, D = x.shape
@@ -55,7 +62,7 @@ class SpatioTemporalNeuralAttention(nn.Module):
         # if neuron_pad_mask is not None and neuron_pad_mask.dtype != d_dtype:
         #     neuron_pad_mask = neuron_pad_mask.to(d_dtype)
 
-        global_mean_pool = self.FFN_global_mean_pool(x)
+        global_mean_pool = self._run_ffn(self.FFN_global_mean_pool, x)
         x = torch.cat([x, global_mean_pool], dim=2)  # (B, T, n_neurons + 1, d_model)
         neuron_pad_mask = torch.cat(
             [neuron_pad_mask, torch.ones(B, 1, device=neuron_pad_mask.device)], dim=1
@@ -94,13 +101,13 @@ class SpatioTemporalNeuralAttention(nn.Module):
         neuron_pad_mask = neuron_pad_mask[:, :-1]
         point_positions = point_positions[:, :-1, :]
 
-        x = self.FFN0(x)
+        x = self._run_ffn(self.FFN0, x)
 
         x = self.temporal_attention(x, neuron_pad_mask)
         if debug_enabled():
             assert_no_nan(x, "STNA.after_temporal")
 
-        x = self.FFN1(x)
+        x = self._run_ffn(self.FFN1, x)
 
         # Output shape: (B, T, N, D)
         return x

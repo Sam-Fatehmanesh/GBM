@@ -26,6 +26,7 @@ class GBM(nn.Module):
         neuron_pad_id: int = 0,
         global_neuron_ids: torch.Tensor | None = None,
         cov_rank: int = 32,
+        use_ffn_checkpoint: bool = False,
     ):
         super(GBM, self).__init__()
 
@@ -38,7 +39,12 @@ class GBM(nn.Module):
         self.neuron_pad_id = int(neuron_pad_id)
 
         self.layers = nn.ModuleList(
-            [SpatioTemporalNeuralAttention(d_model, n_heads) for _ in range(n_layers)]
+            [
+                SpatioTemporalNeuralAttention(
+                    d_model, n_heads, use_ffn_checkpoint=use_ffn_checkpoint
+                )
+                for _ in range(n_layers)
+            ]
         )
 
         self.conv = nn.Sequential(
@@ -173,6 +179,9 @@ class GBM(nn.Module):
         # neuron_ids: (B, N) long; pad entries should be neuron_pad_id (0)
         if neuron_ids.dtype != torch.long:
             neuron_ids = neuron_ids.to(torch.long)
+
+        print("1x2c3v4v5", bool(self.has_global_id_map.item()))
+
         if bool(self.has_global_id_map.item()):
             # Map true 64-bit IDs to compact indices via binary search over sorted unique IDs
             # Keep 0 as pad id if present
