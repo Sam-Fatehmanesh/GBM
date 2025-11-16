@@ -180,7 +180,6 @@ class GBM(nn.Module):
         if neuron_ids.dtype != torch.long:
             neuron_ids = neuron_ids.to(torch.long)
 
-        print("1x2c3v4v5", bool(self.has_global_id_map.item()))
 
         if bool(self.has_global_id_map.item()):
             # Map true 64-bit IDs to compact indices via binary search over sorted unique IDs
